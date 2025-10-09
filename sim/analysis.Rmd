@@ -1,0 +1,723 @@
+---
+title: "Modeling"
+author: "Jonathan Hori"
+date: "2025-10-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# From GitHub - requires devtools
+# devtools::install_github("niccoloanceschi/jafar")
+
+
+library(jafar)
+library(Rfast)
+library(ggplot2)
+library(pROC)
+library(tidyverse)
+
+source("../R/data_methods.R")
+
+jafar_data <- Data
+
+output_dir = "./results/"
+dir.create(output_dir) #, showWarnings = FALSE)
+# getwd()
+```
+
+MCMC params
+```{r}
+tMCMC = 10000
+tBurnIn = 5000
+tThin = 10
+
+mcmc_seed=1234
+```
+
+# Data preprocessing
+
+```{r}
+# sample_ix <- sample(1:500, size = 100)
+
+# sim_data <- readRDS("./data/sim_data_n100_snr1.1.rds")
+# sim_data <- readRDS("./data/sim_data_n100_snr1.1_ywithview.rds")
+# sim_data <- readRDS("./data/sim_data_n100_snr2.2_ywithview.rds")
+# sim_data <- readRDS("./data/sim_data_n100_snr2.2_ywithview_sparseloadings.rds") 
+# sim_data <- readRDS("./data/sim_data_n100p100_snr2.2_ywithview.rds") 
+sim_data <- readRDS("./data/sim_data_n1000p50_snr2.2_ywithview.rds") 
+
+X_l <- sim_data$X_l
+# readRDS("./data/sim_data_x.rds") |> 
+  # lapply(function(x) x[sample_ix, ])
+y <- sim_data$y
+  # eadRDS("./data/sim_data_y.rds")[sample_ix]
+```
+
+
+
+```{r}
+X_l.clean <- standardize_views(X_l)
+y.clean <- standardize_outcome(y)
+```
+
+# JAFAR
+MCMC params
+
+
+## Single run
+```{r}
+system.time({
+mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
+                               y = y.clean, 
+                               # K0=K0, 
+                               K0_m=c(10, 10, 10),
+                               tMCMC=tMCMC, 
+                               tBurnIn=tBurnIn, 
+                               tThin=tThin,
+                               hyperparams = list(seed = mcmc_seed))
+})
+```
+
+For 
+N = 100
+tMCMC = 10000
+tBurnIn = 5000
+tThin = 10
+
+   user  system elapsed 
+699.293 104.625 415.154 
+
+
+
+
+### MatchAlign
+
+```{r}
+plot_loadings(mcmc_supervised,
+              out_path = output_dir,
+              out_shared = paste0(format(Sys.time(), "%m%d%y_%H%M"), "_shared_loadings"), 
+              out_specific = paste0(format(Sys.time(), "%m%d%y_%H%M"), "_specific_loadings"))
+```
+
+
+```{r}
+mcmc_supervised <- multiviewMatchAlign(mcmc_supervised)
+```
+
+
+
+## Multiple datasets
+
+```{r}
+n_array <- c(100, 500, 1000)
+p_array <- c(50, 100)
+# file.path()
+
+data_name_base <- "sim_data_n%sp%s_snr%s.%s_ywithview.rds"
+# sprintf(data_name_base, n, p, snr_x, snr_y)
+
+load_data <- function(n, p, snr_x, snr_y) {
+  data_path <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                  "data", 
+                  sprintf(data_name_base, n, p, snr_x, snr_y))
+  
+  readRDS(data_path)
+}
+
+# rstudioapi::getSourceEditorContext()
+load_data(100, 100, 2, 2) |> print()
+# dirname(rstudioapi::getSourceEditorContext()$path)
+
+```
+
+
+```{r}
+for (n in n_array) {
+  for (p in p_array) {
+    
+  }
+}
+mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
+                               y = y.clean, 
+                               # K0=K0, 
+                               K0_m=c(10, 10, 10),
+                               tMCMC=tMCMC, 
+                               tBurnIn=tBurnIn, 
+                               tThin=tThin,
+                               hyperparams = list(seed = mcmc_seed))
+```
+
+
+## Evaluate performance
+
+### Structure reconstruction
+Check reconstruction of shared and view-specific structure, which should be uniquely identified, unlike individual loading/score matrices.
+
+
+```{r}
+calc_jafar_posterior_means <- function(mcmc_supervised) {
+  jafar_loadings.shared <- lapply(mcmc_supervised$Lambda_m,
+                                  function(mat) {
+                                    apply(mat, c(2, 3), mean)
+                                  })
+  
+  jafar_loadings.view_specific <- lapply(mcmc_supervised$Gamma_m,
+                                         function(mat) {
+                                           apply(mat, c(2, 3), mean)
+                                         })
+  
+  
+  jafar_scores.shared <- apply(mcmc_supervised$eta, c(2, 3), mean)
+  
+  jafar_scores.view_specific <- lapply(mcmc_supervised$phi_m,
+                                       function(mat) {
+                                         apply(mat, c(2, 3), mean)
+                                       })
+  
+  return(list(
+    shared_scores = jafar_scores.shared,
+    view_scores = jafar_scores.view_specific,
+    shared_loadings = jafar_loadings.shared,
+    view_loadings = jafar_loadings.view_specific
+  ))
+}
+
+jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
+
+# jafar_loadings.shared <- lapply(mcmc_supervised$Lambda_m,
+#        function(mat) {
+#          apply(mat, c(2, 3), mean)
+#        })
+# 
+# jafar_loadings.view_specific <- lapply(mcmc_supervised$Gamma_m,
+#        function(mat) {
+#          apply(mat, c(2, 3), mean)
+#        })
+# 
+# 
+# jafar_scores.shared <- apply(mcmc_supervised$eta, c(2, 3), mean)
+# 
+# jafar_scores.view_specific <- lapply(mcmc_supervised$phi_m,
+#        function(mat) {
+#          apply(mat, c(2, 3), mean)
+#        })
+
+```
+
+
+Compute latent structures
+
+```{r}
+compute_structure <- function(scores,
+                              loadings) {
+  scores %*% t(loadings)
+}
+```
+
+
+
+```{r}
+jafar_structure.shared <- lapply(1:length(jafar_loadings.shared), 
+       function(l) {
+         compute_structure(jafar_scores.shared,
+                           jafar_loadings.shared[[l]])
+       }
+)
+
+jafar_structure.view_specific <- lapply(1:length(jafar_scores.view_specific), 
+       function(l) {
+         compute_structure(jafar_scores.view_specific[[l]],
+                           jafar_loadings.view_specific[[l]])
+       }
+)
+
+jafar_structure.reconstructed <- lapply(1:length(jafar_structure.shared), 
+       function(l) {
+         jafar_structure.shared[[l]] + jafar_structure.view_specific[[l]]
+       }
+)
+```
+
+```{r}
+sim_structure.shared <- lapply(1:sim_data$L, 
+       function(l) {
+         compute_structure(sim_data$Z,
+                           sim_data$Lambda_l[[l]])
+       }
+)
+
+sim_structure.view_specific <- lapply(1:sim_data$L, 
+       function(l) {
+         compute_structure(sim_data$Phi[[l]],
+                           sim_data$Gamma_l[[l]])
+       }
+)
+
+sim_structure.reconstructed <- lapply(1:sim_data$L, 
+       function(l) {
+         compute_structure(sim_data$Z,
+                           sim_data$Lambda_l[[l]]) + 
+           compute_structure(sim_data$Phi[[l]],
+                           sim_data$Gamma_l[[l]])
+       }
+)
+```
+
+```{r}
+calc_all_structures <- function(shared_scores,
+                                view_scores,
+                                shared_loadings,
+                                view_loadings) {
+  list(
+    joint_structure = lapply(1:length(jafar_loadings.shared), 
+                             function(l) {
+                               compute_structure(shared_scores,
+                                                 shared_loadings[[l]])
+                             }
+    ),
+    view_structure = lapply(1:length(jafar_scores.view_specific), 
+                            function(l) {
+                              compute_structure(view_scores[[l]],
+                                                view_loadings[[l]])
+                            }
+    ),
+    data_reconstruction = lapply(1:length(jafar_structure.shared), 
+                                 function(l) {
+                                   compute_structure(shared_scores,
+                                                     shared_loadings[[l]]) + 
+                                     compute_structure(view_scores[[l]],
+                                                       view_loadings[[l]])
+                                 }
+    )
+  )
+}
+
+est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                               jafar_posterior_means$view_scores,
+                               jafar_posterior_means$shared_loadings,
+                               jafar_posterior_means$view_loadings)
+
+sim_obj <- calc_all_structures(sim_data$Z,
+                               sim_data$Phi,
+                               sim_data$Lambda_l,
+                               sim_data$Gamma_l)
+```
+
+
+```{r}
+# est_obj <- list(
+#   joint_structure = lapply(1:length(jafar_loadings.shared), 
+#                            function(l) {
+#                              compute_structure(jafar_scores.shared,
+#                                                jafar_loadings.shared[[l]])
+#                            }
+#   ),
+#   view_structure = lapply(1:length(jafar_scores.view_specific), 
+#                           function(l) {
+#                             compute_structure(jafar_scores.view_specific[[l]],
+#                                               jafar_loadings.view_specific[[l]])
+#                           }
+#   ),
+#   data_reconstruction = lapply(1:length(jafar_structure.shared), 
+#                                function(l) {
+#                                  compute_structure(jafar_scores.shared,
+#                                                    jafar_loadings.shared[[l]]) + 
+#                                    compute_structure(jafar_scores.view_specific[[l]],
+#                                                      jafar_loadings.view_specific[[l]])
+#                                }
+#   )
+# )
+
+# sim_obj <- list(
+#   joint_structure = lapply(1:sim_data$L, 
+#                            function(l) {
+#                              compute_structure(sim_data$Z,
+#                                                sim_data$Lambda_l[[l]])
+#                            }
+#   ),
+#   view_structure = lapply(1:sim_data$L, 
+#                           function(l) {
+#                             compute_structure(sim_data$Phi[[l]],
+#                                               sim_data$Gamma_l[[l]])
+#                           }
+#   ),
+#   data_reconstruction = lapply(1:sim_data$L, 
+#                                function(l) {
+#                                  compute_structure(sim_data$Z,
+#                                                    sim_data$Lambda_l[[l]]) + 
+#                                    compute_structure(sim_data$Phi[[l]],
+#                                                      sim_data$Gamma_l[[l]])
+#                                }
+#   )
+# )
+```
+
+
+
+## Eval
+
+Relative squared error in structures:
+
+$$
+\lVert\hat S_{shared} - S_{shared}\rVert^2 = \lVert\hat Z\hat\Lambda^{(l)T} - Z\Lambda^T\rVert^2 \\
+\frac{\lVert\hat S - S\rVert^2}{\lVert S\rVert^2}
+$$
+```{r}
+lapply(1:sim_data$L,
+       function(l) {
+         norm(jafar_structure.shared[[l]] - 
+                sim_structure.shared[[l]], type = "F") ^ 2 /
+           norm(sim_structure.shared[[l]]) ^2
+       })
+
+
+lapply(1:sim_data$L,
+       function(l) {
+         norm(jafar_structure.view_specific[[l]] - 
+                sim_structure.view_specific[[l]], type = "F") ^ 2 /
+           norm(sim_structure.shared[[l]]) ^2
+       })
+
+```
+
+```{r}
+jafar_structure.shared[[l]] |> 
+  as_tibble() |> 
+  mutate(n = row_number()) |> 
+  pivot_longer(c(everything(), -n)) |> 
+  ggplot() +
+  geom_tile(aes(y = n, x = name, fill = value)) +
+  scale_fill_gradient2(low = "red", high = "blue", mid = "white")
+
+sim_structure.shared[[l]] |> 
+  as_tibble() |> 
+  mutate(n = row_number()) |> 
+  pivot_longer(c(everything(), -n)) |> 
+  ggplot() +
+  geom_tile(aes(y = n, x = name, fill = value)) +
+  scale_fill_gradient2(low = "red", high = "blue", mid = "white")
+
+
+
+(jafar_structure.shared[[l]] - 
+                sim_structure.shared[[l]]) |> summary() |> list()
+
+
+for (l in 1:3) {
+print((jafar_structure.shared[[l]] - 
+                sim_structure.shared[[l]]) |> 
+  as_tibble() |> 
+  mutate(n = row_number()) |> 
+  pivot_longer(c(everything(), -n)) |> 
+  ggplot() +
+  geom_tile(aes(y = n, x = name, fill = value)) +
+  scale_fill_gradient2(low = "red", high = "blue", mid = "white") 
+)
+    
+}
+```
+
+
+Difference in covariance
+
+$$
+\lVert\hat \Lambda^{(l)}\hat \Lambda^{(l)T} - \Lambda^{(l)}\Lambda^{(l)T} \rVert^2
+$$
+
+```{r}
+
+lapply(1:sim_data$L,
+       function(l) {
+         norm(sim_data$Lambda_l[[l]] %*% t(sim_data$Lambda_l[[l]]) - 
+                jafar_loadings.shared[[l]] %*% t(jafar_loadings.shared[[l]]), 
+              type = "F") ^ 2
+       })
+```
+
+```{r}
+l = 1
+chol(sim_data$Lambda_l[[l]] %*% t(sim_data$Lambda_l[[l]]))
+
+diag(sim_data$Lambda_l[[l]] %*% t(sim_data$Lambda_l[[l]]))
+```
+
+
+### Data reconstruction
+
+$$
+\frac{\lVert\hat X^{(l)} - X^{(l)}\rVert^2}{\lVert X^{(l)}\rVert^2} \\
+\lVert\hat X^{(l)} - X^{(l)}\rVert^2
+$$
+```{r}
+# Sanity check: Verify simulated data structures reconstruct data
+print("Relative squared error")
+lapply(1:sim_data$L,
+       function(l) {
+         norm(sim_structure.reconstructed[[l]] - 
+                X_l[[l]], type = "F") ^ 2 /
+           norm(X_l[[l]]) ^2
+       })
+
+print("Difference norm")
+lapply(1:sim_data$L,
+       function(l) {
+         norm(sim_structure.reconstructed[[l]] - 
+                X_l[[l]], type = "F") ^ 2
+       })
+
+```
+
+```{r}
+print("Relative squared error")
+lapply(1:sim_data$L,
+       function(l) {
+         return(list(l = l,
+                     rse = 
+         norm(sim_structure.reconstructed[[l]] - 
+                jafar_structure.reconstructed[[l]], type = "F") ^ 2 /
+           norm(sim_structure.reconstructed[[l]], type = "F") ^2
+         ))
+       }) |> bind_rows()
+
+print("Difference norm")
+lapply(1:sim_data$L,
+       function(l) {
+         norm(sim_structure.reconstructed[[l]] - 
+                jafar_structure.reconstructed[[l]], type = "F") ^ 2
+       })
+```
+
+
+```{r}
+eval_model <- function(est_obj,
+                       sim_obj,
+                       quantity,
+                       metric) {
+  # For a given quantity (e.g. joint_structure, view_structure, data_reconstruction),
+  #   compute the desired metric (e.g. relative squared error, difference norm)
+  
+  # Extract quantity to evaluate from model and simulation settings
+  est_quantity = switch(quantity,
+                         joint_structure = {est_obj$joint_structure},
+                         view_structure = {est_obj$view_structure},
+                         data_reconstruction = {est_obj$data_reconstruction})
+  sim_quantity = switch(quantity,
+                         joint_structure = {sim_obj$joint_structure},
+                         view_structure = {sim_obj$view_structure},
+                         data_reconstruction = {sim_obj$data_reconstruction})
+  
+  results = lapply(1:length(sim_obj$view_structure),
+                   function(l) {
+                     return(list(
+                         l = l,
+                         quantity = quantity,
+                         metric = metric,
+                         result = switch(
+                           metric,
+                           rse = {norm(sim_quantity[[l]] - 
+                                        est_quantity[[l]], type = "F")^2 / norm(sim_quantity[[l]], type = "F")^2},
+                           difference_norm = {norm(sim_quantity[[l]] - 
+                                        est_quantity[[l]], type = "F")^2}
+                         )
+                     )
+                     )
+                   }
+  ) |> bind_rows()
+  
+  return(results)
+}
+
+testing <- function(quantity){
+  sim_quantity = switch(quantity,
+                         joint_structure = {sim_obj$joint_structure},
+                         view_structure = {sim_obj$view_structure},
+                         data_reconstruction = {sim_obj$data_reconstruction})
+  est_quantity = switch(quantity,
+                         joint_structure = {est_obj$joint_structure},
+                         view_structure = {est_obj$view_structure},
+                         data_reconstruction = {est_obj$data_reconstruction})
+  return(est_quantity)
+  # lapply(1:3,
+  #        function(l){
+  #          return(sim_quantity[[l]] - est_quantity[[l]])
+  #        })
+}
+
+es
+
+a = testing("joint_structure")
+c(
+eval_model(est_obj,
+           sim_obj,
+           "joint_structure",
+           "rse") ,
+eval_model(est_obj,
+           sim_obj,
+           "view_structure",
+           "rse")
+) |> bind_rows()
+```
+
+
+```{r}
+bind_rows(
+  eval_model(est_obj,
+           sim_obj,
+           "joint_structure",
+           "rse"),
+  eval_model(est_obj,
+           sim_obj,
+           "view_structure",
+           "rse"),
+  eval_model(est_obj,
+           sim_obj,
+           "data_reconstruction",
+           "rse"),
+)
+
+
+```
+
+
+### Outcome model coefficients
+
+```{r}
+colMeans(mcmc_supervised$Theta)
+beta_sim
+```
+
+
+
+### Outcome prediction
+
+```{r}
+y_pred <- predict_y(X_l.clean, mcmc_supervised)
+
+plot_predictions(y_pred, y.clean, mcmc_supervised, 
+                 out_path=output_dir, out_name="preds_sim4")
+```
+
+```{r}
+# knitr::include_graphics(file.path(output_dir,'predictions.pdf'))
+```
+
+```{r}
+plot_coefficients(y_pred)
+```
+
+
+Evaluate prediction AUC
+
+```{r}
+y_pred.means <- colMeans(y_pred$mean)
+```
+
+
+```{r}
+# y.clean
+tibble(pred = y_pred.means,
+       outcome = y.clean) |> 
+  # filter(outcome < -2.23)
+
+  ggplot(aes(x = outcome, y = pred)) +
+  geom_point() +
+  stat_smooth(method = lm) + 
+  labs(x = "Simulated outcome",
+       y = "Predicted outcome")
+```
+
+
+```{r}
+credible_intervals_mcmc <- function(m_samples, s_samples, Smc=10) {
+  T_val <- nrow(m_samples)
+  N_val <- ncol(m_samples)
+  if(length(s_samples)==1){s_samples=rep(s_samples,T_val)}
+  
+  means_matrix_long <- m_samples[, rep(1:N_val, each = Smc)]
+  sds_matrix_long <- matrix(rep(s_samples, each = N_val * Smc), nrow = T_val)
+  
+  noise_matrix <- matrix(rnorm(T_val * N_val * Smc), nrow = T_val)
+  
+  all_samples <- means_matrix_long + sds_matrix_long * noise_matrix
+  
+  all_samples_reshaped <- matrix(all_samples, ncol = N_val)
+  
+  credible_intervals <- apply(all_samples_reshaped, 2, quantile, probs = c(0.05, 0.95))
+  
+  t(credible_intervals)
+}
+
+yPred = y_pred
+yTrue = y.clean
+risMCMC = mcmc_supervised
+size = 0.7
+  linewidth = 0.5
+  width = 0.7
+  alpha = 0.4
+  range = 0.25
+  v_colors <- c("#57B38C")
+  v_pch <- c(21)
+  yPred = yPred$mean
+  n_pred = ncol(yPred)
+  yBinary = ("y_MC" %in% names(risMCMC))
+  sig_y_jafar = sqrt(1/risMCMC$s2_inv)
+  if (yBinary) {
+    yPred <- pnorm(yPred)
+    sig_y_jafar = 0
+  }
+  df_plot = data.frame(y_mean = colMeans(yPred), y_up = colMeans(yPred), 
+    y_low = colMeans(yPred))
+  train_uq <- credible_intervals_mcmc(yPred, sig_y_jafar)
+  df_plot$y_low <- train_uq[, 1]
+  df_plot$y_up <- train_uq[, 2]
+  idx <- sort(df_plot$y_mean, index.return = T)$ix
+  df_plot = df_plot[idx, ]
+  if (yBinary) {
+    df_plot$x_column = unif_jitter(yTrue[idx], range = range)
+    width = 0.5 * range/max(sum(yTrue), n_pred - sum(yTrue))
+  } else {
+    df_plot$x_column = c(1:n_pred)
+    df_ref <- data.frame(x_column = c(1:n_pred), y_column = yTrue[idx])
+  }
+  combined_plot <- ggplot() + theme_bw() + geom_point(data = df_plot, 
+    aes(x = x_column, y = y_mean), color = v_colors, fill = v_colors, 
+    shape = v_pch, size = size) + geom_errorbar(data = df_plot, 
+    aes(x = x_column, y = y_mean, ymin = y_low, ymax = y_up), 
+    color = v_colors, width = width, linewidth = linewidth, 
+    alpha = alpha) + theme(aspect.ratio = 0.7, legend.position = "bottom") + 
+    guides(colour = guide_legend(override.aes = list(size = 1)))
+  if (yBinary) {
+    combined_plot <- combined_plot + labs(y = NULL, title = "P[ y = 1 | X = x ]", 
+      x = "True Response") + geom_hline(yintercept = 0, 
+      col = "gray", linewidth = 0.7) + geom_hline(yintercept = 1, 
+      col = "gray", linewidth = 0.7) + scale_x_continuous(breaks = c(0, 
+      1), labels = c(0, 1)) + theme(plot.title = element_text(hjust = 0.5)) + 
+      scale_y_continuous(breaks = seq(0, 1, by = 0.1), 
+        labels = seq(0, 1, by = 0.1), limits = c(0, 
+          1))
+  } else {
+    combined_plot <- combined_plot + labs(y = NULL, title = "y | X = x", 
+      x = "Sorted Units") + geom_point(data = df_ref, 
+      aes(x = x_column, y = y_column), color = "black", 
+      size = 0) + scale_x_continuous(breaks = NULL, labels = NULL) + 
+      theme(plot.title = element_text(hjust = 0.5)) + 
+      geom_errorbar(data = df_ref, aes(x = x_column, y = y_column, 
+        ymin = y_column, ymax = y_column), width = size, 
+        color = "black", alpha = 0.8)
+  }
+  
+  
+```
+
+
+```{r}
+df_ref
+
+df_plot
+```
+

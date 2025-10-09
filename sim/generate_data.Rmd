@@ -1,0 +1,186 @@
+---
+title: "Data Simulation"
+output: html_document
+---
+
+```{r}
+library(mvtnorm)
+library(tidyverse)
+
+source("./R/sim_methods.R")
+# getwd()
+```
+
+Specify number of views, subjects, data dimensions, latent factor dimensions, and SNRs.
+```{r}
+L = 3
+N = 1000
+p_l = 50
+K = 5
+K_l = 5
+snr_x = 2
+snr_y = 2
+
+loading_sparsity = 0
+
+```
+
+
+```{r}
+sim_data_spec <- lapply(1:L,
+                        function(l) list(N = N,
+                                         p_l = p_l,
+                                         # K = K,
+                                         K_l = K_l,
+                                         snr_x = snr_x)
+                        # ,
+                                         # snr_y = snr_y)
+)
+```
+
+
+# Generate data views
+From latent factor scores and loadings
+```{r}
+set.seed(123)
+
+sim_loadings.shared <- lapply(sim_data_spec,
+                       function(spec) {
+                         generate_factor_loadings(spec, 
+                                                  sparsity_prob = 1 - loading_sparsity, 
+                                                  K)
+                       }
+)
+
+sim_loadings.view_specific <- lapply(sim_data_spec,
+                       function(spec) {
+                         generate_factor_loadings(spec, 
+                                                  sparsity_prob = 1 - loading_sparsity)
+                       }
+)
+
+sim_factors.shared <- generate_factor_scores(sim_data_spec[[1]], K)
+
+
+sim_factors.view_specific <- lapply(sim_data_spec,
+                       function(spec) {
+                         generate_factor_scores(spec)
+                       }
+)
+  
+```
+
+Determine the necessary variance to obtain a desired SNR.
+```{r}
+view_vars <- lapply(1:L,
+       function(l) {
+         diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]) + 
+           sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]])) / N
+       }) #|> diag()
+
+
+noise_x_views <- lapply(1:length(sim_data_spec),
+                  function(l) {
+                    
+                    noise_x <- matrix(nrow = N, ncol = sim_data_spec[[l]]$p_l)
+                    for (i in 1:N) {
+                      for (j in 1:sim_data_spec[[l]]$p_l) {
+                        noise_x[i, j] <- rnorm(1, sd = sqrt(view_vars[[l]][[j]] / sim_data_spec[[l]]$snr_x))
+                      }
+                    }
+                    noise_x
+                  }
+)
+```
+
+
+```{r}
+sim_data.x <- lapply(1:length(sim_data_spec), 
+       function(l) {
+         sim_factors.shared %*% t(sim_loadings.shared[[l]]) + 
+           sim_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]) +
+           noise_x_views[[l]]
+       }
+)
+```
+
+# Generate outcome
+
+From coefficients and factor scores
+
+```{r}
+# beta_sim <- rnorm(n = K)
+# 
+# outcome_var <- t(beta_sim) %*% beta_sim / K
+# 
+# # sim_factors.shared |> colMeans()
+# 
+# noise_y <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+# 
+# sim_data.y <- sim_factors.shared %*% beta_sim + noise_y
+
+```
+
+OR Include view specific factors in outcome model
+```{r}
+beta_sim <- rnorm(n = K)
+
+beta_l <- lapply(1:L, 
+       function(l) {
+         rnorm(n = sim_data_spec[[l]]$K_l)
+       }
+)
+
+lp_view_specific <- lapply(1:L, 
+       function(l) {
+         sim_factors.view_specific[[l]] %*% beta_l[[l]]
+       }
+)
+
+sim_beta_cat <- c(beta_sim, beta_l |> unlist())
+ncoef = K + lapply(1:L, function(l) sim_data_spec[[l]]$K_l) |> unlist() |> sum()
+
+outcome_var <- t(sim_beta_cat) %*% sim_beta_cat / ncoef
+
+# sim_factors.shared |> colMeans()
+
+noise_y <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+
+sim_data.y <- sim_factors.shared %*% beta_sim + 
+  Reduce("+", lp_view_specific) +
+  noise_y
+# sim_data.y <- sim_data.y + Reduce("+", lp_view_specific)
+```
+
+
+# Structure
+
+```{r}
+sim_data <- list(
+  L = L,
+  N = N,
+  p_l = lapply(sim_data.x, ncol),
+  K = K,
+  K_l = c(K_l, K_l, K_l),
+  X_l = sim_data.x,
+  y = sim_data.y,
+  Lambda_l = sim_loadings.shared,
+  Gamma_l = sim_loadings.view_specific,
+  Z = sim_factors.shared,
+  Phi = sim_factors.view_specific
+)
+```
+
+
+# Save
+```{r}
+saveRDS(sim_data, "./sim/data/sim_data_n1000p50_snr2.2_ywithview.rds")
+
+# saveRDS(sim_data.x, "data/sim_data_x.rds")
+# saveRDS(sim_data.y, "data/sim_data_y.rds")
+```
+
+```{r}
+
+```
+
