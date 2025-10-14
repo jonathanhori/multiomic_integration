@@ -20,6 +20,7 @@ library(Rfast)
 library(ggplot2)
 library(pROC)
 library(tidyverse)
+library(latex2exp)
 
 source("../R/data_methods.R")
 
@@ -64,6 +65,7 @@ y <- sim_data$y
 X_l.clean <- standardize_views(X_l)
 y.clean <- standardize_outcome(y)
 ```
+
 
 # JAFAR
 MCMC params
@@ -110,49 +112,6 @@ mcmc_supervised <- multiviewMatchAlign(mcmc_supervised)
 ```
 
 
-
-## Multiple datasets
-
-```{r}
-n_array <- c(100, 500, 1000)
-p_array <- c(50, 100)
-# file.path()
-
-data_name_base <- "sim_data_n%sp%s_snr%s.%s_ywithview.rds"
-# sprintf(data_name_base, n, p, snr_x, snr_y)
-
-load_data <- function(n, p, snr_x, snr_y) {
-  data_path <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                  "data", 
-                  sprintf(data_name_base, n, p, snr_x, snr_y))
-  
-  readRDS(data_path)
-}
-
-# rstudioapi::getSourceEditorContext()
-load_data(100, 100, 2, 2) |> print()
-# dirname(rstudioapi::getSourceEditorContext()$path)
-
-```
-
-
-```{r}
-for (n in n_array) {
-  for (p in p_array) {
-    
-  }
-}
-mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
-                               y = y.clean, 
-                               # K0=K0, 
-                               K0_m=c(10, 10, 10),
-                               tMCMC=tMCMC, 
-                               tBurnIn=tBurnIn, 
-                               tThin=tThin,
-                               hyperparams = list(seed = mcmc_seed))
-```
-
-
 ## Evaluate performance
 
 ### Structure reconstruction
@@ -160,32 +119,7 @@ Check reconstruction of shared and view-specific structure, which should be uniq
 
 
 ```{r}
-calc_jafar_posterior_means <- function(mcmc_supervised) {
-  jafar_loadings.shared <- lapply(mcmc_supervised$Lambda_m,
-                                  function(mat) {
-                                    apply(mat, c(2, 3), mean)
-                                  })
-  
-  jafar_loadings.view_specific <- lapply(mcmc_supervised$Gamma_m,
-                                         function(mat) {
-                                           apply(mat, c(2, 3), mean)
-                                         })
-  
-  
-  jafar_scores.shared <- apply(mcmc_supervised$eta, c(2, 3), mean)
-  
-  jafar_scores.view_specific <- lapply(mcmc_supervised$phi_m,
-                                       function(mat) {
-                                         apply(mat, c(2, 3), mean)
-                                       })
-  
-  return(list(
-    shared_scores = jafar_scores.shared,
-    view_scores = jafar_scores.view_specific,
-    shared_loadings = jafar_loadings.shared,
-    view_loadings = jafar_loadings.view_specific
-  ))
-}
+
 
 jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
 
@@ -213,13 +147,21 @@ jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
 Compute latent structures
 
 ```{r}
-compute_structure <- function(scores,
-                              loadings) {
-  scores %*% t(loadings)
-}
+
 ```
 
 
+```{r}
+est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                               jafar_posterior_means$view_scores,
+                               jafar_posterior_means$shared_loadings,
+                               jafar_posterior_means$view_loadings)
+
+sim_obj <- calc_all_structures(sim_data$Z,
+                               sim_data$Phi,
+                               sim_data$Lambda_l,
+                               sim_data$Gamma_l)
+```
 
 ```{r}
 jafar_structure.shared <- lapply(1:length(jafar_loadings.shared), 
@@ -268,45 +210,7 @@ sim_structure.reconstructed <- lapply(1:sim_data$L,
 )
 ```
 
-```{r}
-calc_all_structures <- function(shared_scores,
-                                view_scores,
-                                shared_loadings,
-                                view_loadings) {
-  list(
-    joint_structure = lapply(1:length(jafar_loadings.shared), 
-                             function(l) {
-                               compute_structure(shared_scores,
-                                                 shared_loadings[[l]])
-                             }
-    ),
-    view_structure = lapply(1:length(jafar_scores.view_specific), 
-                            function(l) {
-                              compute_structure(view_scores[[l]],
-                                                view_loadings[[l]])
-                            }
-    ),
-    data_reconstruction = lapply(1:length(jafar_structure.shared), 
-                                 function(l) {
-                                   compute_structure(shared_scores,
-                                                     shared_loadings[[l]]) + 
-                                     compute_structure(view_scores[[l]],
-                                                       view_loadings[[l]])
-                                 }
-    )
-  )
-}
 
-est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
-                               jafar_posterior_means$view_scores,
-                               jafar_posterior_means$shared_loadings,
-                               jafar_posterior_means$view_loadings)
-
-sim_obj <- calc_all_structures(sim_data$Z,
-                               sim_data$Phi,
-                               sim_data$Lambda_l,
-                               sim_data$Gamma_l)
-```
 
 
 ```{r}
@@ -494,73 +398,37 @@ lapply(1:sim_data$L,
 
 
 ```{r}
-eval_model <- function(est_obj,
-                       sim_obj,
-                       quantity,
-                       metric) {
-  # For a given quantity (e.g. joint_structure, view_structure, data_reconstruction),
-  #   compute the desired metric (e.g. relative squared error, difference norm)
-  
-  # Extract quantity to evaluate from model and simulation settings
-  est_quantity = switch(quantity,
-                         joint_structure = {est_obj$joint_structure},
-                         view_structure = {est_obj$view_structure},
-                         data_reconstruction = {est_obj$data_reconstruction})
-  sim_quantity = switch(quantity,
-                         joint_structure = {sim_obj$joint_structure},
-                         view_structure = {sim_obj$view_structure},
-                         data_reconstruction = {sim_obj$data_reconstruction})
-  
-  results = lapply(1:length(sim_obj$view_structure),
-                   function(l) {
-                     return(list(
-                         l = l,
-                         quantity = quantity,
-                         metric = metric,
-                         result = switch(
-                           metric,
-                           rse = {norm(sim_quantity[[l]] - 
-                                        est_quantity[[l]], type = "F")^2 / norm(sim_quantity[[l]], type = "F")^2},
-                           difference_norm = {norm(sim_quantity[[l]] - 
-                                        est_quantity[[l]], type = "F")^2}
-                         )
-                     )
-                     )
-                   }
-  ) |> bind_rows()
-  
-  return(results)
-}
 
-testing <- function(quantity){
-  sim_quantity = switch(quantity,
-                         joint_structure = {sim_obj$joint_structure},
-                         view_structure = {sim_obj$view_structure},
-                         data_reconstruction = {sim_obj$data_reconstruction})
-  est_quantity = switch(quantity,
-                         joint_structure = {est_obj$joint_structure},
-                         view_structure = {est_obj$view_structure},
-                         data_reconstruction = {est_obj$data_reconstruction})
-  return(est_quantity)
-  # lapply(1:3,
-  #        function(l){
-  #          return(sim_quantity[[l]] - est_quantity[[l]])
-  #        })
-}
 
-es
-
-a = testing("joint_structure")
-c(
-eval_model(est_obj,
-           sim_obj,
-           "joint_structure",
-           "rse") ,
-eval_model(est_obj,
-           sim_obj,
-           "view_structure",
-           "rse")
-) |> bind_rows()
+# testing <- function(quantity){
+#   sim_quantity = switch(quantity,
+#                          joint_structure = {sim_obj$joint_structure},
+#                          view_structure = {sim_obj$view_structure},
+#                          data_reconstruction = {sim_obj$data_reconstruction})
+#   est_quantity = switch(quantity,
+#                          joint_structure = {est_obj$joint_structure},
+#                          view_structure = {est_obj$view_structure},
+#                          data_reconstruction = {est_obj$data_reconstruction})
+#   return(est_quantity)
+#   # lapply(1:3,
+#   #        function(l){
+#   #          return(sim_quantity[[l]] - est_quantity[[l]])
+#   #        })
+# }
+# 
+# es
+# 
+# a = testing("joint_structure")
+# c(
+# eval_model(est_obj,
+#            sim_obj,
+#            "joint_structure",
+#            "rse") ,
+# eval_model(est_obj,
+#            sim_obj,
+#            "view_structure",
+#            "rse")
+# ) |> bind_rows()
 ```
 
 
@@ -578,7 +446,18 @@ bind_rows(
            sim_obj,
            "data_reconstruction",
            "rse"),
-)
+) |> 
+  mutate(n = 1000,
+         p = 50,
+         snr_x = 2,
+         snr_y = 2) |>
+  print() |> 
+  ggplot() +
+  geom_boxplot(aes(x = n,
+                 y = result,
+                 group = quantity,
+                 color = quantity)) #|> 
+  facet_grid(rows = vars())
 
 
 ```
@@ -632,92 +511,624 @@ tibble(pred = y_pred.means,
 ```
 
 
-```{r}
-credible_intervals_mcmc <- function(m_samples, s_samples, Smc=10) {
-  T_val <- nrow(m_samples)
-  N_val <- ncol(m_samples)
-  if(length(s_samples)==1){s_samples=rep(s_samples,T_val)}
-  
-  means_matrix_long <- m_samples[, rep(1:N_val, each = Smc)]
-  sds_matrix_long <- matrix(rep(s_samples, each = N_val * Smc), nrow = T_val)
-  
-  noise_matrix <- matrix(rnorm(T_val * N_val * Smc), nrow = T_val)
-  
-  all_samples <- means_matrix_long + sds_matrix_long * noise_matrix
-  
-  all_samples_reshaped <- matrix(all_samples, ncol = N_val)
-  
-  credible_intervals <- apply(all_samples_reshaped, 2, quantile, probs = c(0.05, 0.95))
-  
-  t(credible_intervals)
-}
-
-yPred = y_pred
-yTrue = y.clean
-risMCMC = mcmc_supervised
-size = 0.7
-  linewidth = 0.5
-  width = 0.7
-  alpha = 0.4
-  range = 0.25
-  v_colors <- c("#57B38C")
-  v_pch <- c(21)
-  yPred = yPred$mean
-  n_pred = ncol(yPred)
-  yBinary = ("y_MC" %in% names(risMCMC))
-  sig_y_jafar = sqrt(1/risMCMC$s2_inv)
-  if (yBinary) {
-    yPred <- pnorm(yPred)
-    sig_y_jafar = 0
-  }
-  df_plot = data.frame(y_mean = colMeans(yPred), y_up = colMeans(yPred), 
-    y_low = colMeans(yPred))
-  train_uq <- credible_intervals_mcmc(yPred, sig_y_jafar)
-  df_plot$y_low <- train_uq[, 1]
-  df_plot$y_up <- train_uq[, 2]
-  idx <- sort(df_plot$y_mean, index.return = T)$ix
-  df_plot = df_plot[idx, ]
-  if (yBinary) {
-    df_plot$x_column = unif_jitter(yTrue[idx], range = range)
-    width = 0.5 * range/max(sum(yTrue), n_pred - sum(yTrue))
-  } else {
-    df_plot$x_column = c(1:n_pred)
-    df_ref <- data.frame(x_column = c(1:n_pred), y_column = yTrue[idx])
-  }
-  combined_plot <- ggplot() + theme_bw() + geom_point(data = df_plot, 
-    aes(x = x_column, y = y_mean), color = v_colors, fill = v_colors, 
-    shape = v_pch, size = size) + geom_errorbar(data = df_plot, 
-    aes(x = x_column, y = y_mean, ymin = y_low, ymax = y_up), 
-    color = v_colors, width = width, linewidth = linewidth, 
-    alpha = alpha) + theme(aspect.ratio = 0.7, legend.position = "bottom") + 
-    guides(colour = guide_legend(override.aes = list(size = 1)))
-  if (yBinary) {
-    combined_plot <- combined_plot + labs(y = NULL, title = "P[ y = 1 | X = x ]", 
-      x = "True Response") + geom_hline(yintercept = 0, 
-      col = "gray", linewidth = 0.7) + geom_hline(yintercept = 1, 
-      col = "gray", linewidth = 0.7) + scale_x_continuous(breaks = c(0, 
-      1), labels = c(0, 1)) + theme(plot.title = element_text(hjust = 0.5)) + 
-      scale_y_continuous(breaks = seq(0, 1, by = 0.1), 
-        labels = seq(0, 1, by = 0.1), limits = c(0, 
-          1))
-  } else {
-    combined_plot <- combined_plot + labs(y = NULL, title = "y | X = x", 
-      x = "Sorted Units") + geom_point(data = df_ref, 
-      aes(x = x_column, y = y_column), color = "black", 
-      size = 0) + scale_x_continuous(breaks = NULL, labels = NULL) + 
-      theme(plot.title = element_text(hjust = 0.5)) + 
-      geom_errorbar(data = df_ref, aes(x = x_column, y = y_column, 
-        ymin = y_column, ymax = y_column), width = size, 
-        color = "black", alpha = 0.8)
-  }
-  
-  
-```
-
 
 ```{r}
 df_ref
 
 df_plot
+```
+
+
+# Multiple datasets
+
+```{r}
+n_array <- c(50, 100, 500, 1000, 5000)
+p_array <- c(50, 100, 1000, 10000)
+snr_x_array <- c(2, 1, 0.5)
+snr_y_array <- c(2, 1, 0.5)
+reps = 10
+
+sim_grid <- expand.grid(n = n_array,
+            p_l = p_array,
+            snr_x = snr_x_array,
+            snr_y = snr_y_array,
+            rep = 1:10)
+
+data_name_base <- "sim_data_ywithview_rep%s.rds"
+data_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                      "data",
+                      "n%sp%s_snr%s.%s")
+
+out_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                           "results",
+                           "jafar")
+out_name_base <- "n%sp%s_snr%s.%s_rep%s.rds"
+
+
+log_dir <- "logs"
+
+log_message <- function(...) {
+  msg <- paste(Sys.time(), paste(..., collapse = " "), "\n")
+  cat(msg, file = log_file, append = TRUE)
+}
+```
+
+
+Raw code below. Attempting to parallelize below this.
+```{r}
+eval_table.collected <- tibble()
+mcmc_objects <- list()
+
+mapply(function(n, p, snr_x, snr_y) {
+  for (rep in 1:reps) {
+    # Load + process data
+    run_data <- load_data(n, p, snr_x, snr_y, rep)
+    X_l <- run_data$X_l
+    y <- run_data$y
+    X_l.clean <- standardize_views(X_l)
+    y.clean <- standardize_outcome(y)
+    
+    # use default K0. 
+    # FIT MODEL
+    tik <- Sys.time()
+    mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
+                                   y = y.clean, 
+                                   # K0=K0, 
+                                   # K0_m=c(10, 10, 10),
+                                   tMCMC=tMCMC, 
+                                   tBurnIn=tBurnIn, 
+                                   tThin=tThin,
+                                   hyperparams = list(seed = mcmc_seed))
+    tok <- Sys.time()
+    runtime <- tok - tik
+    
+    # Average over MCMC samples
+    jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
+    
+    # Calculate structures from fitted model and simulated data
+    est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                                   jafar_posterior_means$view_scores,
+                                   jafar_posterior_means$shared_loadings,
+                                   jafar_posterior_means$view_loadings)
+    
+    sim_obj <- calc_all_structures(run_data$Z,
+                                   run_data$Phi,
+                                   run_data$Lambda_l,
+                                   run_data$Gamma_l)
+    
+    eval_table <- bind_rows(
+      eval_model(est_obj,
+                 sim_obj,
+                 "joint_structure",
+                 "rse"),
+      eval_model(est_obj,
+                 sim_obj,
+                 "view_structure",
+                 "rse"),
+      eval_model(est_obj,
+                 sim_obj,
+                 "data_reconstruction",
+                 "rse"),
+    ) |> 
+      mutate(n = n,
+             p = p,
+             snr_x = snr_x,
+             snr_y = snr_y,
+             rep = rep,
+             time = as.numeric(difftime(tok, tik, units = "secs")))
+    
+    eval_table.collected <- bind_rows(eval_table.collected,
+                                      eval_table)
+    mcmc_objects[paste0("n", n, "p", p, "snrx", snr_x, "snry", snr_y, "rep", rep)] <- mcmc_supervised
+  }
+},
+sim_grid$n,
+sim_grid$p_l,
+sim_grid$snr_x,
+sim_grid$snr_y)
+```
+
+```{r}
+run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
+                               in_path_base,
+                               in_name_base,
+                               out_path_base,
+                               out_name_base) {
+  model_out_data_path <- file.path(out_path_base,
+                             "models",
+                             sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
+  # Skip dataset if model already run
+  if (file.exists(model_out_data_path)) {NA}
+  else {
+  
+  # n <- params$n
+  # p <- params$p
+  # snr_x <- params$snr_x
+  # snr_y <- params$snr_y
+  
+  # Load + process data
+  run_data <- load_data(in_path_base, in_name_base,
+                        n, p, snr_x, snr_y, rep)
+  X_l <- run_data$X_l
+  y <- run_data$y
+  X_l.clean <- standardize_views(X_l)
+  y.clean <- standardize_outcome(y)
+  
+  # use default K0. 
+  # FIT MODEL
+  tik <- Sys.time()
+  tryCatch({
+  mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
+                                 y = y.clean, 
+                                 # K0=K0, 
+                                 # K0_m=c(10, 10, 10),
+                                 tMCMC=tMCMC, 
+                                 tBurnIn=tBurnIn, 
+                                 tThin=tThin,
+                                 hyperparams = list(seed = mcmc_seed))
+  }, error = function(e) {
+    message(e)
+    log_message(e)
+  })
+  tok <- Sys.time()
+  runtime <- tok - tik
+  
+  # Export model
+  # model_out_data_path <- file.path(out_path_base,
+  #                            "models",
+  #                            sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
+  log_message("Writing model:", as.character(model_out_data_path))
+  saveRDS(mcmc_supervised,
+          model_out_data_path)
+  
+  tryCatch({
+    # log_message("Evaluating metrics")
+  # Average over MCMC samples
+    # log_message("→ calc_jafar_posterior_means")
+  jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
+  
+  # Calculate structures from fitted model and simulated data
+  # log_message("→ calc_all_structures est_obj")
+  est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                                 jafar_posterior_means$view_scores,
+                                 jafar_posterior_means$shared_loadings,
+                                 jafar_posterior_means$view_loadings)
+  # log_message("→ calc_all_structures sim_obj")
+  sim_obj <- calc_all_structures(run_data$Z,
+                                 run_data$Phi,
+                                 run_data$Lambda_l,
+                                 run_data$Gamma_l)
+   
+  # log_message("→ eval_model + bind_rows")
+  eval_table <- bind_rows(
+    eval_model(est_obj,
+               sim_obj,
+               "joint_structure",
+               "rse"),
+    eval_model(est_obj,
+               sim_obj,
+               "view_structure",
+               "rse"),
+    eval_model(est_obj,
+               sim_obj,
+               "data_reconstruction",
+               "rse"),
+  ) |> 
+    mutate(n = n,
+           p = p,
+           snr_x = snr_x,
+           snr_y = snr_y,
+           rep = rep,
+           time = as.numeric(difftime(tok, tik, units = "secs")))
+  
+  
+  ### Export results
+  # eval_table.collected <- bind_rows(eval_table.collected,
+  #                                   eval_table)
+  metric_out_data_path <- file.path(out_path_base,
+                             "metrics",
+                             sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
+  log_message("Writing metrics:", as.character(metric_out_data_path))
+  dir.create(dirname(metric_out_data_path), recursive = TRUE, showWarnings = TRUE)
+  stopifnot(exists("eval_table"))
+  
+  saveRDS(eval_table,
+          metric_out_data_path)
+  }, error = function(e) {
+    message(e)
+    log_message(e)
+  })
+  }
+  
+}
+```
+
+
+```{r}
+
+test_run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
+                                    in_path_base,
+                                    in_name_base,
+                                    out_path_base,
+                                    out_name_base) {
+  log_message("Starting run")
+  load_data(in_path_base, in_name_base,
+            n, p, snr_x, snr_y, rep)
+  log_message("data loaded")
+  
+  log_message(paste0(n, p, snr_x, snr_y, rep))
+  eval_table <- tibble(c(n, p, snr_x, snr_y, rep))
+  log_message(paste0(out_path_base, "mod_n", n, "p", p, "snrx", snr_x, "snry", snr_y, "rep", rep))
+  
+  saveRDS(eval_table, 
+          paste0(out_path_base, "/mod_n", n, "p", p, "snrx", snr_x, "snry", snr_y, "rep", rep, ".RDS"))
+}
+
+
+```
+
+Fit JAFAR in parallel
+```{r}
+library(foreach)
+library(doParallel)
+```
+
+```{r}
+n_cores <- detectCores()
+n_cores
+
+# cluster <- makeCluster(n_cores - 1)
+# registerDoParallel(cluster)
+```
+
+```{r}
+
+cluster <- makeCluster(n_cores - 1)
+registerDoParallel(cluster)
+
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+dir.create(log_dir, showWarnings = FALSE)
+log_file <- file.path(log_dir, paste0("run_", timestamp, ".log"))
+file.create(log_file)
+
+sim_grid_test <- sim_grid |> filter(snr_x == 1, snr_y == 1, p_l < 10000)
+
+tik <- Sys.time()
+# Run sim
+tryCatch({
+  jafar_sim_results <- foreach(i = 1:nrow(sim_grid_test),
+                               .combine = bind_rows,
+                               .packages = c("tidyverse",
+                                             "jafar",
+                                             "Rfast")#,
+                               # .export = c("load_data",
+                               #             "standardize_views",
+                               #             "calc_jafar_posterior_means",
+                               #             "calc_all_structures",
+                               #             "tMCMC",
+                               #             "tBurnIn",
+                               #             "tThin",
+                               #             "mcmc_seed")
+  ) %dopar% {
+    log_message("Worker:", paste(Sys.info()[['nodename']], Sys.getpid(), sep='-'))
+    params <- sim_grid_test[i, ]
+    run_and_eval_model(params$n,
+                       params$p,
+                       params$snr_x,
+                       params$snr_y,
+                       params$rep,
+                       data_path_base,
+                       data_name_base,
+                       out_path_base,
+                       out_name_base)
+  }
+  
+  message("Stopping cluster")
+  stopCluster(cl = cluster)
+}, error = function(e){
+  message(e)
+  log_message("Worker:", paste(Sys.info()[['nodename']], Sys.getpid(), sep='-'), e)
+  message("Stopping cluster")
+  stopCluster(cl = cluster)
+}
+)
+tok <- Sys.time()
+
+print(tok - tik)
+```
+
+
+Debugging
+```{r}
+i = 1
+params <- sim_grid_test[i, ]
+run_and_eval_model(params$n,
+                       params$p,
+                       params$snr_x,
+                       params$snr_y,
+                       params$rep,
+                       data_path_base,
+                       data_name_base,
+                       out_path_base,
+                       out_name_base)
+
+
+n = params$n
+p = params$p
+snr_x = params$snr_x
+snr_y = params$snr_y
+rep = params$rep
+in_path_base = data_path_base
+in_name_base = data_name_base
+out_path_base = out_path_base
+out_name_base = out_name_base
+
+#################
+# Load + process data
+  run_data <- load_data(in_path_base, in_name_base,
+                        n, p, snr_x, snr_y, rep)
+  X_l <- run_data$X_l
+  y <- run_data$y
+  X_l.clean <- standardize_views(X_l)
+  y.clean <- standardize_outcome(y)
+  
+  # use default K0. 
+  # FIT MODEL
+  tik <- Sys.time()
+  tryCatch({
+  mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
+                                 y = y.clean, 
+                                 # K0=K0, 
+                                 # K0_m=c(10, 10, 10),
+                                 tMCMC=tMCMC, 
+                                 tBurnIn=tBurnIn, 
+                                 tThin=tThin,
+                                 hyperparams = list(seed = mcmc_seed))
+  }, error = function(e) {
+    message(e)
+    log_message(e)
+  })
+  tok <- Sys.time()
+  runtime <- tok - tik
+  
+  # Export model
+  model_out_data_path <- file.path(out_path_base,
+                             "models",
+                             sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
+  log_message("Writing model:", as.character(model_out_data_path))
+  saveRDS(mcmc_supervised,
+          model_out_data_path)
+  
+  tryCatch({
+    log_message("Evaluating metrics")
+  # Average over MCMC samples
+    log_message("→ calc_jafar_posterior_means")
+  jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
+  
+  # Calculate structures from fitted model and simulated data
+  log_message("→ calc_all_structures est_obj")
+  est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                                 jafar_posterior_means$view_scores,
+                                 jafar_posterior_means$shared_loadings,
+                                 jafar_posterior_means$view_loadings)
+  log_message("→ calc_all_structures sim_obj")
+  sim_obj <- calc_all_structures(run_data$Z,
+                                 run_data$Phi,
+                                 run_data$Lambda_l,
+                                 run_data$Gamma_l)
+   
+  log_message("→ eval_model + bind_rows")
+  eval_table <- bind_rows(
+    eval_model(est_obj,
+               sim_obj,
+               "joint_structure",
+               "rse"),
+    eval_model(est_obj,
+               sim_obj,
+               "view_structure",
+               "rse"),
+    eval_model(est_obj,
+               sim_obj,
+               "data_reconstruction",
+               "rse"),
+  ) |> 
+    mutate(n = n,
+           p = p,
+           snr_x = snr_x,
+           snr_y = snr_y,
+           rep = rep,
+           time = as.numeric(difftime(tok, tik, units = "secs")))
+  
+  
+  ### Export results
+  # eval_table.collected <- bind_rows(eval_table.collected,
+  #                                   eval_table)
+  metric_out_data_path <- file.path(out_path_base,
+                             "metrics",
+                             sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
+  log_message("Writing metrics:", as.character(metric_out_data_path))
+  dir.create(dirname(metric_out_data_path), recursive = TRUE, showWarnings = TRUE)
+  stopifnot(exists("eval_table"))
+  
+  saveRDS(eval_table,
+          metric_out_data_path)
+  }, error = function(e) {
+    message(e)
+    log_message(e)
+  })
+
+#################
+shared_scores = jafar_posterior_means$shared_scores
+view_scores = jafar_posterior_means$view_scores
+shared_loadings = jafar_posterior_means$shared_loadings
+view_loadings = jafar_posterior_means$view_loadings
+
+joint_structure = lapply(1:length(shared_loadings), 
+                             function(l) {
+                               compute_structure(shared_scores,
+                                                 shared_loadings[[l]])
+                             }
+    )
+    view_structure = lapply(1:length(view_scores), 
+                            function(l) {
+                              compute_structure(view_scores[[l]],
+                                                view_loadings[[l]])
+                            }
+    )
+    data_reconstruction = lapply(1:length(view_scores), 
+                                 function(l) {
+                                   compute_structure(shared_scores,
+                                                     view_scores[[l]]) + 
+                                     compute_structure(view_scores[[l]],
+                                                       view_loadings[[l]])
+                                 }
+    )
+```
+
+
+
+```{r}
+for (n in n_array) {
+  for (p in p_array) {
+    for (rep in 1:reps) {
+      # Load + process data
+      run_data <- load_data(n, p, snr_x, snr_y)
+      X_l <- run_data$X_l
+      y <- run_data$y
+      X_l.clean <- standardize_views(X_l)
+      y.clean <- standardize_outcome(y)
+      
+      # use default K0
+      mcmc_supervised <- gibbs_jafar(X_m = X_l.clean, 
+                                     y = y.clean, 
+                                     # K0=K0, 
+                                     # K0_m=c(10, 10, 10),
+                                     tMCMC=tMCMC, 
+                                     tBurnIn=tBurnIn, 
+                                     tThin=tThin,
+                                     hyperparams = list(seed = mcmc_seed))
+      
+      # Average over MCMC samples
+      jafar_posterior_means <- calc_jafar_posterior_means(mcmc_supervised)
+      
+      # Calculate structures from fitted model and simulated data
+      est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                                     jafar_posterior_means$view_scores,
+                                     jafar_posterior_means$shared_loadings,
+                                     jafar_posterior_means$view_loadings)
+      
+      sim_obj <- calc_all_structures(run_data$Z,
+                                     run_data$Phi,
+                                     run_data$Lambda_l,
+                                     run_data$Gamma_l)
+      
+      eval_table <- bind_rows(
+        eval_model(est_obj,
+                   sim_obj,
+                   "joint_structure",
+                   "rse"),
+        eval_model(est_obj,
+                   sim_obj,
+                   "view_structure",
+                   "rse"),
+        eval_model(est_obj,
+                   sim_obj,
+                   "data_reconstruction",
+                   "rse"),
+      ) |> 
+        mutate(n = n,
+               p = p,
+               snr_x = snr_x,
+               snr_y = snr_y,
+               rep = rep)
+      
+      eval_table.collected <- bind_rows(eval_table.collected,
+                                        eval_table)
+      mcmc_objects[paste0("n", n, "p", p, "snrx", snr_x, "snry", snr_y, "rep", rep)] <- mcmc_supervised
+      
+    }
+  }
+}
+```
+
+
+```{r}
+eval_table.collected |> 
+  mutate(n = factor(n),
+         l = factor(l),
+         p = factor(p)) |> 
+  print() |>
+  ggplot() +
+  geom_point(aes(x = n,
+                 y = result,
+                 # group = n,
+                 color = l)) +
+  facet_grid(rows = vars(quantity),
+             cols = vars(p),
+             scales = "fixed")
+```
+
+
+## Evaluate
+
+Load all metric files and plot
+
+```{r}
+getwd()
+metric_filenames <- list.files("./results/jafar/metrics/", pattern = "\\.rds$", full.names = TRUE)
+
+jafar_sim_results <- lapply(metric_filenames,
+                            function(x) readRDS(x)) |> 
+  bind_rows()
+```
+
+
+```{r}
+jafar_sim_results |> 
+  mutate(n = factor(n),
+         l = factor(l),
+         p = factor(p)) |> 
+  # filter(rep == 1) |> 
+  print() |>
+  ggplot() +
+  # geom_point(aes(x = n,
+  #                y = result,
+  #                # group = n,
+  #                color = l)) +
+  geom_boxplot(aes(x = n,
+                 y = result,
+                 # group = n,
+                 color = l)) +
+  facet_grid(rows = vars(quantity),
+             cols = vars(p),
+             scales = "fixed",
+             labeller = label_both) + 
+  labs(
+    title = "Relative squared error of structure and data reconstruction for JAFAR",
+    subtitle = TeX("$\\frac{\\|S - \\hat{S}\\| ^{2}}{\\|S \\|^{2}}$")
+  )
+  
+```
+
+
+```{r}
+jafar_sim_results |> 
+  group_by(n, p, snr_x, snr_y, rep) |> 
+  summarise(mean(time))
+
+jafar_sim_results |> 
+  distinct(n, p, snr_x, snr_y, rep, .keep_all = TRUE) |> 
+  mutate(n = factor(n),
+         l = factor(l),
+         p = factor(p)
+         ) |>
+  # distinct(n, p)
+  print() |> 
+  ggplot() + 
+  geom_boxplot(aes(x = n, y = time)) +
+  facet_wrap(~p, labeller = label_both) + 
+  labs(
+    title = "Wallclock time for JAFAR runs"
+  )
 ```
 

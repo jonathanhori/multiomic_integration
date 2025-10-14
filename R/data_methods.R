@@ -2,6 +2,20 @@
 # colMeans(X_l[[1]])
 # colVars(X_l[[1]], std = TRUE)
 
+library(Rfast)
+
+
+load_data <- function(path_base, name_base, 
+                      n, p, snr_x, snr_y, rep) {
+  out_path <- sprintf(path_base, n, p, snr_x, snr_y)
+  data_path <- file.path(file.path(out_path,
+                                   sprintf(name_base, rep)))
+  
+  log_message("Loading:", as.character(data_path))
+  
+  readRDS(as.character(data_path))
+}
+
 
 standardize_X <- function(data, training_data = NA) {
   if (is.na(training_data)) {
@@ -38,3 +52,103 @@ standardize_outcome <- function(data, training_data = NA) {
 # mean(y)
 # 
 # scale(y)
+
+calc_jafar_posterior_means <- function(mcmc_supervised) {
+  jafar_loadings.shared <- lapply(mcmc_supervised$Lambda_m,
+                                  function(mat) {
+                                    apply(mat, c(2, 3), mean)
+                                  })
+  
+  jafar_loadings.view_specific <- lapply(mcmc_supervised$Gamma_m,
+                                         function(mat) {
+                                           apply(mat, c(2, 3), mean)
+                                         })
+  
+  
+  jafar_scores.shared <- apply(mcmc_supervised$eta, c(2, 3), mean)
+  
+  jafar_scores.view_specific <- lapply(mcmc_supervised$phi_m,
+                                       function(mat) {
+                                         apply(mat, c(2, 3), mean)
+                                       })
+  
+  return(list(
+    shared_scores = jafar_scores.shared,
+    view_scores = jafar_scores.view_specific,
+    shared_loadings = jafar_loadings.shared,
+    view_loadings = jafar_loadings.view_specific
+  ))
+}
+
+
+compute_structure <- function(scores,
+                              loadings) {
+  scores %*% t(loadings)
+}
+
+calc_all_structures <- function(shared_scores,
+                                view_scores,
+                                shared_loadings,
+                                view_loadings) {
+  list(
+    joint_structure = lapply(1:length(shared_loadings), 
+                             function(l) {
+                               compute_structure(shared_scores,
+                                                 shared_loadings[[l]])
+                             }
+    ),
+    view_structure = lapply(1:length(view_scores), 
+                            function(l) {
+                              compute_structure(view_scores[[l]],
+                                                view_loadings[[l]])
+                            }
+    ),
+    data_reconstruction = lapply(1:length(view_scores), 
+                                 function(l) {
+                                   compute_structure(shared_scores,
+                                                     shared_loadings[[l]]) + 
+                                     compute_structure(view_scores[[l]],
+                                                       view_loadings[[l]])
+                                 }
+    )
+  )
+}
+
+
+eval_model <- function(est_obj,
+                       sim_obj,
+                       quantity,
+                       metric) {
+  # For a given quantity (e.g. joint_structure, view_structure, data_reconstruction),
+  #   compute the desired metric (e.g. relative squared error, difference norm)
+  
+  # Extract quantity to evaluate from model and simulation settings
+  est_quantity = switch(quantity,
+                        joint_structure = {est_obj$joint_structure},
+                        view_structure = {est_obj$view_structure},
+                        data_reconstruction = {est_obj$data_reconstruction})
+  sim_quantity = switch(quantity,
+                        joint_structure = {sim_obj$joint_structure},
+                        view_structure = {sim_obj$view_structure},
+                        data_reconstruction = {sim_obj$data_reconstruction})
+  
+  results = lapply(1:length(sim_obj$view_structure),
+                   function(l) {
+                     return(list(
+                       l = l,
+                       quantity = quantity,
+                       metric = metric,
+                       result = switch(
+                         metric,
+                         rse = {norm(sim_quantity[[l]] - 
+                                       est_quantity[[l]], type = "F")^2 / norm(sim_quantity[[l]], type = "F")^2},
+                         difference_norm = {norm(sim_quantity[[l]] - 
+                                                   est_quantity[[l]], type = "F")^2}
+                       )
+                     )
+                     )
+                   }
+  ) |> bind_rows()
+  
+  return(results)
+}
