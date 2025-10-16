@@ -13,11 +13,13 @@ source("./R/sim_methods.R")
 
 Specify number of views, subjects, data dimensions, latent factor dimensions, and SNRs.
 ```{r}
+
+
 L = 3
 N = 1000
-p_l = 50
+p_l = rep(1000, L)
 K = 5
-K_l = 5
+K_l = rep(5, L)
 snr_x = 2
 snr_y = 2
 
@@ -32,8 +34,8 @@ sim_data_spec <- lapply(1:L,
                                          p_l = p_l,
                                          # K = K,
                                          K_l = K_l,
-                                         snr_x = snr_x)
-                        # ,
+                                         snr_x = snr_x,
+                                         sparsity = 0) #,
                                          # snr_y = snr_y)
 )
 ```
@@ -47,7 +49,7 @@ set.seed(123)
 sim_loadings.shared <- lapply(sim_data_spec,
                        function(spec) {
                          generate_factor_loadings(spec, 
-                                                  sparsity_prob = 1 - loading_sparsity, 
+                                                  sparsity_prob = 1 - spec$sparsity, 
                                                   K)
                        }
 )
@@ -55,7 +57,7 @@ sim_loadings.shared <- lapply(sim_data_spec,
 sim_loadings.view_specific <- lapply(sim_data_spec,
                        function(spec) {
                          generate_factor_loadings(spec, 
-                                                  sparsity_prob = 1 - loading_sparsity)
+                                                  sparsity_prob = 1 - spec$sparsity)
                        }
 )
 
@@ -69,6 +71,14 @@ sim_factors.view_specific <- lapply(sim_data_spec,
 )
   
 ```
+
+```{r}
+set.seed(123)
+sample(LETTERS, 5)
+set.seed(123)
+sample(LETTERS, 5)
+```
+
 
 Determine the necessary variance to obtain a desired SNR.
 ```{r}
@@ -109,6 +119,7 @@ sim_data.x <- lapply(1:length(sim_data_spec),
 From coefficients and factor scores
 
 ```{r}
+
 # beta_sim <- rnorm(n = K)
 # 
 # outcome_var <- t(beta_sim) %*% beta_sim / K
@@ -169,18 +180,148 @@ sim_data <- list(
   Z = sim_factors.shared,
   Phi = sim_factors.view_specific
 )
+
+
+  # L = L,
+  #                             N = N,
+  #                             p_l = c(p_l, p_l, p_l),
+  #                             K = K,
+  #                             K_l = c(K_l, K_l, K_l))
 ```
 
 
 # Save
 ```{r}
-saveRDS(sim_data, "./sim/data/sim_data_n1000p50_snr2.2_ywithview.rds")
+# data_name_base <- "sim_data_n%sp%s_snr%s.%s_ywithview.rds"
+# saveRDS(sim_data, sprintf(data_name_base, N, p_l, snr_x, snr_y))
+
+saveRDS(sim_data, 
+        file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                  "data",
+                  sprintf(data_name_base, N, p_l, snr_x, snr_y))
+)
 
 # saveRDS(sim_data.x, "data/sim_data_x.rds")
 # saveRDS(sim_data.y, "data/sim_data_y.rds")
 ```
 
 ```{r}
+
+```
+
+#--------------------
+# Multiple reps
+
+
+```{r}
+set.seed(123)
+
+reps = 10
+
+n_array <- c(50, 100, 500, 1000, 5000)
+p_array <- c(50, 100, 1000, 10000)
+snr_x_array <- c(2, 1, 0.5)
+snr_y_array <- c(2, 1, 0.5)
+# snr_x_array <- c(0.5)
+# snr_y_array <- c(0.5)
+L = 3
+K = 5
+K_l = 5
+loading_sparsity = 0
+
+sim_grid <- expand.grid(n = n_array,
+            p_l = p_array,
+            snr_x = snr_x_array,
+            snr_y = snr_y_array)
+
+sim_grid <- sim_grid |> filter(n == 5000, p_l == 1000, snr_x == 1, snr_y == 1)
+
+data_name_base <- "sim_data_ywithview_rep%s.rds"
+data_path_base <- "n%sp%s_snr%s.%s"
+
+mapply(function(n, p_l, snr_x, snr_y) {
+  # Create output path
+  out_path <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                        "data",
+                        sprintf(data_path_base, n, p_l, snr_x, snr_y))
+  # if (dir.exists(out_path)) {NA}
+  # else {
+    dir.create(out_path,
+               showWarnings = FALSE)
+    
+    # Replicates
+    for (rep in 10:reps) {
+      if (n == 5000 & p_l == 10000) {NA} # takes too long
+      else {
+        # Check if replicate already created
+        if (file.exists(file.path(out_path,
+                                  sprintf(data_name_base, rep)))) {NA}
+        else {
+          sim_data <- generate_factor_data(L = L,
+                                           N = n,
+                                           p_l_vec = c(p_l, p_l, p_l),
+                                           K = K,
+                                           K_l_vec = c(K_l, K_l, K_l),
+                                           snr_x_vec = c(snr_x, snr_x, snr_x),
+                                           sparsity_vec = c(loading_sparsity, loading_sparsity, loading_sparsity),
+                                           snr_y = snr_y,
+                                           outcome = "all")
+          
+          saveRDS(sim_data, 
+                  file.path(out_path,
+                            sprintf(data_name_base, rep))
+          )
+        }
+      }
+    }
+  # }
+},
+sim_grid$n,
+sim_grid$p_l,
+sim_grid$snr_x,
+sim_grid$snr_y)
+
+```
+
+#--------------------
+# Debug: Generate one dataset
+
+```{r}
+
+L = 3
+n = 500
+p_l = 100 #rep(1000, L)
+K = 5
+K_l = 5 #rep(5, L)
+snr_x = 9
+snr_y = 2
+
+data_name_base <- "sim_data_ywithview_rep%s.rds"
+data_path_base <- "n%sp%s_snr%s.%s"
+
+out_path <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                      "data2",
+                      sprintf(data_path_base, n, p_l, snr_x, snr_y))
+out_path
+dir.create(out_path, recursive = TRUE)
+
+
+rep = 1
+
+sim_data <- generate_factor_data(L = L,
+                                 N = n,
+                                 p_l_vec = c(p_l, p_l, p_l),
+                                 K = K,
+                                 K_l_vec = c(K_l, K_l, K_l),
+                                 snr_x_vec = c(snr_x, snr_x, snr_x),
+                                 sparsity_vec = c(loading_sparsity, loading_sparsity, loading_sparsity),
+                                 snr_y = snr_y,
+                                 outcome = "all")
+
+saveRDS(sim_data, 
+        file.path(out_path,
+                  sprintf(data_name_base, rep))
+)
 
 ```
 

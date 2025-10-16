@@ -8,7 +8,7 @@ generate_factor_loadings <- function(data_spec, sparsity_prob = 1, K = NA) {
              ncol = data_spec$K_l)
   } else { # shared
     rnorm(n = data_spec$K * data_spec$p_l) * 
-      rbinom(n = data_spec$K_l * data_spec$p_l, 
+      rbinom(n = data_spec$K * data_spec$p_l, 
              size = 1, 
              prob = sparsity_prob) |> 
       matrix(nrow = data_spec$p_l,
@@ -18,9 +18,9 @@ generate_factor_loadings <- function(data_spec, sparsity_prob = 1, K = NA) {
 
 generate_factor_scores <- function(data_spec, K = NA) {
   if (is.na(K)) { # view-specific
-    rmvnorm(n = data_spec$N, mean = rep(0, data_spec$K_l)) 
+    mvtnorm::rmvnorm(n = data_spec$N, mean = rep(0, data_spec$K_l)) 
   } else { # shared
-    rmvnorm(n = data_spec$N, mean = rep(0, K))
+    mvtnorm::rmvnorm(n = data_spec$N, mean = rep(0, K))
   }
 }
 
@@ -71,7 +71,7 @@ generate_factor_data <- function(L,
   view_vars <- lapply(1:L,
                       function(l) {
                         diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]) + 
-                               sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]])) / N
+                               sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]))# / N
                       })
   noise_x_views <- lapply(1:length(sim_data_spec),
                           function(l) {
@@ -116,7 +116,7 @@ generate_factor_data <- function(L,
     sim_beta_cat <- c(beta_sim, beta_l |> unlist())
     ncoef = K + lapply(1:L, function(l) sim_data_spec[[l]]$K_l) |> unlist() |> sum()
     
-    outcome_var <- t(sim_beta_cat) %*% sim_beta_cat / ncoef
+    outcome_var <- t(sim_beta_cat) %*% sim_beta_cat# / ncoef
     noise_y <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
     
     sim_data.y <- sim_factors.shared %*% beta_sim + 
@@ -125,7 +125,7 @@ generate_factor_data <- function(L,
   } else if (outcome == "shared") {
     beta_sim <- rnorm(n = K)
     
-    outcome_var <- t(beta_sim) %*% beta_sim / K
+    outcome_var <- t(beta_sim) %*% beta_sim# / K
     noise_y <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
     
     sim_data.y <- sim_factors.shared %*% beta_sim + noise_y
