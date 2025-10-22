@@ -71,7 +71,7 @@ generate_factor_data <- function(L,
   view_vars <- lapply(1:L,
                       function(l) {
                         diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]) + 
-                               sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]))# / N
+                               sim_loadings.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]))# / N
                       })
   noise_x_views <- lapply(1:length(sim_data_spec),
                           function(l) {
