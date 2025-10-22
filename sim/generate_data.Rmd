@@ -218,8 +218,8 @@ set.seed(123)
 
 reps = 10
 
-n_array <- c(50, 100, 500, 1000, 5000)
-p_array <- c(50, 100, 1000, 10000)
+n_array <- c(50, 100, 500, 1000) #, 5000)
+p_array <- c(50, 100, 1000) #, 10000)
 snr_x_array <- c(2, 1, 0.5)
 snr_y_array <- c(2, 1, 0.5)
 # snr_x_array <- c(0.5)
@@ -284,7 +284,114 @@ sim_grid$snr_y)
 ```
 
 #--------------------
-# Debug: Generate one dataset
+# Generate simple factorized matrix
+
+X = Z %*% Lambda^T + E
+
+```{r}
+L = 1
+N = 2000
+p_l = rep(10000, L)
+K = 5
+K_l = rep(5, L)
+snr_x = 2
+snr_y = 2
+
+loading_sparsity = 0
+
+sim_data_spec <- lapply(1:L,
+                        function(l) list(N = N,
+                                         p_l = p_l,
+                                         # K = K,
+                                         K_l = K_l,
+                                         snr_x = snr_x,
+                                         sparsity = 0) #,
+                                         # snr_y = snr_y)
+)
+```
+
+
+```{r}
+set.seed(123)
+
+sim_loadings.shared <- lapply(sim_data_spec,
+                       function(spec) {
+                         generate_factor_loadings(spec, 
+                                                  sparsity_prob = 1 - spec$sparsity, 
+                                                  K)
+                       }
+)
+
+sim_factors.shared <- generate_factor_scores(sim_data_spec[[1]], K)
+
+
+view_vars <- lapply(1:L,
+       function(l) {
+         diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]))
+       }) #|> diag()
+
+
+noise_x_views <- lapply(1:length(sim_data_spec),
+                  function(l) {
+                    
+                    noise_x <- matrix(nrow = N, ncol = sim_data_spec[[l]]$p_l)
+                    for (i in 1:N) {
+                      for (j in 1:sim_data_spec[[l]]$p_l) {
+                        noise_x[i, j] <- rnorm(1, sd = sqrt(view_vars[[l]][[j]] / sim_data_spec[[l]]$snr_x))
+                      }
+                    }
+                    noise_x
+                  }
+)
+
+sim_data.x <- lapply(1:length(sim_data_spec), 
+                       function(l) {
+                         sim_factors.shared %*% t(sim_loadings.shared[[l]]) + 
+                           noise_x_views[[l]]
+                       }
+  )
+```
+
+
+```{r}
+sim_data <- list(
+  L = L,
+  N = N,
+  p_l = lapply(sim_data.x, ncol),
+  K = K,
+  K_l = c(K_l, K_l, K_l),
+  X_l = sim_data.x,
+  # y = sim_data.y,
+  Lambda_l = sim_loadings.shared,
+  # Gamma_l = sim_loadings.view_specific,
+  Z = sim_factors.shared
+  # Phi = sim_factors.view_specific
+)
+```
+
+
+
+```{r}
+data_name_base <- "factor_data_n%sp%s_snr%s.%s.rds"
+# saveRDS(sim_data, sprintf(data_name_base, N, p_l, snr_x, snr_y))
+# saveRDS()
+saveRDS(sim_data, #sim_data.x, 
+        file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
+                  "simple_data",
+                  sprintf(data_name_base, N, p_l, snr_x, snr_y))
+)
+```
+
+
+```{r}
+
+svd(sim_data.x[[1]])
+```
+
+
+#--------------------
+# Generate just one dataset
+For debugging
 
 ```{r}
 
@@ -323,5 +430,17 @@ saveRDS(sim_data,
                   sprintf(data_name_base, rep))
 )
 
+```
+
+
+Check one dataset
+```{r}
+test_data <- readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/n500p100_snr1.1/sim_data_ywithview_rep1.rds')
+
+```
+
+
+```{r}
+test_data$X_l
 ```
 
