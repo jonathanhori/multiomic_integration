@@ -4,3 +4,4 @@
 .Ruserdata
 *.rds
 sim/logs
+**/__pycache__
