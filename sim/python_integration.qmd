@@ -1,0 +1,691 @@
+---
+jupyter: python3
+---
+
+```{python}
+import os
+import sys
+```
+
+```{python}
+import os
+import rpy2.robjects as robjects
+
+import pandas as pd
+import seaborn as sns
+
+from rpy2.robjects import pandas2ri, default_converter, conversion
+
+import torch
+import pyro
+from rpy2.robjects import r, vectors
+from rpy2 import rinterface
+
+from torchvision import transforms
+
+from pathlib import Path
+```
+
+```{python}
+#| label: Insert path
+sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/python")
+```
+
+```{python}
+#| label: Load data utils
+
+from r_data_utils import bayesian_factor_model, train_decomp, predict_factor_model
+```
+
+```{python}
+#| label: Load model objects
+
+importlib.reload(sys.modules["matrix_decomp"])
+# from matrix_decomp import bayesian_factor_model, train_decomp, predict_factor_model, FactorModelARD, do_inference, subsample_create_plates
+from matrix_decomp import FactorModelARD, do_inference
+```
+
+# Load data
+
+## Load single dataset
+
+```{python}
+conversion._converter = None
+conversion.set_conversion(default_converter)
+readRDS = robjects.r['readRDS']
+
+sim_data = readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/simple_data/factor_data_n1000p500_snr2.2.rds')
+# sim_data = readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/simple_data/factor_data_n2000p10000_snr2.2.rds')
+        
+```
+
+```{python}
+print(sim_data)
+```
+
+```{python}
+conversion.set_conversion(default_converter)
+
+sim_data_torch = {name: r_to_torch(sim_data.rx2(name)) for name in sim_data.names}
+
+sim_data_torch
+```
+
+```{python}
+# os.path.isdir(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n50p100_snr2.2_sparse0"))
+# os.path.isdir("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3")
+```
+
+## Load data from path
+```{python}
+sim_data_path = "~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/"
+
+# Absolute paths to directories containing dataset replicates
+dirs = [os.path.join(sim_data_path, dir) \
+    for dir in os.listdir(os.path.expanduser(sim_data_path)) \
+        if os.path.isdir(os.path.expanduser(os.path.join(sim_data_path, dir)))]
+
+dirs
+```
+
+```{python}
+# conversion._converter = None
+# conversion.set_conversion(default_converter)
+
+filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in dirs}
+```
+
+
+```{python}
+
+files_for_condition = load_and_process_rds_data_for_condition("n100p100_snr2.2_sparse0", 
+    sim_data_path, 
+    filename_dict)
+```
+
+```{python}
+print(files.get("sim_data_ywithview_rep1"))
+```
+```{python}
+dirs[0]
+filename_dict.keys()
+```
+
+```{python}
+files.get("sim_data_ywithview_rep1")
+```
+```{python}
+# Iterate over simulation condtions
+for name in filename_dict.keys():
+    print(name)
+    # Load all replicates
+    files_for_condition = load_and_process_rds_data_for_condition(
+        name, 
+        sim_data_path, 
+        filename_dict)
+    # Fit for each replicate
+    for cond in files_for_condition.keys():
+        X = files_for_condition.get(cond).get("X_l")[0]
+        p = files_for_condition.get(cond).get("p_l")[0]
+        n = files_for_condition.get(cond).get("N")[0]
+
+        print(X, p, n)
+
+
+        #####
+        # Run model on data
+        #####
+    pass
+  
+
+```
+
+```{python}
+files_for_condition.get("sim_data_ywithview_rep1").get("X_l")
+```
+
+Example of how to load data from imported RDS object
+
+
+```{python}
+# conversion._converter = None
+# conversion.set_conversion(default_converter)
+
+# y = sim_data.rx2("y")
+# y = torch.tensor(y)
+
+# y.shape
+
+# input_dims = [tuple(robjects.r['dim'](x)) for x in sim_data.rx2("X_l")]
+
+# conversion.set_conversion(default_converter)
+# X_l_list = [torch.reshape(torch.tensor(X_l), dim[::-1]).t() for X_l, dim in zip(sim_data.rx2("X_l"), input_dims)]
+```
+
+```{python}
+X_l_list
+```
+
+Process entire RDS file
+
+
+```{python}
+conversion.set_conversion(default_converter)
+[floatmatrix_to_torch(x[1]) for x in sim_data.items()]
+```
+
+```{python}
+conversion.set_conversion(default_converter)
+[name for name in sim_data.names()]
+```
+
+```{python}
+conversion.set_conversion(default_converter)
+X = floatmatrix_to_torch(next(sim_data.items())[1])
+# X = 
+```
+
+```{python}
+X = sim_data_torch["X_l"][0]
+k = int(sim_data_torch["K"].item())
+n = X.shape[0]
+```
+
+```{python}
+print(X.shape)
+print(k)
+print(n)
+```
+
+# Load data into model
+
+```{python}
+import importlib
+```
+
+
+
+
+```{python}
+sim_data_torch["X_l"][0]
+```
+
+```{python}
+X_l_tensor = torch.utils.data.TensorDataset(sim_data_torch["X_l"][0])
+loader = torch.utils.data.DataLoader(X_l_tensor, batch_size = len(X_l_tensor))
+one_batch, = next(iter(loader))
+one_batch.shape
+```
+
+## Visualize model structure
+```{python}
+pyro.render_model(
+    factor_model, #bayesian_factor_model, 
+    model_args = (X,
+                  torch.arange(X.shape[0])
+    ),
+    render_distributions=True, 
+    render_params=True,
+    render_deterministic = True)
+```
+
+```{python}
+pyro.clear_param_store()
+```
+
+```{python}
+
+# X = one_batch
+# k = 5
+n = X.shape[0]
+```
+
+
+```{python}
+pyro.get_param_store().get_all_param_names()
+```
+
+```{python}
+pyro.clear_param_store()
+```
+
+
+```{python}
+# print(X.shape)
+X_means = torch.mean(X, 0)
+X_stds = torch.std(X, 0)
+
+```
+
+```{python}
+# normalizer = transforms.Normalize(mean = X_means, std = X_stds)
+# X_clean = normalizer(X)
+
+X_clean = (X - X_means) / X_stds
+```
+
+```{python}
+torch.mean(X_clean, 0)
+```
+
+# Run model
+
+```{python}
+# def subsample_create_plates(X):
+#     return pyro.plate("obs", 1000, subsample = torch.LongTensor(range(X.shape[0])))
+
+# factor_model = FactorModelARD(k, n)
+# guide = pyro.infer.autoguide.AutoNormal(
+#     factor_model, 
+#     create_plates = subsample_create_plates)
+```
+
+## Run model: with minibatching
+
+```{python}
+# X_clean.shape
+X_dataset = torch.utils.data.TensorDataset(torch.arange(X_clean.shape[0]), X_clean)
+```
+
+```{python}
+loader = torch.utils.data.DataLoader(X_dataset, batch_size = 32, shuffle = True, drop_last=True)
+```
+
+```{python}
+for batch in loader:
+    # print(idx)
+    print(batch)
+```
+
+
+```{python}
+
+# def subsample_create_plates(X):
+#     return pyro.plate("obs", 1000, subsample = torch.LongTensor(range(X.shape[0])))
+
+factor_model = FactorModelARD(k, n)
+guide = factor_model.guide
+# guide = pyro.infer.autoguide.AutoNormal(
+#     factor_model, 
+#     create_plates = subsample_create_plates)
+
+
+pyro.clear_param_store()
+
+t0 = time.time()
+svi, opt = do_inference(
+    X_clean, #X,
+    factor_model,
+    guide,
+    opt = "Adam",
+    tol = 1,
+    epochs = 1000,
+    minibatch_flag = True,
+    minibatch_size = 32,
+    opt_args = {"lr":0.001} #, "weight_decay": 5}
+    )
+# opt_minibatch = train_decomp(X, #sim_data_torch["X_l"][0], #X, 
+#                    k, 
+#                    epochs = 500,
+#                    minibatch_flag = True,
+#                    minibatch_size = 500,
+#                    opt_args = {"lr": 0.001})
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins")
+```
+
+
+```{python}
+run_minibatch / 60
+```
+
+```{python}
+p = sns.relplot(
+    data = factor_model.loss_history,
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Negative ELBO")
+p.fig.suptitle("Minibatch loss per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+
+```
+Pass full dataset as Tensor into model training. Tolerance is at scale of difference in ELBO by iteration.
+
+```{python}
+import time
+```
+
+## Run model: batch updates
+
+tol = 1 works fine for unscaled data
+tol = 0.5 good for rescaled data
+
+```{python}
+pyro.clear_param_store()
+
+factor_model = FactorModelARD(k, n)
+guide = factor_model.guide
+# guide = pyro.infer.autoguide.AutoNormal(
+#     factor_model)
+
+
+t0 = time.time()
+svi, opt = do_inference(
+    X_clean, #X,
+    factor_model,
+    guide,
+    minibatch_flag = False,
+    tol = 1)
+
+# factor_model.do_inference(
+#     X,
+#     minibatch_flag = False,
+#     tol = 1)
+t1 = time.time()
+run = t1 - t0
+print(f"Runtime: {run / 60} mins")
+```
+
+```{python}
+print(f"Runtime: {run / 60} mins")
+```
+
+```{python}
+# pyro.clear_param_store()
+# t0 = time.time()
+# opt = train_decomp(X,
+#                    k, 
+#                    minibatch_flag = False,
+#                    tol = 1)
+# t1 = time.time()
+# run = t1 - t0
+```
+
+## Plot loss
+```{python}
+p = sns.relplot(
+    data = factor_model.loss_history,
+    kind = "line"
+)
+p.set_axis_labels("100 Iterations", "Negative ELBO")
+p.fig.suptitle("Minibatch loss per epoch")
+# factor_model.loss_history
+```
+
+
+```{python}
+len(factor_model.loss_history)
+```
+## Save model and optimzer state
+
+```{python}
+opt.get_state()
+pyro.get_param_store().get_state()
+```
+
+```{python}
+out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/rmf_ard")
+out_filename = os.path.join(out_path, "batch_run_n1000p500_customguide.pth")
+```
+
+```{python}
+out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/rmf_ard")
+out_filename = os.path.join(out_path, "batch_run_n1000p500_customguide.pth")
+
+torch.save({
+    "inference_time": run,
+    "model_param_store": pyro.get_param_store(),
+    "model_state_dict": pyro.get_param_store().get_state(),
+    "optimizer_state": opt.get_state(),
+    "loss_history": factor_model.loss_history
+}, out_filename)
+```
+
+
+
+```{python}
+
+```
+
+
+```{python}
+print(run)
+```
+
+Save parameter store 
+```{python}
+pyro.get_param_store().save("rmf_ard.params_n2000p10000.save")
+```
+
+```{python}
+pyro.get_param_store().get_all_param_names()
+```
+
+
+```{python}
+for name in pyro.get_param_store().get_all_param_names():
+    print(name)
+    print(pyro.param(name))
+```
+
+
+### Evaluate latent structure reconstruction
+
+With AutoNormal guide
+```{python}
+Lambda_est = pyro.param("AutoNormal.locs.Lambda")
+Z_est = pyro.param("AutoNormal.locs.Z_batch")
+Z_est
+```
+
+With custom guide
+```{python}
+Lambda_est = pyro.param("Lambda_loc")
+Z_est = pyro.param("Z_loc")
+Z_est
+```
+
+```{python}
+Z_est.shape
+# pyro.param("AutoNormal.scales.Z_batch").shape
+```
+
+```{python}
+Struct_est = Z_est @ Lambda_est.T
+Struct_est
+```
+
+```{python}
+torch.std(Struct_est, 0)
+```
+
+```{python}
+Struct_est_rescaled = (Struct_est * X_stds) + X_means
+Struct_est_rescaled
+```
+
+```{python}
+# sim_data_torch["X_l"][0]
+# X
+```
+
+```{python}
+Struct_sim = sim_data_torch["Z"] @ sim_data_torch["Lambda_l"][0].T
+Struct_sim
+```
+
+```{python}
+# Struct_sim_rescaled = (Struct_sim * X_stds) + X_means
+Struct_sim_rescaled = (Struct_sim - X_means) /  X_stds
+Struct_sim_rescaled
+```
+
+```{python}
+Struct_sim_rescaled.shape
+Struct_est_rescaled.shape
+# sim_data_torch["Lambda_l"][0]
+```
+
+```{python}
+# torch.norm(sim_data_torch["X_l"][0] - Struct_est) ** 2 / torch.norm(sim_data_torch["X_l"][0]) ** 2
+```
+
+```{python}
+torch.norm(Struct_est)
+```
+
+```{python}
+torch.norm(Struct_sim - Struct_est) ** 2 / torch.norm(Struct_sim) ** 2
+```
+
+```{python}
+# torch.norm(Struct_sim - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2
+
+torch.norm(Struct_sim_rescaled - Struct_est) ** 2 / torch.norm(Struct_sim_rescaled) ** 2
+```
+
+```{python}
+torch.norm(Struct_sim - Struct_est_rescaled) ** 2 / torch.norm(Struct_sim) ** 2
+```
+
+# Predict 
+
+```{python}
+pyro.clear_param_store()
+pyro.get_param_store().load("rmf_ard.params_n2000p10000.save")
+```
+
+
+```{python}
+def g(X, k, n):
+    pyro.infer.autoguide.AutoNormal(lambda d: bayesian_factor_model(d, 5, 5000))
+    
+```
+
+
+```{python}
+# guide = AutoNormal(bayesian_factor_model)
+post_pred = guide.sample_posterior(sample_shape = (1000,))
+```
+
+Posterior samples for all latent avriables
+```{python}
+predictive = pyro.infer.Predictive(guide, num_samples = 1000)
+post_samples = predictive(X, torch.arange(X.shape[0]))
+```
+
+
+```{python}
+post_samples
+```
+
+```{python}
+post_samples.get("Z").shape
+```
+
+```{python}
+# post_pred = predict_factor_model(bayesian_factor_model,
+#                                  g,
+#                                  1000,
+#                                 #  [X, 5, X.shape[0]])
+#                                  {"X": X,
+#                                   "k": 5,
+#                                   "n": X.shape[0]})
+```
+
+```{python}
+Lambda_post_mean = torch.mean(post_samples.get("Lambda"), dim = 0).squeeze(0)
+Z_post_mean = torch.mean(post_samples.get("Z"), dim = 0).squeeze(0)
+```
+```{python}
+Struct_post_mean = Z_post_mean @ Lambda_post_mean.T
+Struct_post_mean
+```
+
+```{python}
+Struct_sim
+```
+
+```{python}
+Struct_deterministic_post_mean = torch.mean(post_samples.get("structure"), dim = 0)
+```
+
+Check structure from posterior mean:
+
+```{python}
+print(torch.norm(Struct_deterministic_post_mean - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2)
+print(torch.norm(Struct_post_mean - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2)
+```
+
+```{python}
+# pd.DataFrame(post_samples.get("Lambda"))
+def summarise_post_samples(sample_tensor): 
+    summary = {
+        "mean": torch.mean(sample_tensor, dim = 0),
+        "std": torch.std(sample_tensor, dim = 0),
+        "q2.5" = torch.quantile(sample_tensor, 0.025, dim = 0),
+        "q5": torch.quantile(sample_tensor, 0.05, dim = 0),
+        "q25": torch.quantile(sample_tensor, 0.25, dim = 0),
+        "q50": torch.quantile(sample_tensor, 0.50, dim = 0),
+        "q75": torch.quantile(sample_tensor, 0.75, dim = 0),
+        "q95": torch.quantile(sample_tensor, 0.95, dim = 0),
+        "q97.5" = torch.quantile(sample_tensor, 0.975, dim = 0)
+    }
+    return summary
+
+
+```
+
+```{python}
+structure_summary = summarise_post_samples(post_samples.get("structure"))
+```
+
+Elementwise posterior credible interval nominal coverage
+```{python}
+torch.sum(torch.logical_and(
+    torch.less_equal(structure_summary["q25"], Struct_sim_rescaled),
+    torch.greater_equal(structure_summary["q75"], Struct_sim_rescaled)
+)) / torch.numel(Struct_sim_rescaled)
+```
+
+```{python}
+# structure_summary["std"]
+
+```
+
+```{python}
+Lambda_post_mean
+```
+
+```{python}
+Struct_est
+```
+
+```{python}
+def test_fn(X, k, n):
+      print(X, k, n)
+
+test_fn(**{"X": X, "k": 5,"n": X.shape[0]})
+```
+
+```{python}
+[(a, b) for (a, b) in post_pred.items()]
+```
+
+```{python}
+torch.mean(post_pred["Lambda"], dim = 0)
+```
+
+```{python}
+
+
+svi_samples = {k: v.reshape(1000).detach().cpu().numpy()
+                for k, v in post_pred.items()a
+                if k != "obs"}
+```
+
+

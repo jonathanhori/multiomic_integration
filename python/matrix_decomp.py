@@ -37,8 +37,10 @@ class FactorModelARD(PyroModule):
         self.a_psi = a_psi
         self.b_psi = b_psi
         
+        self.loss_history = []
+        
     
-    def forward(self, X):
+    def forward(self, X, batch_idx):
         if torch.is_tensor(X):
             m, p = X.shape # Working with minibatches of size m
         elif isinstance(X, TensorDataset): # working with full dataset directly
@@ -75,25 +77,24 @@ class FactorModelARD(PyroModule):
         psi_sqrt = torch.sqrt(psi)
         
         # Local latent variables and observations
-        with pyro.plate("obs", self.n, subsample = X): # X is a minibatch, can pass directly into subsample
+        with pyro.plate("obs", self.n, subsample = batch_idx): # X is a minibatch, can pass directly into subsample
             # Latent scores Z_i are local
-            Z_batch = pyro.sample("Z_batch", dist.Normal(torch.zeros(m, self.k), torch.ones(self.k)).to_event(1))
+            # Z_batch = pyro.sample("Z", dist.Normal(torch.zeros(m, self.k), torch.ones(self.k)).to_event(1))
+            Z_batch = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
             
             # Compute structure
-            structure = torch.matmul(Z_batch, Lambda.T)
+            structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
             
-            X_batch = pyro.sample("X_batch", dist.Normal(structure, psi_sqrt).to_event(1), obs = X)
+            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X)
             
             
-    def guide(self, X):
+    def guide(self, X, batch_idx):
         if torch.is_tensor(X):
             m, p = X.shape # Working with minibatches of size m
         elif isinstance(X, TensorDataset): # working with full dataset directly
             # print("is tensordataset")
             m = len(X)
             p = X[0][0].shape[0]
-        
-            
             
         ######
         # Loadings
@@ -108,13 +109,13 @@ class FactorModelARD(PyroModule):
                                constraint = dist.constraints.positive)
         
         sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_q, b_sigma_q).to_event(1))
-        sigma = torch.sqrt(sigma2)
+        # sigma = torch.sqrt(sigma2)
         
         # Lambda: Variational parameters loc, scale
         Lambda_loc = pyro.param("Lambda_loc", lambda: torch.zeros(p, self.k))
         Lambda_scale = pyro.param("Lambda_scale", lambda: torch.ones(p, self.k),
                                   constraint = dist.constraints.positive)
-        pyro.sample("Lambda", dist.Normal(Lambda_loc, Lambda_scale).to_event(2))
+        Lambda = pyro.sample("Lambda", dist.Normal(Lambda_loc, Lambda_scale).to_event(2))
         
         ########################
         # Scores
@@ -127,14 +128,20 @@ class FactorModelARD(PyroModule):
                              lambda: torch.ones((p)),
                              constraint = dist.constraints.positive)  
         psi = pyro.sample("psi", dist.InverseGamma(a_psi_q, b_psi_q).to_event(1))
-        psi_sqrt = torch.sqrt(psi)
+        # psi_sqrt = torch.sqrt(psi)
         
         # Local latent variables Z: Variational params loc, scale
-        with pyro.plate("obs", self.n, subsample = X):
-            Z_loc = pyro.param("Z_loc", lambda: torch.zeros(m, self.k))
-            Z_scale = pyro.param("Z_scale", lambda: torch.ones(m, self.k),
-                                 constraint = dist.constraints.positive)
-            pyro.sample("Z_batch", dist.Normal(Z_loc, Z_scale).to_event(1))
+        Z_loc = pyro.param("Z_loc", lambda: torch.zeros(self.n, self.k))
+        Z_scale = pyro.param("Z_scale", lambda: torch.ones(self.n, self.k),
+                                constraint = dist.constraints.positive)
+        with pyro.plate("obs", self.n, subsample = batch_idx):
+            Z_loc_batch = Z_loc[batch_idx]
+            Z_scale_batch = Z_scale[batch_idx]
+            Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
+            
+            pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+            
+        
     
     
 ##############
@@ -154,7 +161,7 @@ def do_inference(X, model, guide, opt = "Adam",
     ########################
     # Handle minibatching of dataset
     ########################
-    X_mod = TensorDataset(X)
+    X_mod = TensorDataset(torch.arange(X.shape[0]), X)
     loader = DataLoader(X_mod, batch_size = minibatch_size, shuffle = True, drop_last=True)
     
     ########################
@@ -174,18 +181,19 @@ def do_inference(X, model, guide, opt = "Adam",
     # If minibatching: pass batch from loader
     # If not minibatching: pass original data as tensor
     ########################
-    loss = []
     if minibatch_flag:
         prev_loss = None
         for epoch in range(epochs):
             epoch_loss = 0.
-            for batch, in loader:
+            for batch_idx, batch, in loader:
                 # print(batch.shape)
-                loss = svi.step(batch)
+                loss = svi.step(batch, batch_idx)
                 # print(loss)
                 epoch_loss += loss
             print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
             print(f"Loss at epoch {epoch+1}: {loss / model.n}")
+            
+            model.loss_history.append(epoch_loss)
             
             if prev_loss is not None and abs(epoch_loss - prev_loss) < tol:
                 break
@@ -202,7 +210,7 @@ def do_inference(X, model, guide, opt = "Adam",
         prev_loss = None
         for iter in range(max_iter):
             # total_loss = 0.
-            loss = svi.step(X) #batch[0])
+            loss = svi.step(X, torch.arange(X.shape[0])) #batch[0])
             # print(loss)
             # total_loss += loss
             # for batch in loader:
@@ -210,6 +218,7 @@ def do_inference(X, model, guide, opt = "Adam",
             #     epoch_loss += loss
             if iter % 100 == 0:
                 print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
+                model.loss_history.append(loss)
                 # print(f"Epoch {iter+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss:.4f}")
                 
             # if prev_loss is not None and abs((loss- prev_loss) / prev_loss) < tol:
@@ -219,8 +228,9 @@ def do_inference(X, model, guide, opt = "Adam",
                 print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
                 break
             prev_loss = loss
+            
         
-    # return svi
+    return svi, opt
         
         
         
