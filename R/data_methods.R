@@ -6,9 +6,9 @@ library(Rfast)
 
 
 load_data <- function(path_base, name_base, 
-                      n, p, snr_x, snr_y, rep,
+                      n, p, snr_x, snr_y, sparsity, rep,
                       log = TRUE) {
-  out_path <- sprintf(path_base, n, p, snr_x, snr_y)
+  out_path <- sprintf(path_base, n, p, snr_x, snr_y, sparsity)
   data_path <- file.path(file.path(out_path,
                                    sprintf(name_base, rep)))
   if (log) {

@@ -34,7 +34,7 @@ sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~Cloud
 ```{python}
 #| label: Load data utils
 
-from r_data_utils import bayesian_factor_model, train_decomp, predict_factor_model
+from r_data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition
 ```
 
 ```{python}
@@ -219,6 +219,7 @@ one_batch.shape
 
 ## Visualize model structure
 ```{python}
+factor_model = FactorModelARD(k, n)
 pyro.render_model(
     factor_model, #bayesian_factor_model, 
     model_args = (X,
@@ -249,7 +250,7 @@ pyro.get_param_store().get_all_param_names()
 pyro.clear_param_store()
 ```
 
-
+Normalize data
 ```{python}
 # print(X.shape)
 X_means = torch.mean(X, 0)
@@ -445,10 +446,13 @@ torch.save({
 }, out_filename)
 ```
 
+```{python}
+mod_info = torch.load(out_filename)
+```
 
 
 ```{python}
-
+mod_info.items()
 ```
 
 

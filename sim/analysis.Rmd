@@ -580,11 +580,12 @@ mcmc_supervised.example <- multiviewMatchAlign(mcmc_supervised.example)
 # Multiple datasets
 
 ```{r}
-n_array <- c(50, 100, 500, 1000, 5000)
-p_array <- c(50, 100, 1000, 10000)
+n_array <- c(50, 100, 500, 1000)
+p_array <- c(50, 100, 1000)
 snr_x_array <- c(2, 1, 0.5)
 snr_y_array <- c(2, 1, 0.5)
 reps = 10
+loading_sparsity = 0
 
 sim_grid <- expand.grid(n = n_array,
             p_l = p_array,
@@ -594,13 +595,13 @@ sim_grid <- expand.grid(n = n_array,
 
 data_name_base <- "sim_data_ywithview_rep%s.rds"
 data_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                      "data",
-                      "n%sp%s_snr%s.%s")
+                      "data3",
+                      "n%sp%s_snr%s.%s_sparse%s")
 
 out_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
                            "results",
                            "jafar")
-out_name_base <- "n%sp%s_snr%s.%s_rep%s.rds"
+out_name_base <- "n%sp%s_snr%s.%s_sparse%s_rep%s.rds"
 
 
 log_dir <- "logs"
@@ -688,14 +689,14 @@ Raw code below. Attempting to parallelize below this.
 
 
 ```{r}
-run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
+run_and_eval_model <- function(n, p, snr_x, snr_y, rep, sparsity,
                                in_path_base,
                                in_name_base,
                                out_path_base,
                                out_name_base) {
   model_out_data_path <- file.path(out_path_base,
                              "models",
-                             sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
+                             sprintf(out_name_base,  n, p, snr_x, snr_y, sparsity, rep))
   # Skip dataset if model already run
   if (file.exists(model_out_data_path)) {NA}
   else {
@@ -707,7 +708,7 @@ run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
   
   # Load + process data
   run_data <- load_data(in_path_base, in_name_base,
-                        n, p, snr_x, snr_y, rep)
+                        n, p, snr_x, snr_y, sparsity, rep)
   X_l <- run_data$X_l
   y <- run_data$y
   X_l.clean <- standardize_views(X_l)
@@ -737,6 +738,7 @@ run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
   #                            "models",
   #                            sprintf(out_name_base,  n, p, snr_x, snr_y, rep))
   log_message("Writing model:", as.character(model_out_data_path))
+  dir.create(dirname(model_out_data_path), recursive = TRUE, showWarnings = TRUE)
   saveRDS(mcmc_supervised,
           model_out_data_path)
   
@@ -777,6 +779,7 @@ run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
            p = p,
            snr_x = snr_x,
            snr_y = snr_y,
+           sparsity = sparsity,
            rep = rep,
            time = as.numeric(difftime(tok, tik, units = "secs")))
   
@@ -788,6 +791,7 @@ run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
            p = p,
            snr_x = snr_x,
            snr_y = snr_y,
+           sparsity = sparsity,
            rep = rep
     )
   
@@ -797,10 +801,10 @@ run_and_eval_model <- function(n, p, snr_x, snr_y, rep,
   #                                   eval_table)
   metric_out_data_path <- file.path(out_path_base,
                              "metrics",
-                             sprintf(out_name_base, n, p, snr_x, snr_y, rep))
+                             sprintf(out_name_base, n, p, snr_x, snr_y, sparsity, rep))
   cov_out_data_path <- file.path(out_path_base,
                              "covariances",
-                             sprintf(out_name_base, n, p, snr_x, snr_y, rep))
+                             sprintf(out_name_base, n, p, snr_x, snr_y, sparsity, rep))
   log_message("Writing metrics:", as.character(metric_out_data_path))
   dir.create(dirname(metric_out_data_path), recursive = TRUE, showWarnings = TRUE)
   dir.create(dirname(cov_out_data_path), recursive = TRUE, showWarnings = TRUE)
@@ -866,15 +870,15 @@ dir.create(log_dir, showWarnings = FALSE)
 log_file <- file.path(log_dir, paste0("run_", timestamp, ".log"))
 file.create(log_file)
 
-sim_grid_test <- sim_grid |> filter(snr_x == 2, #0.5, 
-                                    # (snr_y == 0.5 | snr_y == 1), 
-                                    n < 1000,
-                                    p_l < 10000)
+# sim_grid_test <- sim_grid |> filter(snr_x == 2, #0.5, 
+#                                     # (snr_y == 0.5 | snr_y == 1), 
+#                                     n < 1000,
+#                                     p_l < 10000)
 
 tik <- Sys.time()
 # Run sim
 tryCatch({
-  jafar_sim_results <- foreach(i = 1:nrow(sim_grid_test),
+  jafar_sim_results <- foreach(i = 1:nrow(sim_grid),
                                .combine = bind_rows,
                                .packages = c("tidyverse",
                                              "jafar",
@@ -889,12 +893,13 @@ tryCatch({
                                #             "mcmc_seed")
   ) %dopar% {
     log_message("Worker:", paste(Sys.info()[['nodename']], Sys.getpid(), sep='-'))
-    params <- sim_grid_test[i, ]
+    params <- sim_grid[i, ]
     run_and_eval_model(params$n,
                        params$p,
                        params$snr_x,
                        params$snr_y,
                        params$rep,
+                       loading_sparsity,
                        data_path_base,
                        data_name_base,
                        out_path_base,
@@ -1203,14 +1208,14 @@ run_data <- load_data(data_path_base, data_name_base,
 
 
 ```{r}
-getwd()
-covariance_agreement |> bind_rows() |> saveRDS("./results/jafar/covariance_agreement.rds")
+# getwd()
+# covariance_agreement |> bind_rows() |> saveRDS("./results/jafar/covariance_agreement.rds")
 ```
 
 
 
 ```{r}
-covariance_agreement
+# covariance_agreement
 
 jafar_cov_results |> 
   bind_rows() |> 
@@ -1227,52 +1232,71 @@ jafar_cov_results |>
 ```
 
 ```{r}
-jafar_cov_results |> 
-  mutate(n = factor(n),
-         p = factor(p)) |> 
-  filter(snr_x == 2) |> #, snr_y == 0.5) |> 
-  arrange(l_1) |> 
-  print() |> 
-  ggplot() +
-  geom_boxplot(aes(x = n, y = result, group = interaction(n, p), color = p), position = "dodge") +
-  # geom_point(aes(x = n, y = result, group = p, color = p)) +
-  facet_grid(l_1 ~ l_2, 
-             labeller = label_both) +
-  scale_y_continuous(labels = scales::comma,
-                     transform = "log10")
+for (snr in c(2, 1, 0.5)) {
+  snr_x = snr
+  snr_y = snr
+  
+  print(
+    jafar_cov_results |> 
+      mutate(n = factor(n),
+             p = factor(p)) |> 
+      filter(snr_x == snr,
+             snr_y == snr) |> #, snr_y == 0.5) |> 
+      arrange(l_1) |> 
+      print() |> 
+      ggplot() +
+      geom_boxplot(aes(x = n, y = result, group = interaction(n, p), color = p), position = "dodge") +
+      # geom_point(aes(x = n, y = result, group = p, color = p)) +
+      facet_grid(l_1 ~ l_2, 
+                 labeller = label_both) +
+      scale_y_continuous(labels = scales::comma,
+                         transform = "log10") +
+      labs(
+        title = paste0("Rescaled difference norm of covariances for JAFAR - SNR(X): ", snr_x, ", SNR(Y): ", snr_y),
+        subtitle = TeX("$\\frac{\\| \\Lambda^{(l)}\\Lambda^{(m)T} - \\hat{\\Lambda}^{(l)}\\hat{\\Lambda}^{(m)T}\\|}{p_lp_m}$")
+      )
+  )
+}
+
+
 ```
 
 
 ### Evaluation plots
 ```{r}
-jafar_sim_results |> 
-  mutate(n = factor(n),
-         l = factor(l),
-         p = factor(p)) |> 
-  # filter(quantity == "joint_structure") |>
-  # filter(quantity == "view_structure") |>
-  filter(quantity == "data_reconstruction") |>
-  print() |>
-  ggplot() +
-  # geom_point(aes(x = n,
-  #                y = result,
-  #                # group = n,
-  #                color = l)) +
-  geom_boxplot(aes(x = n,
-                 y = result,
-                 group = interaction(n, p),
-                 color = p
-                 # group = n,
-                 # color = l
-                 )) +
-  facet_grid(snr_y ~ snr_x, #rows = vars(quantity),
-             # cols = vars(p),
-             scales = "fixed",
-             labeller = label_both) + 
-  labs(
-    title = "Relative squared error of structure and data reconstruction for JAFAR",
-    subtitle = TeX("$\\frac{\\|S - \\hat{S}\\| ^{2}}{\\|S \\|^{2}}$")
+for (qu in c("joint_structure", "view_structure", "data_reconstruction")) {
+  print(
+  jafar_sim_results |> 
+    mutate(n = factor(n),
+           l = factor(l),
+           p = factor(p)) |> 
+    # filter(quantity == "joint_structure") |>
+    # filter(quantity == "view_structure") |>
+    # filter(quantity == "data_reconstruction") |>
+    filter(quantity == qu) |>
+    print() |>
+    ggplot() +
+    # geom_point(aes(x = n,
+    #                y = result,
+    #                # group = n,
+    #                color = l)) +
+    geom_boxplot(aes(x = n,
+                     y = result,
+                     group = interaction(n, p),
+                     color = p
+                     # group = n,
+                     # color = l
+    )) +
+    facet_grid(snr_y ~ snr_x, #rows = vars(quantity),
+               # cols = vars(p),
+               scales = "fixed",
+               labeller = label_both) + 
+    labs(
+      title = paste0("Relative squared error of structure and data reconstruction for JAFAR, ", qu),
+      subtitle = TeX("$\\frac{\\|S - \\hat{S}\\| ^{2}}{\\|S \\|^{2}}$")
+    )
   )
+}
   
 ```
 
@@ -1296,7 +1320,7 @@ jafar_sim_results |>
   scale_y_continuous(trans='log10') + 
   labs(
     title = "Wallclock time for JAFAR runs",
-    y = "Runtime (log 10)"
+    y = "Runtime seconds (log 10)"
   )
 ```
 

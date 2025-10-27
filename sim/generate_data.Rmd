@@ -228,29 +228,31 @@ L = 3
 K = 5
 K_l = 5
 loading_sparsity = 0
+getwd()
 
 sim_grid <- expand.grid(n = n_array,
             p_l = p_array,
             snr_x = snr_x_array,
             snr_y = snr_y_array)
 
-sim_grid <- sim_grid |> filter(n == 5000, p_l == 1000, snr_x == 1, snr_y == 1)
+# sim_grid <- sim_grid |> filter(n == 5000, p_l == 1000, snr_x == 1, snr_y == 1)
 
 data_name_base <- "sim_data_ywithview_rep%s.rds"
-data_path_base <- "n%sp%s_snr%s.%s"
+data_path_base <- "n%sp%s_snr%s.%s_sparse%s"
 
 mapply(function(n, p_l, snr_x, snr_y) {
   # Create output path
-  out_path <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                        "data",
-                        sprintf(data_path_base, n, p_l, snr_x, snr_y))
+  out_path <- file.path("/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim", #dirname(rstudioapi::getSourceEditorContext()$path), 
+                        "data3",
+                        sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity))
   # if (dir.exists(out_path)) {NA}
   # else {
     dir.create(out_path,
-               showWarnings = FALSE)
+               showWarnings = FALSE,
+               recursive = TRUE)
     
     # Replicates
-    for (rep in 10:reps) {
+    for (rep in 1:reps) {
       if (n == 5000 & p_l == 10000) {NA} # takes too long
       else {
         # Check if replicate already created

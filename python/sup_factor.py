@@ -2,7 +2,7 @@
 
 import os
 import sys
-import pyreadr
+# import pyreadr
 
 import torch
 import pyro
@@ -75,49 +75,6 @@ def supervised_factor_model(X, y, k,
         mu_y = (Z @ beta)
         pyro.sample("y_obs", dist.Normal(mu_y, sigma_y), obs=y)
         
-        
-sim_data = pyreadr.read_r('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/n500p100_snr1.1/sim_data_ywithview_rep1.rds')
-
-import pandas as pd
-
-print(sim_data.keys())
-sim_data = sim_data[None]
-
-# import rpy2.robjects as robjects
-# from rpy2.robjects import pandas2ri
-# pandas2ri.activate()
-
-# readRDS = robjects.r['readRDS']
-# sim_data = readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/n500p100_snr1.1/sim_data_ywithview_rep1.rds')
-        
-dir(sim_data)
-
-sim_data.names
-
-# Outcome
-y = sim_data.rx2("y")
-y = torch.tensor(y)
-
-# Multiview data
-
-
-[print(torch.tensor(X_l).shape) for X_l in sim_data.rx2("X_l")]
-[X_l for X_l in sim_data.rx2("X_l")]
-
-X_l_array = sim_data.rx2("X_l")
-
-dir(X_l_array[1])
-X_l_array
-
-[print(name) for name in sim_data.names]
-
-py_list = [pandas2ri.rpy2py(df) for df in sim_data]
-py_list
-
-for i, j in sim_data.items():
-    if i == "X_l":
-        print(i, j)
-    
-sim_data.items()
+      
 
 pyro.render_model(supervised_factor_model, render_distributions=True, render_params=True)

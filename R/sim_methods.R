@@ -122,6 +122,7 @@ generate_factor_data <- function(L,
     sim_data.y <- sim_factors.shared %*% beta_sim + 
       Reduce("+", lp_view_specific) +
       noise_y
+    beta_sim <- c(beta_sim, as.vector(beta_l))
   } else if (outcome == "shared") {
     beta_sim <- rnorm(n = K)
     
@@ -139,6 +140,7 @@ generate_factor_data <- function(L,
     K = K,
     K_l = K_l_vec,
     sparsity = sparsity_vec,
+    beta = beta_sim,
     snr_x = snr_x_vec,
     snr_y = snr_y,
     X_l = sim_data.x,

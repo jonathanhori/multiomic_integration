@@ -6,6 +6,8 @@ from rpy2.robjects import pandas2ri, default_converter, conversion
 from rpy2 import rinterface
 from rpy2.robjects import vectors
 
+######## 
+# Utilities for converting data from R
 def floatmatrix_to_torch(m):
     t = torch.tensor(list(m), dtype=torch.float32)
     # R matrices are stored column-major, so reshape and transpose
@@ -75,3 +77,6 @@ def load_and_process_rds_data_for_condition(
     files = {Path(name).stem: readRDS(name) for name in directory_names_with_path}
     files = {n: r_to_torch(v) for n, v in files.items()}
     return files
+
+
+
