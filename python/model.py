@@ -13,7 +13,7 @@ from pyro.optim import Adam, ClippedAdam
 from pyro.infer import SVI, Trace_ELBO, Predictive, TraceGraph_ELBO
 from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNormal
 
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataSet, TensorDataset, DataLoader
 
 pyro.enable_validation(True)
 pyro.set_rng_seed(0)
@@ -37,9 +37,9 @@ class SupMultiviewDecomp(PyroModule):
                  ):
         super().__init__()
         # Model parameters
+        self.n = n
         self.k = k
         self.k_l = k_l_list # assumes k_l > 0 for all l
-        self.n = n
         self.p_l = None
         
         # Hyperparams
@@ -62,7 +62,8 @@ class SupMultiviewDecomp(PyroModule):
                 batch_idx,
                 y = None):
         """
-        X_l = Z @ Lambda_l^T + Phi_l @ Gamma_l^T + E
+        X_l = Z @ Lambda_l^T + Phi_l @ Gamma_l^T + E,   l = 1, ... , L
+        y = Z @ beta + e
         """
         m = len(batch_idx)
         p_l_list = [X_l.shape[1] for X_l in X_list]
@@ -79,10 +80,10 @@ class SupMultiviewDecomp(PyroModule):
         # Loadings Lambda: sample rows across features (p, k)
         # ARD prior
         # Lambda_j ~ N_k(0, sigma_k^2 I)
-        #   ==> Lambda_jk ~ N(0, sigma_k^2)
-        # sigma_k^2 ~ InvGamma(a_sigma, b_sigma))
+        #   ==> Lambda^l_jk ~ N(0, sigma_lambda^l_k^2)
+        # sigma^l_k^2 ~ InvGamma(a_sigma, b_sigma))
         #
-        # Gamma_jk ~ N(0, )
+        # Gamma^l_jk ~ N(0, sigma_gamma^l_k^2)
         ########################
         # VIEW SPECIFIC
         Gamma_l_list = []
@@ -115,6 +116,8 @@ class SupMultiviewDecomp(PyroModule):
         # The plate statement defines conditional independence over each observation
         # We assume the full dataset cannot fit in memory, so a data loader is used OUTSIDE this
         #   function to perform minibatching. 
+        #
+        # Outcome y can be dependent on just shared factors, or all factors
         ########################
         
         # Idiosyncratic error variance 
@@ -137,9 +140,7 @@ class SupMultiviewDecomp(PyroModule):
         
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx): # X is a minibatch, can pass directly into subsample
-            # Latent scores Z_i are local
-            # Z_batch = pyro.sample("Z", dist.Normal(torch.zeros(m, self.k), torch.ones(self.k)).to_event(1))
-            Z_batch = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
+            Z = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
             
             Phi_l_list = []
             for l, k_l in enumerate(self.k_l):
@@ -147,11 +148,11 @@ class SupMultiviewDecomp(PyroModule):
                 Phi_l_list.append(Phi_l)
                 
             
-            # Compute structure
+            # Compute structures
             joint_structure_list = []
             for l in range(len(X_list)):
                 joint_structure_l = pyro.deterministic(f"joint_structure_l{l}", 
-                                                       torch.matmul(Z_batch, Lambda_l_list[l].T))
+                                                       torch.matmul(Z, Lambda_l_list[l].T))
                 view_structure_l = pyro.deterministic(f"view_structure_l{l}",
                                                     torch.matmul(Phi_l_list[l], Gamma_l_list[l].T))
                 
@@ -163,74 +164,78 @@ class SupMultiviewDecomp(PyroModule):
                                                    psi_sqrt_l_list[l]).to_event(1), 
                             obs = X_list[l])
             
-            outcome_structure = torch.matmul(Z_batch, beta)
-                
+            # Outcome model
+            outcome_structure = pyro.deterministic("outcome_structure",
+                                                   torch.matmul(Z, beta))
             pyro.sample("y", dist.Normal(outcome_structure, sigma_y),
                         obs = y)
             
             
-        ########################
-        # ---- Outcome --------
-        # Dependent on just shared factors, or all factors
-        ########################
+    def guide(self, 
+              X_list, 
+              batch_idx,
+              y = None):
+        raise NotImplementedError
+        # TODO
+    
+        # if torch.is_tensor(X):
+        #     m, p = X.shape # Working with minibatches of size m
+        # elif isinstance(X, TensorDataset): # working with full dataset directly
+        #     # print("is tensordataset")
+        #     m = len(X)
+        #     p = X[0][0].shape[0]
             
+        # ######
+        # # Loadings
+        # # The model specifies 
+        # ######
+        # # Sigma2: Variational parameters a, b
+        # a_sigma_q = pyro.param("a_sigma_q", 
+        #                        lambda: torch.ones((self.k)),
+        #                        constraint = dist.constraints.positive)
+        # b_sigma_q = pyro.param("b_sigma_q", 
+        #                        lambda: torch.ones((self.k)),
+        #                        constraint = dist.constraints.positive)
+        
+        # sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_q, b_sigma_q).to_event(1))
+        # # sigma = torch.sqrt(sigma2)
+        
+        # # Lambda: Variational parameters loc, scale
+        # Lambda_loc = pyro.param("Lambda_loc", lambda: torch.zeros(p, self.k))
+        # Lambda_scale = pyro.param("Lambda_scale", lambda: torch.ones(p, self.k),
+        #                           constraint = dist.constraints.positive)
+        # Lambda = pyro.sample("Lambda", dist.Normal(Lambda_loc, Lambda_scale).to_event(2))
+        
+        # ########################
+        # # Scores
+        # ########################
+        # # Psi: Variational params a, b
+        # a_psi_q = pyro.param("a_psi_q",
+        #                      lambda: torch.ones((p)),
+        #                      constraint = dist.constraints.positive)     
+        # b_psi_q = pyro.param("b_psi_q",
+        #                      lambda: torch.ones((p)),
+        #                      constraint = dist.constraints.positive)  
+        # psi = pyro.sample("psi", dist.InverseGamma(a_psi_q, b_psi_q).to_event(1))
+        # # psi_sqrt = torch.sqrt(psi)
+        
+        # # Local latent variables Z: Variational params loc, scale
+        # Z_loc = pyro.param("Z_loc", lambda: torch.zeros(self.n, self.k))
+        # Z_scale = pyro.param("Z_scale", lambda: torch.ones(self.n, self.k),
+        #                         constraint = dist.constraints.positive)
+        # with pyro.plate("obs", self.n, subsample = batch_idx):
+        #     Z_loc_batch = Z_loc[batch_idx]
+        #     Z_scale_batch = Z_scale[batch_idx]
+        #     Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
             
-    def guide(self, X, batch_idx):
-        if torch.is_tensor(X):
-            m, p = X.shape # Working with minibatches of size m
-        elif isinstance(X, TensorDataset): # working with full dataset directly
-            # print("is tensordataset")
-            m = len(X)
-            p = X[0][0].shape[0]
-            
-        ######
-        # Loadings
-        # The model specifies 
-        ######
-        # Sigma2: Variational parameters a, b
-        a_sigma_q = pyro.param("a_sigma_q", 
-                               lambda: torch.ones((self.k)),
-                               constraint = dist.constraints.positive)
-        b_sigma_q = pyro.param("b_sigma_q", 
-                               lambda: torch.ones((self.k)),
-                               constraint = dist.constraints.positive)
-        
-        sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_q, b_sigma_q).to_event(1))
-        # sigma = torch.sqrt(sigma2)
-        
-        # Lambda: Variational parameters loc, scale
-        Lambda_loc = pyro.param("Lambda_loc", lambda: torch.zeros(p, self.k))
-        Lambda_scale = pyro.param("Lambda_scale", lambda: torch.ones(p, self.k),
-                                  constraint = dist.constraints.positive)
-        Lambda = pyro.sample("Lambda", dist.Normal(Lambda_loc, Lambda_scale).to_event(2))
-        
-        ########################
-        # Scores
-        ########################
-        # Psi: Variational params a, b
-        a_psi_q = pyro.param("a_psi_q",
-                             lambda: torch.ones((p)),
-                             constraint = dist.constraints.positive)     
-        b_psi_q = pyro.param("b_psi_q",
-                             lambda: torch.ones((p)),
-                             constraint = dist.constraints.positive)  
-        psi = pyro.sample("psi", dist.InverseGamma(a_psi_q, b_psi_q).to_event(1))
-        # psi_sqrt = torch.sqrt(psi)
-        
-        # Local latent variables Z: Variational params loc, scale
-        Z_loc = pyro.param("Z_loc", lambda: torch.zeros(self.n, self.k))
-        Z_scale = pyro.param("Z_scale", lambda: torch.ones(self.n, self.k),
-                                constraint = dist.constraints.positive)
-        with pyro.plate("obs", self.n, subsample = batch_idx):
-            Z_loc_batch = Z_loc[batch_idx]
-            Z_scale_batch = Z_scale[batch_idx]
-            Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
-            
-            pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+        #     pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
             
     
 ##############
-def do_inference(X, model, guide, 
+def do_inference(X_list, 
+                 y,
+                 model, 
+                 guide, 
                  opt = "Adam",
                 epochs = 20,
                 max_iter = 20000,
@@ -247,8 +252,8 @@ def do_inference(X, model, guide,
     ########################
     # Handle minibatching of dataset
     ########################
-    X_mod = TensorDataset(torch.arange(X.shape[0]), X)
-    loader = DataLoader(X_mod, batch_size = minibatch_size, shuffle = True, drop_last=True)
+    tensor_dataset = TensorDataset(torch.arange(X_list[0].shape[0]), *X_list, y)
+    loader = DataLoader(tensor_dataset, batch_size = minibatch_size, shuffle = True, drop_last=True)
     
     ########################
     # Initialize instances for optimization
@@ -271,9 +276,11 @@ def do_inference(X, model, guide,
         prev_loss = None
         for epoch in range(epochs):
             epoch_loss = 0.
-            for batch_idx, batch, in loader:
+            for batch in loader:
+                batch_idx = batch.pop(0)
+                y_batch = batch.pop(-1)
                 # print(batch.shape)
-                loss = svi.step(batch, batch_idx)
+                loss = svi.step(batch, batch_idx, y_batch)
                 # print(loss)
                 epoch_loss += loss
             print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
