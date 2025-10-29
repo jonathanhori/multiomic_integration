@@ -259,12 +259,12 @@ def do_inference(X_list,
                  model, 
                  guide, 
                  opt = "Adam",
+                 opt_args = {"lr": 0.001},
                  epochs = 20,
                  max_iter = 20000,
                  minibatch_flag = False,
                  minibatch_size = 32,
                  tol = 1e-4,
-                 opt_args = {"lr": 0.001},
                  device = "cpu"):
     
     # if minibatch_flag == False, then do not minibatch, data loader not necessary
@@ -285,7 +285,7 @@ def do_inference(X_list,
         opt = Adam(opt_args)
     elif opt == "ClippedAdam":
         opt = ClippedAdam(opt_args)
-    elbo = Trace_ELBO(num_particles = 10)
+    elbo = Trace_ELBO(num_particles = 1)
     # elbo = TraceGraph_ELBO()
     svi = SVI(model, guide, opt, loss = elbo)
     
