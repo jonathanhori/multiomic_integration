@@ -21,9 +21,12 @@ import pyro
 from rpy2.robjects import r, vectors
 from rpy2 import rinterface
 
+import importlib
+
 from torchvision import transforms
 
 from pathlib import Path
+import time
 ```
 
 ```{python}
@@ -34,15 +37,15 @@ sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~Cloud
 ```{python}
 #| label: Load data utils
 
-from r_data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition
+from data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition, normalize_tensor_by_col, extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, eval_rse'
 ```
 
 ```{python}
 #| label: Load model objects
+importlib.reload(sys.modules["model"])
 
-importlib.reload(sys.modules["matrix_decomp"])
-# from matrix_decomp import bayesian_factor_model, train_decomp, predict_factor_model, FactorModelARD, do_inference, subsample_create_plates
-from matrix_decomp import FactorModelARD, do_inference
+# from matrix_decomp import FactorModelARD, do_inference
+from model import SupMultiviewDecomp, do_inference
 ```
 
 # Load data
@@ -74,6 +77,22 @@ sim_data_torch
 ```{python}
 # os.path.isdir(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n50p100_snr2.2_sparse0"))
 # os.path.isdir("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3")
+```
+
+## Load multiview data
+
+```{python}
+conversion.set_conversion(default_converter)
+readRDS = robjects.r['readRDS']
+sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p100_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
+```
+
+```{python}
+conversion.set_conversion(default_converter)
+
+sim_data_multiview_torch = {name: r_to_torch(sim_data_multiview.rx2(name)) for name in sim_data_multiview.names}
+
+sim_data_multiview_torch
 ```
 
 ## Load data from path
@@ -163,11 +182,62 @@ Example of how to load data from imported RDS object
 ```
 
 ```{python}
+sim_data_multiview_torch.keys()
+```
+
+Extract 
+```{python}
+#| label: Extract features to use
+
+
+X_l_list = sim_data_multiview_torch.get("X_l")
 X_l_list
+
+y = sim_data_multiview_torch.get("y")
+y
+
+k = sim_data_multiview_torch.get("K")
+k_l_list = sim_data_multiview_torch.get("K_l")
+
+n = X_l_list[0].shape[0]
+```
+
+```{python}
+k_l_list.tolist()
+int(k)
+```
+
+```{python}
+X_l_list[0].shape[0]
+
+```
+```{python}
+X_l_list_tensordataset = torch.utils.data.TensorDataset(
+    torch.arange(X_l_list[0].shape[0]), 
+    *X_l_list,
+    y
+    )
+```
+
+
+```{python}
+loader = torch.utils.data.DataLoader(X_l_list_tensordataset, batch_size = 2)
+one_batch = next(iter(loader))
+one_batch
+```
+
+```{python}
+# for batch in loader:
+#     print(batch)
+one_batch.pop(0)
+one_batch.pop(-1)
+```
+
+```{python}
+one_batch
 ```
 
 Process entire RDS file
-
 
 ```{python}
 conversion.set_conversion(default_converter)
@@ -197,6 +267,56 @@ print(k)
 print(n)
 ```
 
+
+## Clean list
+Normalize data
+```{python}
+# print(X.shape)
+# def normalize_tensor_by_col(data):
+#     # Means and sds are are broadcast across rows
+#     data_means = torch.mean(data, 0)
+#     data_stds = torch.std(data, 0)
+#     return {
+#         "data_clean": (data - data_means) / data_stds,
+#         "means": data_means,
+#         "sds": data_stds
+#     }
+
+# X_means = torch.mean(X, 0)
+# X_stds = torch.std(X, 0)
+
+```
+
+```{python}
+# normalizer = transforms.Normalize(mean = X_means, std = X_stds)
+# X_clean = normalizer(X)
+
+# X_clean = (X - X_means) / X_stds
+
+clean_data_dict = normalize_tensor_by_col(X)
+
+```
+
+```{python}
+X_clean = clean_data_dict.get("data_clean")
+X_means = clean_data_dict.get("means")
+X_stds = clean_data_dict.get("sds")
+torch.mean(X_clean, 0)
+```
+
+
+
+```{python}
+X_l_list_clean = [clean["data_clean"] for clean in map(normalize_tensor_by_col, X_l_list)]
+# y_clean = 
+```
+
+```{python}
+X_l_list_clean
+# X_l_list
+```
+
+
 # Load data into model
 
 ```{python}
@@ -217,7 +337,24 @@ one_batch, = next(iter(loader))
 one_batch.shape
 ```
 
-## Visualize model structure
+# Visualize model structure
+
+### SupMultiviewDecomp
+```{python}
+factor_model = SupMultiviewDecomp(int(k), k_l_list.int().tolist(), n)
+
+pyro.render_model(
+    factor_model, #bayesian_factor_model, 
+    model_args = (X_l_list,
+                  torch.arange(X_l_list[0].shape[0]),
+                  y
+    ),
+    render_distributions=True, 
+    render_params=True,
+    render_deterministic = True)
+```
+
+### FactorModelARD
 ```{python}
 factor_model = FactorModelARD(k, n)
 pyro.render_model(
@@ -250,68 +387,130 @@ pyro.get_param_store().get_all_param_names()
 pyro.clear_param_store()
 ```
 
-Normalize data
-```{python}
-# print(X.shape)
-X_means = torch.mean(X, 0)
-X_stds = torch.std(X, 0)
 
-```
-
-```{python}
-# normalizer = transforms.Normalize(mean = X_means, std = X_stds)
-# X_clean = normalizer(X)
-
-X_clean = (X - X_means) / X_stds
-```
-
-```{python}
-torch.mean(X_clean, 0)
-```
 
 # Run model
 
-```{python}
-# def subsample_create_plates(X):
-#     return pyro.plate("obs", 1000, subsample = torch.LongTensor(range(X.shape[0])))
-
-# factor_model = FactorModelARD(k, n)
-# guide = pyro.infer.autoguide.AutoNormal(
-#     factor_model, 
-#     create_plates = subsample_create_plates)
-```
-
 ## Run model: with minibatching
 
+### SupMultiviewDecomp
+
 ```{python}
-# X_clean.shape
-X_dataset = torch.utils.data.TensorDataset(torch.arange(X_clean.shape[0]), X_clean)
+X_l_list_clean[0].index_select(0, torch.Tensor([1, 2, 3]))
 ```
 
 ```{python}
-loader = torch.utils.data.DataLoader(X_dataset, batch_size = 32, shuffle = True, drop_last=True)
+
+trace = pyro.poutine.trace(
+    SupMultiviewDecomp(
+    int(k),
+    k_l_list.int().tolist(),
+    n
+    )
+    ).get_trace(X_l_list,
+                  torch.arange(X_l_list[0].shape[0]),
+                  y)
+
+trace.compute_log_prob() # optional, but allows printing of log_prob shapes
+
+print(trace.format_shapes())
 ```
 
-```{python}
-for batch in loader:
-    # print(idx)
-    print(batch)
-```
 
+ClippedAdam with learning rate decay.
+Start lr = 0.001. Over 1000 epochs 
 
 ```{python}
 
-# def subsample_create_plates(X):
-#     return pyro.plate("obs", 1000, subsample = torch.LongTensor(range(X.shape[0])))
+factor_model = SupMultiviewDecomp(
+    int(k),
+    k_l_list.int().tolist(),
+    n,
+    include_view_factors = True
+)
 
-factor_model = FactorModelARD(k, n)
-guide = factor_model.guide
-# guide = pyro.infer.autoguide.AutoNormal(
-#     factor_model, 
-#     create_plates = subsample_create_plates)
+def subsample_create_plates(X, batch_idx, y = None):
+    # m = len(batch_idx)
+    return pyro.plate("obs", factor_model.n, subsample = batch_idx)
+# guide = factor_model.guide
+
+guide = pyro.infer.autoguide.AutoNormal(
+    factor_model, 
+    create_plates = subsample_create_plates)
 
 
 pyro.clear_param_store()
+
+OPT = "ClippedAdam"
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 1000
+initial_lr = 0.01
+
+gamma = 0.1  # final learning rate will be gamma * initial_lr
+lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+if OPT == "ClippedAdam": print(f"lrd: {lrd}")
+
+t0 = time.time()
+svi, opt = do_inference(
+    X_l_list_clean,
+    y,
+    factor_model,
+    guide,
+    # opt = "Adam",
+    # opt_args = {"lr": initial_lr}, #, "weight_decay": 5},
+    opt = "ClippedAdam",
+    opt_args = {"lr": initial_lr, "lrd": lrd},
+    tol = 0.5, # tolerance is epoch loss per datum
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE
+    )
+# opt_minibatch = train_decomp(X, #sim_data_torch["X_l"][0], #X, 
+#                    k, 
+#                    epochs = 500,
+#                    minibatch_flag = True,
+#                    minibatch_size = 500,
+#                    opt_args = {"lr": 0.001})
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins")
+```
+
+
+### FactorModelARD
+```{python}
+# X_clean.shape
+# X_dataset = torch.utils.data.TensorDataset(torch.arange(X_clean.shape[0]), X_clean)
+```
+
+```{python}
+# loader = torch.utils.data.DataLoader(X_dataset, batch_size = 32, shuffle = True, drop_last=True)
+```
+
+```{python}
+# for batch in loader:
+#     # print(idx)
+#     print(batch)
+```
+
+
+```{python}
+
+factor_model = FactorModelARD(k, n)
+
+def subsample_create_plates(X, batch_idx):
+    # m = len(batch_idx)
+    return pyro.plate("obs", factor_model.n, subsample = batch_idx)
+# guide = factor_model.guide
+
+guide = pyro.infer.autoguide.AutoNormal(
+    factor_model, 
+    create_plates = subsample_create_plates)
+
+
+pyro.clear_param_store()
+
+MINIBATCH_SIZE = 32
 
 t0 = time.time()
 svi, opt = do_inference(
@@ -319,10 +518,10 @@ svi, opt = do_inference(
     factor_model,
     guide,
     opt = "Adam",
-    tol = 1,
+    tol = 1, # tolerance is epoch loss per datum
     epochs = 1000,
     minibatch_flag = True,
-    minibatch_size = 32,
+    minibatch_size = MINIBATCH_SIZE,
     opt_args = {"lr":0.001} #, "weight_decay": 5}
     )
 # opt_minibatch = train_decomp(X, #sim_data_torch["X_l"][0], #X, 
@@ -338,9 +537,14 @@ print(f"Minibatch runtime: {run_minibatch / 60} mins")
 
 
 ```{python}
+print(f"Minibatch runtime: {run_minibatch / 60} mins")
+```
+
+```{python}
 run_minibatch / 60
 ```
 
+### Plot loss
 ```{python}
 p = sns.relplot(
     data = factor_model.loss_history,
@@ -351,9 +555,7 @@ p.fig.suptitle("Minibatch loss per epoch")
 # factor_model.loss_history
 ```
 
-```{python}
 
-```
 Pass full dataset as Tensor into model training. Tolerance is at scale of difference in ELBO by iteration.
 
 ```{python}
@@ -361,6 +563,36 @@ import time
 ```
 
 ## Run model: batch updates
+
+### SupMultiviewDecomp
+
+```{python}
+pyro.clear_param_store()
+
+factor_model = FactorModelARD(k, n)
+# guide = factor_model.guide
+guide = pyro.infer.autoguide.AutoNormal(
+    factor_model)
+
+
+t0 = time.time()
+svi, opt = do_inference(
+    X_clean, #X,
+    factor_model,
+    guide,
+    minibatch_flag = False,
+    tol = 1)
+
+# factor_model.do_inference(
+#     X,
+#     minibatch_flag = False,
+#     tol = 1)
+t1 = time.time()
+run = t1 - t0
+print(f"Runtime: {run / 60} mins")
+```
+
+### FactorModelARD
 
 tol = 1 works fine for unscaled data
 tol = 0.5 good for rescaled data
@@ -425,7 +657,7 @@ len(factor_model.loss_history)
 
 ```{python}
 opt.get_state()
-pyro.get_param_store().get_state()
+# pyro.get_param_store().get_state()
 ```
 
 ```{python}
@@ -444,6 +676,28 @@ torch.save({
     "optimizer_state": opt.get_state(),
     "loss_history": factor_model.loss_history
 }, out_filename)
+```
+
+```{python}
+pyro.get_param_store().get_state()
+```
+
+```{python}
+out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/model")
+out_filename = os.path.join(out_path, "batch_run_n500p500_autonormalguide.pth")
+
+torch.save({
+    "inference_time": run_minibatch,
+    "model_param_store": pyro.get_param_store(),
+    "model_state_dict": pyro.get_param_store().get_state(),
+    "optimizer_state": opt.get_state(),
+    "loss_history": factor_model.loss_history
+}, out_filename)
+```
+
+
+```{python}
+pyro.get_param_store().save(os.path.join(out_path, "batch_run_n500p500_autonormalguide_params.pth"))
 ```
 
 ```{python}
@@ -476,13 +730,68 @@ for name in pyro.get_param_store().get_all_param_names():
     print(pyro.param(name))
 ```
 
+# Evaluate
+## Evaluate latent structure reconstruction
+### SupMultiviewDecomp
 
-### Evaluate latent structure reconstruction
+```{python}
+L = int(sim_data_multiview_torch["L"])
+```
 
+```{python}
+EST_decomp = extract_est_decomp(L, True)
+
+EST_Struct_shared_l_list = list(map(calc_struct, \
+    [EST_decomp.get("EST_Z")] * L, EST_decomp.get("EST_Lambda_l_list")))
+EST_Struct_view_l_list = list(map(calc_struct, \
+    EST_decomp.get("EST_Phi_l_list"), EST_decomp.get("EST_Gamma_l_list")))
+```
+
+```{python}
+SIM_decomp = extract_sim_decomp(sim_data_multiview_torch)
+
+SIM_Struct_shared_l_list = list(map(calc_struct, \
+    [SIM_decomp.get("SIM_Z")]* L, SIM_decomp.get("SIM_Lambda_l_list")))
+SIM_Struct_view_l_list = list(map(calc_struct, \
+    SIM_decomp.get("SIM_Phi_l_list"), SIM_decomp.get("SIM_Gamma_l_list")))
+```
+
+
+Rescale structures using original data view means and sds
+```{python}
+X_l_mean_list = [clean["means"] for clean in map(normalize_tensor_by_col, X_l_list)]
+X_l_sd_list = [clean["sds"] for clean in map(normalize_tensor_by_col, X_l_list)]
+
+
+EST_Struct_shared_l_list_rescaled = scale_est_struct(EST_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
+SIM_Struct_shared_l_list_rescaled = scale_est_struct(EST_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
+
+
+EST_Struct_view_l_list_rescaled = scale_est_struct(EST_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
+SIM_Struct_view_l_list_rescaled = scale_est_struct(EST_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
+```
+
+
+
+```{python}
+[eval_rse(est, sim) for est, sim in zip(EST_Struct_shared_l_list_rescaled, SIM_Struct_shared_l_list)]
+```
+
+```{python}
+[eval_rse(est, sim) for est, sim in zip(EST_Struct_view_l_list_rescaled, SIM_Struct_view_l_list)]
+```
+
+
+```{python}
+# pyro.param("AutoNormal.locs.y")
+```
+
+
+### FactorModelARD
 With AutoNormal guide
 ```{python}
 Lambda_est = pyro.param("AutoNormal.locs.Lambda")
-Z_est = pyro.param("AutoNormal.locs.Z_batch")
+Z_est = pyro.param("AutoNormal.locs.Z")
 Z_est
 ```
 
@@ -498,6 +807,8 @@ Z_est.shape
 # pyro.param("AutoNormal.scales.Z_batch").shape
 ```
 
+Structure from fit model 
+
 ```{python}
 Struct_est = Z_est @ Lambda_est.T
 Struct_est
@@ -507,21 +818,21 @@ Struct_est
 torch.std(Struct_est, 0)
 ```
 
+Rescaled structure to have ORIGINAL mean and variance
+
 ```{python}
 Struct_est_rescaled = (Struct_est * X_stds) + X_means
 Struct_est_rescaled
 ```
 
-```{python}
-# sim_data_torch["X_l"][0]
-# X
-```
+Structure from simulated edata
 
 ```{python}
 Struct_sim = sim_data_torch["Z"] @ sim_data_torch["Lambda_l"][0].T
 Struct_sim
 ```
 
+Rescaled to have mean 0 and variance 1
 ```{python}
 # Struct_sim_rescaled = (Struct_sim * X_stds) + X_means
 Struct_sim_rescaled = (Struct_sim - X_means) /  X_stds
@@ -546,6 +857,7 @@ torch.norm(Struct_est)
 torch.norm(Struct_sim - Struct_est) ** 2 / torch.norm(Struct_sim) ** 2
 ```
 
+Compare rescaled 
 ```{python}
 # torch.norm(Struct_sim - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2
 
@@ -556,6 +868,7 @@ torch.norm(Struct_sim_rescaled - Struct_est) ** 2 / torch.norm(Struct_sim_rescal
 torch.norm(Struct_sim - Struct_est_rescaled) ** 2 / torch.norm(Struct_sim) ** 2
 ```
 
+# _____________________________
 # Predict 
 
 ```{python}
@@ -573,18 +886,31 @@ def g(X, k, n):
 
 ```{python}
 # guide = AutoNormal(bayesian_factor_model)
-post_pred = guide.sample_posterior(sample_shape = (1000,))
+post_samples_fromguide = guide.sample_posterior(sample_shape = (1000,))
 ```
 
 Posterior samples for all latent avriables
 ```{python}
 predictive = pyro.infer.Predictive(guide, num_samples = 1000)
-post_samples = predictive(X, torch.arange(X.shape[0]))
+post_samples = predictive(X_clean, torch.arange(X_clean.shape[0]))
 ```
 
+```{python}
+post_samples_subset = dict((k, post_samples[k]) for k in ("sigma2_lambda", "Lambda", "psi", "Z"))
+predictive_model = pyro.infer.Predictive(
+    factor_model, 
+    posterior_samples = post_samples_subset,
+    num_samples = 1000,
+    return_sites = ["structure"])
+
+post_samples_from_model = predictive_model(X_clean, torch.arange(X_clean.shape[0]))
+
+```
 
 ```{python}
-post_samples
+post_samples.keys()
+
+dict(k, post_samples[k] for k in ("sigma2_lambda", "Lambda", "psi", "Z"))
 ```
 
 ```{python}
@@ -621,8 +947,8 @@ Struct_deterministic_post_mean = torch.mean(post_samples.get("structure"), dim =
 Check structure from posterior mean:
 
 ```{python}
-print(torch.norm(Struct_deterministic_post_mean - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2)
-print(torch.norm(Struct_post_mean - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2)
+# print(torch.norm(Struct_deterministic_post_mean - Struct_est_rescaled) ** 2 / torch.norm(Struct_est_rescaled) ** 2)
+print(torch.norm(Struct_post_mean - Struct_sim_rescaled) ** 2 / torch.norm(Struct_sim_rescaled) ** 2)
 ```
 
 ```{python}
