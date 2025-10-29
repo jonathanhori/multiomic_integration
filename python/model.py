@@ -13,7 +13,7 @@ from pyro.optim import Adam, ClippedAdam
 from pyro.infer import SVI, Trace_ELBO, Predictive, TraceGraph_ELBO
 from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNormal
 
-from torch.utils.data import DataSet, TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader
 
 pyro.enable_validation(True)
 pyro.set_rng_seed(0)
@@ -24,6 +24,7 @@ class SupMultiviewDecomp(PyroModule):
                  k, 
                  k_l_list,
                  n,
+                 include_view_factors = False,
                  a_sigma_joint=2.0, # Hyperparams: ARD prior per factor: IG same for all views
                  b_sigma_joint=2.0,
                  a_sigma_view=2.0, # Hyperparams: ARD prior per factor: IG same for all views
@@ -39,7 +40,7 @@ class SupMultiviewDecomp(PyroModule):
         # Model parameters
         self.n = n
         self.k = k
-        self.k_l = k_l_list # assumes k_l > 0 for all l
+        self.k_l_list = k_l_list # assumes k_l > 0 for all l
         self.p_l = None
         
         # Hyperparams
@@ -51,8 +52,12 @@ class SupMultiviewDecomp(PyroModule):
         self.b_psi = b_psi
         self.a_sigma_y = a_sigma_y
         self.b_sigma_y = b_sigma_y
-        self.a_sigma_beta = a_sigma_beta,
+        self.a_sigma_beta = a_sigma_beta
         self.b_sigma_beta = b_sigma_beta
+        
+        # Should view-specific factors be included in the outcome model?
+        self.include_view_factors = include_view_factors
+        self.num_outcome_factors = k if not include_view_factors else sum((k, *k_l_list))
         
         self.loss_history = []
         
@@ -99,7 +104,7 @@ class SupMultiviewDecomp(PyroModule):
         
         # SHARED
         Lambda_l_list = []
-        for l, p_l in enumerate(p_l_list, self.k_l_list):
+        for l, p_l in enumerate(p_l_list):
             sigma2_lambda_l = pyro.sample(f"sigma2_lambda_l{l}", 
                                    dist.InverseGamma(self.a_sigma_joint, self.b_sigma_joint).expand([self.k]).to_event(1))
             sigma_lambda_l = torch.sqrt(sigma2_lambda_l)
@@ -127,23 +132,19 @@ class SupMultiviewDecomp(PyroModule):
             psi_sqrt = torch.sqrt(psi_l)
             psi_sqrt_l_list.append(psi_sqrt)
             
-        # Outcome variances
-        sigma2_y = pyro.sample("sigma2_y",
-                               dist.InverseGamma(self.a_sigma_y, self.b_sigma_y).to_event(1))
-        sigma_y = torch.sqrt(sigma2_y)
         
         # Outcome model coefficients
         sigma2_beta = pyro.sample("sigma2_beta",
-                                  dist.InverseGamma(self.a_sigma_beta, self.b_sigma_beta).expand([self.k]).to_event(1))
+                                  dist.InverseGamma(self.a_sigma_beta, self.b_sigma_beta).expand([self.num_outcome_factors]).to_event(1))
         beta = pyro.sample("beta",
-                           dist.Normal(torch.zeros(self.k), sigma2_beta).to_event(1))
+                           dist.Normal(torch.zeros(self.num_outcome_factors), sigma2_beta).to_event(1))
         
         # Local latent variables and observations
-        with pyro.plate("obs", self.n, subsample = batch_idx): # X is a minibatch, can pass directly into subsample
+        with pyro.plate("obs", self.n, subsample = batch_idx):
             Z = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
             
             Phi_l_list = []
-            for l, k_l in enumerate(self.k_l):
+            for l, k_l in enumerate(self.k_l_list):
                 Phi_l = pyro.sample(f"Phi_l{l}", dist.Normal(0., 1.).expand([k_l]).to_event(1))
                 Phi_l_list.append(Phi_l)
                 
@@ -159,16 +160,37 @@ class SupMultiviewDecomp(PyroModule):
                 total_structure_l = torch.add(joint_structure_l, view_structure_l)
                 
                 joint_structure_list.append(joint_structure_l)
-            
+                
                 pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
                                                    psi_sqrt_l_list[l]).to_event(1), 
                             obs = X_list[l])
             
+                # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
+                #                                    psi_sqrt_l_list[l]).to_event(1), 
+                #             obs = X_list[l].index_select(0, batch_idx))
+            
+            # Outcome variances
+            sigma2_y = pyro.sample("sigma2_y",
+                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y))
+            sigma_y = torch.sqrt(sigma2_y)
+            
             # Outcome model
-            outcome_structure = pyro.deterministic("outcome_structure",
-                                                   torch.matmul(Z, beta))
-            pyro.sample("y", dist.Normal(outcome_structure, sigma_y),
-                        obs = y)
+            if self.include_view_factors:
+                full_factors = torch.cat((Z, *Phi_l_list), 1)
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(full_factors, beta))
+                pyro.sample("y", dist.Normal(outcome_structure, 
+                                            sigma_y).to_event(),
+                            obs = y)
+            else:
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(Z, beta))
+                pyro.sample("y", dist.Normal(outcome_structure, 
+                                            sigma_y).to_event(),
+                            obs = y)
+            # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx), 
+            #                              sigma_y),
+            #             obs = y.index_select(0, batch_idx))
             
             
     def guide(self, 
@@ -237,13 +259,13 @@ def do_inference(X_list,
                  model, 
                  guide, 
                  opt = "Adam",
-                epochs = 20,
-                max_iter = 20000,
-                minibatch_flag = False,
-                minibatch_size = 32,
-                tol = 1e-4,
-                opt_args = {"lr": 0.001},
-                device = "cpu"):
+                 epochs = 20,
+                 max_iter = 20000,
+                 minibatch_flag = False,
+                 minibatch_size = 32,
+                 tol = 1e-4,
+                 opt_args = {"lr": 0.001},
+                 device = "cpu"):
     
     # if minibatch_flag == False, then do not minibatch, data loader not necessary
     if not minibatch_flag:
@@ -277,6 +299,7 @@ def do_inference(X_list,
         for epoch in range(epochs):
             epoch_loss = 0.
             for batch in loader:
+                # batch is subsampled [idx, X_l_list, y]
                 batch_idx = batch.pop(0)
                 y_batch = batch.pop(-1)
                 # print(batch.shape)
@@ -297,7 +320,7 @@ def do_inference(X_list,
             #     p = pyro.param(name)
             #     print(name, p.shape, getattr(p, "grad", None) is not None)
             
-            prev_loss = loss
+            prev_loss = epoch_loss
     else:
         # total_loss = 0.
         prev_loss = None
