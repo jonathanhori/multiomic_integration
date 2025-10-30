@@ -59,6 +59,8 @@ class SupMultiviewDecomp(PyroModule):
         self.include_view_factors = include_view_factors
         self.num_outcome_factors = k if not include_view_factors else sum((k, *k_l_list))
         
+        self.total_epochs = None
+        self.total_iters = None
         self.loss_history = []
         
     
@@ -258,8 +260,9 @@ def do_inference(X_list,
                  y,
                  model, 
                  guide, 
-                 opt = "Adam",
-                 opt_args = {"lr": 0.001},
+                 opt = Adam({"lr": 0.001}), #"Adam",
+                 elbo = Trace_ELBO(),
+                #  opt_args = {"lr": 0.001},
                  epochs = 20,
                  max_iter = 20000,
                  minibatch_flag = False,
@@ -281,11 +284,11 @@ def do_inference(X_list,
     # Initialize instances for optimization
     ########################
     # guide = self.guide
-    if opt == "Adam":
-        opt = Adam(opt_args)
-    elif opt == "ClippedAdam":
-        opt = ClippedAdam(opt_args)
-    elbo = Trace_ELBO(num_particles = 1)
+    # if opt == "Adam":
+    #     opt = Adam(opt_args)
+    # elif opt == "ClippedAdam":
+    #     opt = ClippedAdam(opt_args)
+    # elbo = Trace_ELBO(num_particles = 1)
     # elbo = TraceGraph_ELBO()
     svi = SVI(model, guide, opt, loss = elbo)
     
@@ -312,6 +315,7 @@ def do_inference(X_list,
             model.loss_history.append(epoch_loss)
             
             if prev_loss is not None and abs(epoch_loss - prev_loss) / model.n < tol:
+                model.total_epochs = epoch
                 break
                 
             # print(f"delta: {epoch_loss / n - (prev_loss / n if prev_loss is not None else epoch_loss / n):+.6f}")
@@ -342,6 +346,7 @@ def do_inference(X_list,
                 # print(f"Stopping: {abs((loss- prev_loss) / prev_loss)} < {tol}")
                 print(f"Iteration {iter-1}  loss: {prev_loss / model.n:.4f}")
                 print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
+                model.total_iters = iter
                 break
             prev_loss = loss
             
