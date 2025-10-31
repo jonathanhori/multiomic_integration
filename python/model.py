@@ -4,6 +4,7 @@ import sys
 
 from functools import partial
 
+import math
 import torch
 import pyro
 import pyro.distributions as dist
@@ -59,7 +60,7 @@ class SupMultiviewDecomp(PyroModule):
         self.include_view_factors = include_view_factors
         self.num_outcome_factors = k if not include_view_factors else sum((k, *k_l_list))
         
-        self.total_epochs = None
+        self.total_epochs = 0
         self.total_iters = None
         self.loss_history = []
         
@@ -141,6 +142,11 @@ class SupMultiviewDecomp(PyroModule):
         beta = pyro.sample("beta",
                            dist.Normal(torch.zeros(self.num_outcome_factors), sigma2_beta).to_event(1))
         
+        # Outcome variances
+        sigma2_y = pyro.sample("sigma2_y",
+                            dist.InverseGamma(self.a_sigma_y, self.b_sigma_y))
+        sigma_y = torch.sqrt(sigma2_y)
+        
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx):
             Z = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
@@ -171,10 +177,6 @@ class SupMultiviewDecomp(PyroModule):
                 #                                    psi_sqrt_l_list[l]).to_event(1), 
                 #             obs = X_list[l].index_select(0, batch_idx))
             
-            # Outcome variances
-            sigma2_y = pyro.sample("sigma2_y",
-                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y))
-            sigma_y = torch.sqrt(sigma2_y)
             
             # Outcome model
             if self.include_view_factors:
@@ -182,13 +184,13 @@ class SupMultiviewDecomp(PyroModule):
                 outcome_structure = pyro.deterministic("outcome_structure",
                                                     torch.matmul(full_factors, beta))
                 pyro.sample("y", dist.Normal(outcome_structure, 
-                                            sigma_y).to_event(),
+                                            sigma_y), #.to_event(1),
                             obs = y)
             else:
                 outcome_structure = pyro.deterministic("outcome_structure",
                                                     torch.matmul(Z, beta))
                 pyro.sample("y", dist.Normal(outcome_structure, 
-                                            sigma_y).to_event(),
+                                            sigma_y), #.to_event(1),
                             obs = y)
             # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx), 
             #                              sigma_y),
@@ -263,12 +265,15 @@ def do_inference(X_list,
                  opt = Adam({"lr": 0.001}), #"Adam",
                  elbo = Trace_ELBO(),
                 #  opt_args = {"lr": 0.001},
+                 min_epochs = 10,
                  epochs = 20,
                  max_iter = 20000,
                  minibatch_flag = False,
                  minibatch_size = 32,
                  tol = 1e-4,
                  device = "cpu"):
+    
+    # min_epochs = 10
     
     # if minibatch_flag == False, then do not minibatch, data loader not necessary
     if not minibatch_flag:
@@ -299,12 +304,14 @@ def do_inference(X_list,
     ########################
     if minibatch_flag:
         prev_loss = None
+        min_loss = math.inf
+        epoch_at_min_loss = 0
         for epoch in range(epochs):
             epoch_loss = 0.
             for batch in loader:
                 # batch is subsampled [idx, X_l_list, y]
                 batch_idx = batch.pop(0)
-                y_batch = batch.pop(-1)
+                y_batch = batch.pop(-1).squeeze()
                 # print(batch.shape)
                 loss = svi.step(batch, batch_idx, y_batch)
                 # print(loss)
@@ -314,41 +321,47 @@ def do_inference(X_list,
             
             model.loss_history.append(epoch_loss)
             
-            if prev_loss is not None and abs(epoch_loss - prev_loss) / model.n < tol:
-                model.total_epochs = epoch
+            # Determine the epoch when the min loss is obtained
+            if epoch_loss < min_loss:
+                min_loss = epoch_loss
+                epoch_at_min_loss = epoch
+            
+            model.total_epochs += 1
+            
+            # Converged?
+            if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch):
+            # if prev_loss is not None and abs(epoch_loss - prev_loss) / model.n < tol:
+                # model.total_epochs = epoch
                 break
                 
             # print(f"delta: {epoch_loss / n - (prev_loss / n if prev_loss is not None else epoch_loss / n):+.6f}")
             
-            # for name in pyro.get_param_store().get_all_param_names():
-            #     p = pyro.param(name)
-            #     print(name, p.shape, getattr(p, "grad", None) is not None)
-            
             prev_loss = epoch_loss
     else:
-        # total_loss = 0.
-        prev_loss = None
-        for iter in range(max_iter):
-            # total_loss = 0.
-            loss = svi.step(X, torch.arange(X.shape[0])) #batch[0])
-            # print(loss)
-            # total_loss += loss
-            # for batch in loader:
-            #     loss = svi.step(batch[0])
-            #     epoch_loss += loss
-            if iter % 100 == 0:
-                print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
-                model.loss_history.append(loss)
-                # print(f"Epoch {iter+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss:.4f}")
+        raise NotImplementedError
+        # # total_loss = 0.
+        # prev_loss = None
+        # for iter in range(max_iter):
+        #     # total_loss = 0.
+        #     loss = svi.step(X, torch.arange(X.shape[0])) #batch[0])
+        #     # print(loss)
+        #     # total_loss += loss
+        #     # for batch in loader:
+        #     #     loss = svi.step(batch[0])
+        #     #     epoch_loss += loss
+        #     if iter % 100 == 0:
+        #         print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
+        #         model.loss_history.append(loss)
+        #         # print(f"Epoch {iter+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss:.4f}")
                 
-            # if prev_loss is not None and abs((loss- prev_loss) / prev_loss) < tol:
-            if prev_loss is not None and abs((loss- prev_loss)) < tol:
-                # print(f"Stopping: {abs((loss- prev_loss) / prev_loss)} < {tol}")
-                print(f"Iteration {iter-1}  loss: {prev_loss / model.n:.4f}")
-                print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
-                model.total_iters = iter
-                break
-            prev_loss = loss
+        #     # if prev_loss is not None and abs((loss- prev_loss) / prev_loss) < tol:
+        #     if prev_loss is not None and abs((loss- prev_loss)) < tol:
+        #         # print(f"Stopping: {abs((loss- prev_loss) / prev_loss)} < {tol}")
+        #         print(f"Iteration {iter-1}  loss: {prev_loss / model.n:.4f}")
+        #         print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
+        #         model.total_iters = iter
+        #         break
+        #     prev_loss = loss
             
         
     return svi, opt
