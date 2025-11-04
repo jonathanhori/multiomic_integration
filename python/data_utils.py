@@ -144,5 +144,63 @@ def scale_sim_struct(struct_list, mean_list, sd_list):
     return [(struct - mean) / sd for struct, mean, sd in zip(struct_list, mean_list, sd_list)]
     # return [struct_list[i] * sd_list[i] + mean_list[i] for i in range(len(struct_list))]
 
+
+###############
+# Evaluate structures
+
 def eval_rse(est_struct, sim_struct):
     return torch.norm(sim_struct - est_struct) ** 2 / torch.norm(sim_struct) ** 2
+
+
+def summarise_post_samples(sample_tensor): 
+    """
+    Calculate summary statistics for posterior samples
+    """
+    summary = {
+        "mean": torch.mean(sample_tensor, dim = 0),
+        "std": torch.std(sample_tensor, dim = 0),
+        "q2.5": torch.quantile(sample_tensor, 0.025, dim = 0),
+        "q5": torch.quantile(sample_tensor, 0.05, dim = 0),
+        "q25": torch.quantile(sample_tensor, 0.25, dim = 0),
+        "q50": torch.quantile(sample_tensor, 0.50, dim = 0),
+        "q75": torch.quantile(sample_tensor, 0.75, dim = 0),
+        "q95": torch.quantile(sample_tensor, 0.95, dim = 0),
+        "q97.5": torch.quantile(sample_tensor, 0.975, dim = 0)
+    }
+    return summary
+
+
+def summarise_structure_list(post_samples, L, struct_type):
+    """
+    Summarise all joint or individual structures from a given model
+    """
+    if struct_type == "joint":
+        return [summarise_post_samples(post_samples.get(f'joint_structure_l{l}')) for l in range(L)]
+    elif struct_type == "individual": 
+        return [summarise_post_samples(post_samples.get(f'view_structure_l{l}')) for l in range(L)]
+
+def eval_post_coverage(sim_struct, lower, upper):
+    """
+    Calculate the nominal entrywise coverage probability for posterior samples and simulated data
+    """
+    return torch.sum(torch.logical_and(
+            torch.less_equal(lower, sim_struct),
+            torch.greater_equal(upper, sim_struct)
+        )) / torch.numel(sim_struct)
+    
+def eval_credible_interval(sim_structure_list, summary_list, region = '95'):
+    """
+    Determine coverage of credible intervals for given lists of simulated structures and
+        associated dictionaries of summary statistics
+    """
+    if region == '95':
+        lower = 'q2.5'
+        upper = 'q97.5'
+    elif region == '90':
+        lower = 'q5'
+        upper = 'q95'
+    elif region == '50':
+        lower = 'q25'
+        upper = 'q75'
+    return [eval_post_coverage(sim_struct, post_summary.get(lower), post_summary.get(upper)).item() \
+        for sim_struct, post_summary in zip(sim_structure_list, summary_list)]
