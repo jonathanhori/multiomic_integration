@@ -14,7 +14,7 @@ from rpy2.robjects import pandas2ri, default_converter, conversion
 import torch
 import pyro
 from pyro.optim import Adam, ClippedAdam
-from pyro.infer import SVI, Trace_ELBO
+from pyro.infer import SVI, Trace_ELBO, Predictive
 
 import importlib
 
@@ -27,7 +27,7 @@ sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~Cloud
 
 from data_utils import load_and_process_rds_data_for_condition, normalize_tensor_by_col, \
     extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, \
-        eval_rse
+        summarise_structure_list, eval_rse, eval_credible_interval
 from model import SupMultiviewDecomp, do_inference
 
 
@@ -59,6 +59,7 @@ sim_grid = itertools.product(
     [loading_sparsity]
 )
 
+N_POSTERIOR_SAMPLES = 1000
 
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 1000
@@ -75,6 +76,10 @@ model_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_rep{}"
 
 metric_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/metrics")
 metric_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_rep{}"
+
+# Create output paths if don't exist
+Path(model_out_path).mkdir(parents=True, exist_ok=True)
+Path(metric_out_path).mkdir(parents=True, exist_ok=True)
 
 metric_list = []
 
@@ -191,7 +196,7 @@ if __name__ == "__main__":
             pyro.get_param_store().save(model_out_filename + "_paramstore.pth") #os.path.join(model_out_path, model_out_filename + "_paramstore.pth"))
             
             #################
-            # Evaluate model 
+            # Calculate model structures
             EST_decomp = extract_est_decomp(L, True)
 
             EST_Struct_shared_l_list = list(map(calc_struct, \
@@ -211,19 +216,49 @@ if __name__ == "__main__":
 
             EST_Struct_view_l_list_rescaled = scale_est_struct(EST_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
             SIM_Struct_view_l_list_rescaled = scale_sim_struct(SIM_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
+            
+            #################
+            # Sample from posterior
+            predictive = Predictive(factor_model, guide = guide, num_samples = N_POSTERIOR_SAMPLES)
 
+            # Do not supply y
+            post_samples = predictive(
+                X_l_list_clean,
+                torch.arange(n)
+                )
+            
+            joint_structure_summaries = summarise_structure_list(post_samples, L, "joint")
+            individual_structure_summaries = summarise_structure_list(post_samples, L, "individual")
+
+            #################
+            # Evaluate
+            # Compare estimated structures (targeting mean 0 var 1 data) with 
+            #   RESCALED simulated structures
             shared_rse = [eval_rse(est, sim).detach().item() for est, sim in zip(EST_Struct_shared_l_list_rescaled, SIM_Struct_shared_l_list)]
             view_rse = [eval_rse(est, sim).detach().item() for est, sim in zip(EST_Struct_view_l_list_rescaled, SIM_Struct_view_l_list)]
+            
+            joint_coverage = eval_credible_interval(
+                SIM_Struct_shared_l_list_rescaled,
+                joint_structure_summaries,
+                '95')
 
-            eval_metric_table = pd.melt(pd.DataFrame({
-                "shared": shared_rse,
-                "view_specific": view_rse
+            individual_coverage = eval_credible_interval(
+                SIM_Struct_view_l_list_rescaled,
+                individual_structure_summaries,
+                '95')
+
+            eval_metric_table = pd.wide_to_long(pd.DataFrame({
+                "joint.rse": shared_rse,
+                "individual.rse": view_rse,
+                "joint.95p_coverage": joint_coverage,
+                "individual.95p_coverage": individual_coverage
                 }
                 ).rename_axis('view').reset_index(),
-                id_vars = ["view"],
-                value_vars = ["shared", "view_specific"],
-                var_name = "structure",
-                value_name = "rse").\
+                stubnames = ['joint', 'individual'],
+                i = 'view',
+                j = 'metric',
+                sep = '.',
+                suffix = '.+').\
                 assign(n = n,
                     p = p_l,
                     snr_x = snr_x,
