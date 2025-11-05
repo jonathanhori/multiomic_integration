@@ -63,6 +63,7 @@ class SupMultiviewDecomp(PyroModule):
         self.total_epochs = 0
         self.total_iters = None
         self.loss_history = []
+        self.var_param_convergence_history = []
         
     
     def forward(self, 
@@ -140,11 +141,12 @@ class SupMultiviewDecomp(PyroModule):
         sigma2_beta = pyro.sample("sigma2_beta",
                                   dist.InverseGamma(self.a_sigma_beta, self.b_sigma_beta).expand([self.num_outcome_factors]).to_event(1))
         beta = pyro.sample("beta",
-                           dist.Normal(torch.zeros(self.num_outcome_factors), sigma2_beta).to_event(1))
+                           dist.Normal(torch.zeros(self.num_outcome_factors), sigma2_beta).to_event(1)).\
+                               squeeze(0)
         
         # Outcome variances
         sigma2_y = pyro.sample("sigma2_y",
-                            dist.InverseGamma(self.a_sigma_y, self.b_sigma_y))
+                            dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
         sigma_y = torch.sqrt(sigma2_y)
         
         # Local latent variables and observations
@@ -161,9 +163,9 @@ class SupMultiviewDecomp(PyroModule):
             joint_structure_list = []
             for l in range(len(X_list)):
                 joint_structure_l = pyro.deterministic(f"joint_structure_l{l}", 
-                                                       torch.matmul(Z, Lambda_l_list[l].T))
+                                                       torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
                 view_structure_l = pyro.deterministic(f"view_structure_l{l}",
-                                                    torch.matmul(Phi_l_list[l], Gamma_l_list[l].T))
+                                                    torch.matmul(Phi_l_list[l], Gamma_l_list[l].squeeze(0).T))
                 
                 total_structure_l = torch.add(joint_structure_l, view_structure_l)
                 
@@ -271,6 +273,7 @@ def do_inference(X_list,
                  minibatch_flag = False,
                  minibatch_size = 32,
                  tol = 1e-4,
+                 variational_tol = 1e-4,
                  device = "cpu"):
     
     # min_epochs = 10
@@ -303,9 +306,11 @@ def do_inference(X_list,
     # If not minibatching: pass original data as tensor
     ########################
     if minibatch_flag:
-        prev_loss = None
+        # prev_loss = None
         min_loss = math.inf
         epoch_at_min_loss = 0
+        params_epoch_last = None
+        params_epoch_curr = None
         for epoch in range(epochs):
             epoch_loss = 0.
             for batch in loader:
@@ -327,16 +332,26 @@ def do_inference(X_list,
                 epoch_at_min_loss = epoch
             
             model.total_epochs += 1
+            param_store_curr = pyro.get_param_store()
+            params_epoch_curr = {k: v.detach().clone() for k, v in param_store_curr.items()}
+            if epoch == 0: 
+                params_epoch_last = params_epoch_curr
+            # Check Euclidean norm of difference in variational params for convergence
+            param_diff_norm_dict = {k: torch.norm(params_epoch_last[k] - params_epoch_curr[k]).item() for k in pyro.get_param_store()}
+            model.var_param_convergence_history.append(max(param_diff_norm_dict.values()))
+            # print(params_epoch_curr.items())
+            params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())
             
             # Converged?
-            if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch):
+            if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch)\
+                and params_epoch_last is not None and params_converged:
             # if prev_loss is not None and abs(epoch_loss - prev_loss) / model.n < tol:
                 # model.total_epochs = epoch
                 break
-                
-            # print(f"delta: {epoch_loss / n - (prev_loss / n if prev_loss is not None else epoch_loss / n):+.6f}")
             
-            prev_loss = epoch_loss
+            params_epoch_last = params_epoch_curr
+            
+            # prev_loss = epoch_loss
     else:
         raise NotImplementedError
         # # total_loss = 0.
