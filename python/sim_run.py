@@ -27,7 +27,8 @@ sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~Cloud
 
 from data_utils import load_and_process_rds_data_for_condition, normalize_tensor_by_col, \
     extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, \
-        summarise_structure_list, eval_rse, eval_credible_interval
+        summarise_structure_list, eval_rse, eval_mse, eval_credible_interval, \
+            eval_post_coverage, summarise_post_samples
 from model import SupMultiviewDecomp, do_inference
 
 
@@ -148,14 +149,16 @@ if __name__ == "__main__":
             # OPT = Adam({"lr": initial_lr})
             OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
             LOSS = Trace_ELBO(num_particles = 1)
-            if n == 50: 
-                TOL = 0.001
-            elif n == 100:
-                TOL = 0.002
-            elif n == 500:
-                TOL = 0.01
-            elif n == 1000:
-                TOL = 0.1
+            TOL = 1
+            VARIATIONAL_TOL = 0.001
+            # if n == 50: 
+            #     TOL = 0.001
+            # elif n == 100:
+            #     TOL = 0.002
+            # elif n == 500:
+            #     TOL = 0.01
+            # elif n == 1000:
+            #     TOL = 0.1
             # TOL = 0.5 * n / 1000 # just a heuristic for now
             
             t0 = time.time()
@@ -166,7 +169,8 @@ if __name__ == "__main__":
                 guide = guide,
                 opt = OPT,
                 elbo = LOSS,
-                tol = TOL, # tolerance is on epoch loss per datum
+                # tol = TOL, # tolerance is on epoch loss per datum,
+                variational_tol = VARIATIONAL_TOL,
                 epochs = NUM_EPOCHS,
                 minibatch_flag = True,
                 minibatch_size = MINIBATCH_SIZE
@@ -197,64 +201,93 @@ if __name__ == "__main__":
             
             #################
             # Calculate model structures
-            EST_decomp = extract_est_decomp(L, True)
+            # EST_decomp = extract_est_decomp(L, True)
 
-            EST_Struct_shared_l_list = list(map(calc_struct, \
-                [EST_decomp.get("EST_Z")] * L, EST_decomp.get("EST_Lambda_l_list")))
-            EST_Struct_view_l_list = list(map(calc_struct, \
-                EST_decomp.get("EST_Phi_l_list"), EST_decomp.get("EST_Gamma_l_list")))
+            # EST_Struct_shared_l_list = list(map(calc_struct, \
+            #     [EST_decomp.get("EST_Z")] * L, EST_decomp.get("EST_Lambda_l_list")))
+            # EST_Struct_view_l_list = list(map(calc_struct, \
+            #     EST_decomp.get("EST_Phi_l_list"), EST_decomp.get("EST_Gamma_l_list")))
 
             SIM_decomp = extract_sim_decomp(sim_data)
 
-            SIM_Struct_shared_l_list = list(map(calc_struct, \
+            SIM_joint_struct_l_list = list(map(calc_struct, \
                 [SIM_decomp.get("SIM_Z")]* L, SIM_decomp.get("SIM_Lambda_l_list")))
-            SIM_Struct_view_l_list = list(map(calc_struct, \
+            SIM_individual_struct_l_list = list(map(calc_struct, \
                 SIM_decomp.get("SIM_Phi_l_list"), SIM_decomp.get("SIM_Gamma_l_list")))
 
-            EST_Struct_shared_l_list_rescaled = scale_est_struct(EST_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
-            SIM_Struct_shared_l_list_rescaled = scale_sim_struct(SIM_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
+            # EST_Struct_shared_l_list_rescaled = scale_est_struct(EST_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
+            SIM_joint_struct_l_list_rescaled = scale_sim_struct(SIM_joint_struct_l_list, X_l_mean_list, X_l_sd_list)
 
-            EST_Struct_view_l_list_rescaled = scale_est_struct(EST_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
-            SIM_Struct_view_l_list_rescaled = scale_sim_struct(SIM_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
+            # EST_Struct_view_l_list_rescaled = scale_est_struct(EST_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
+            SIM_individual_struct_l_list_rescaled = scale_sim_struct(SIM_individual_struct_l_list, X_l_mean_list, X_l_sd_list)
             
             #################
             # Sample from posterior
-            predictive = Predictive(factor_model, guide = guide, num_samples = N_POSTERIOR_SAMPLES)
-
-            # Do not supply y
+            predictive = Predictive(factor_model, 
+                                    guide = guide, 
+                                    num_samples = N_POSTERIOR_SAMPLES)
             post_samples = predictive(
                 X_l_list_clean,
                 torch.arange(n)
                 )
             
+            # Structures
             joint_structure_summaries = summarise_structure_list(post_samples, L, "joint")
             individual_structure_summaries = summarise_structure_list(post_samples, L, "individual")
+            
+            POST_joint_struct_l_list = [summary.get('mean') for summary in joint_structure_summaries]
+            POST_individual_struct_l_list = [summary.get('mean') for summary in individual_structure_summaries]
+            
+            # Sample posterior predictive for outcome - specify return_sites
+            predictive_y = Predictive(factor_model, 
+                                    guide = guide, 
+                                    num_samples = N_POSTERIOR_SAMPLES,
+                                    return_sites = ["y"])
+            # Do not supply y
+            post_samples_y = predictive_y(
+                X_l_list_clean,
+                torch.arange(n)
+                )
+            
+            PRED_outcome_summary = summarise_post_samples(post_samples_y.get("y"))
+            PRED_y = PRED_outcome_summary.get('mean')
+            
 
             #################
             # Evaluate
             # Compare estimated structures (targeting mean 0 var 1 data) with 
             #   RESCALED simulated structures
-            shared_rse = [eval_rse(est, sim).detach().item() for est, sim in zip(EST_Struct_shared_l_list_rescaled, SIM_Struct_shared_l_list)]
-            view_rse = [eval_rse(est, sim).detach().item() for est, sim in zip(EST_Struct_view_l_list_rescaled, SIM_Struct_view_l_list)]
+            joint_rse = [eval_rse(est, sim).detach().item() for est, sim in \
+                zip(POST_joint_struct_l_list, SIM_joint_struct_l_list_rescaled)]
+            individual_rse = [eval_rse(est, sim).detach().item() for est, sim in \
+                zip(POST_individual_struct_l_list, SIM_individual_struct_l_list_rescaled)]
             
             joint_coverage = eval_credible_interval(
-                SIM_Struct_shared_l_list_rescaled,
+                SIM_joint_struct_l_list_rescaled,
                 joint_structure_summaries,
                 '95')
-
             individual_coverage = eval_credible_interval(
-                SIM_Struct_view_l_list_rescaled,
+                SIM_individual_struct_l_list_rescaled,
                 individual_structure_summaries,
                 '95')
+            
+            outcome_mse = eval_mse(PRED_y, y_clean.squeeze()).item()
+            outcome_coverage = eval_post_coverage(
+                y_clean.squeeze(),
+                PRED_outcome_summary.get('q2.5'),
+                PRED_outcome_summary.get('q97.5')
+                ).item()
 
             eval_metric_table = pd.wide_to_long(pd.DataFrame({
-                "joint.rse": shared_rse,
-                "individual.rse": view_rse,
+                "joint.rse": joint_rse,
+                "individual.rse": individual_rse,
                 "joint.95p_coverage": joint_coverage,
-                "individual.95p_coverage": individual_coverage
+                "individual.95p_coverage": individual_coverage,
+                "outcome.mse": outcome_mse,
+                "outcome.95p_coverage": outcome_coverage
                 }
                 ).rename_axis('view').reset_index(),
-                stubnames = ['joint', 'individual'],
+                stubnames = ['joint', 'individual', 'outcome'],
                 i = 'view',
                 j = 'metric',
                 sep = '.',
