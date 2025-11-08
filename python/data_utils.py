@@ -152,6 +152,10 @@ def eval_rse(est_struct, sim_struct):
     return torch.norm(sim_struct - est_struct) ** 2 / torch.norm(sim_struct) ** 2
 
 
+def eval_mse(pred_outcome, sim_outcome):
+    return torch.nn.functional.mse_loss(sim_outcome, pred_outcome)
+
+
 def summarise_post_samples(sample_tensor): 
     """
     Calculate summary statistics for posterior samples
