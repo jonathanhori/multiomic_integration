@@ -274,7 +274,8 @@ def do_inference(X_list,
                  minibatch_size = 32,
                  tol = 1e-4,
                  variational_tol = 1e-4,
-                 device = "cpu"):
+                 device = "cpu",
+                 verbose = False):
     
     # min_epochs = 10
     
@@ -321,8 +322,9 @@ def do_inference(X_list,
                 loss = svi.step(batch, batch_idx, y_batch)
                 # print(loss)
                 epoch_loss += loss
-            print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
-            print(f"Loss at epoch {epoch+1}: {loss / model.n}")
+            if verbose:
+                print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
+                print(f"Loss at epoch {epoch+1}: {loss / model.n}")
             
             model.loss_history.append(epoch_loss)
             
@@ -380,17 +382,3 @@ def do_inference(X_list,
             
         
     return svi, opt
-        
-
-    
-# def predict_factor_model(model,
-#                          guide,
-#                          num_samples,
-#                          data):
-    
-#     num_samples = 1000
-#     predictive = Predictive(model, guide=guide, num_samples=num_samples)
-#     return predictive(**data)
-#     # svi_samples = {k: v.reshape(num_samples).detach().cpu().numpy()
-#     #             for k, v in predictive(data).items()
-#     #             if k != "obs"}

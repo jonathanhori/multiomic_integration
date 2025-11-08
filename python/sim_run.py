@@ -48,7 +48,7 @@ n_array = (50, 100, 500, 1000)
 p_array = (50, 100, 1000)
 snr_x_array = (2, 1, 0.5)
 snr_y_array = (2, 1, 0.5)
-reps = 1
+reps = 10
 loading_sparsity = 0
 
 sim_grid = itertools.product(
@@ -64,7 +64,7 @@ N_POSTERIOR_SAMPLES = 1000
 
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 1000
-initial_lr = 0.01
+initial_lr = 0.005
 
 gamma = 0.1  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
@@ -87,8 +87,18 @@ metric_list = []
 if __name__ == "__main__":
     for n, p, snr_x, snr_y, sparsity in sim_grid:
         pyro.clear_param_store()
+        
         print("Loading:")
         print(file_dir_base.format(n, p, snr_x, snr_y, sparsity))
+        
+        # Determine if all reps are already done - skip training
+        check_model_out_filename = os.path.join(
+            model_out_path, 
+            model_out_filename_base.format(n, p, snr_x, snr_y, sparsity, reps))
+        if os.path.isfile(check_model_out_filename + ".pth"):
+            print('Model already trained, moving on')
+            continue
+        
         # Load data
         # file_name_base.format(n, p, snr_x, snr_y, sparsity) #, rep)
         files_for_condition = load_and_process_rds_data_for_condition(
@@ -102,6 +112,15 @@ if __name__ == "__main__":
 
         for rep in range(reps):
             rep += 1 # sim reps are created indexed by 1
+            
+            # Determine if model is already saved - skip training
+            model_out_filename = os.path.join(
+                model_out_path, 
+                model_out_filename_base.format(n, p, snr_x, snr_y, sparsity, rep))
+            if os.path.isfile(model_out_filename + ".pth"):
+                print('Model already trained, moving on')
+                continue
+            
             ##################
             # Setup replicate data
             print(file_name_base.format(rep))
@@ -173,7 +192,8 @@ if __name__ == "__main__":
                 variational_tol = VARIATIONAL_TOL,
                 epochs = NUM_EPOCHS,
                 minibatch_flag = True,
-                minibatch_size = MINIBATCH_SIZE
+                minibatch_size = MINIBATCH_SIZE,
+                verbose = False
                 )
             t1 = time.time()
             run_minibatch = t1 - t0
@@ -182,19 +202,18 @@ if __name__ == "__main__":
             # Inference finished, save and evaluate
             # Save model parameters
 
-            model_out_filename = os.path.join(
-                model_out_path, 
-                model_out_filename_base.format(n, p, snr_x, snr_y, sparsity, rep))
             print("Exporting:")
             print(model_out_filename)
             
 
             torch.save({
                 "inference_time": run_minibatch,
+                "epochs": factor_model.total_epochs,
                 # "model_param_store": pyro.get_param_store(),
                 "model_state_dict": pyro.get_param_store().get_state(),
                 "optimizer_state": opt.get_state(),
-                "loss_history": factor_model.loss_history
+                "loss_history": factor_model.loss_history,
+                "param_convergence_history": factor_model.var_param_convergence_history                
             }, model_out_filename + ".pth")
 
             pyro.get_param_store().save(model_out_filename + "_paramstore.pth") #os.path.join(model_out_path, model_out_filename + "_paramstore.pth"))
@@ -223,9 +242,12 @@ if __name__ == "__main__":
             
             #################
             # Sample from posterior
+            print('Sampling from posterior')
+            sites = [f'joint_structure_l{l}' for l in range(L)] + ['view_structure_l{l}' for l in range(L)]
             predictive = Predictive(factor_model, 
                                     guide = guide, 
-                                    num_samples = N_POSTERIOR_SAMPLES)
+                                    num_samples = N_POSTERIOR_SAMPLES,
+                                    return_sites = sites)
             post_samples = predictive(
                 X_l_list_clean,
                 torch.arange(n)
@@ -237,7 +259,7 @@ if __name__ == "__main__":
             
             POST_joint_struct_l_list = [summary.get('mean') for summary in joint_structure_summaries]
             POST_individual_struct_l_list = [summary.get('mean') for summary in individual_structure_summaries]
-            
+            print('Sampling outcomes from posterior')
             # Sample posterior predictive for outcome - specify return_sites
             predictive_y = Predictive(factor_model, 
                                     guide = guide, 

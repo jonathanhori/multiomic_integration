@@ -35,14 +35,14 @@ sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~Cloud
 
 ```{python}
 #| label: Load data utils
-importlib.reload(sys.modules["data_utils"])
+# importlib.reload(sys.modules["data_utils"])
 
 from data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition, normalize_tensor_by_col, extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, eval_rse, summarise_post_samples, summarise_structure_list, eval_post_coverage, eval_credible_interval
 ```
 
 ```{python}
 #| label: Load model objects
-importlib.reload(sys.modules["model"])
+# importlib.reload(sys.modules["model"])
 
 # from matrix_decomp import FactorModelARD, do_inference
 from model import SupMultiviewDecomp, do_inference
@@ -50,7 +50,7 @@ from model import SupMultiviewDecomp, do_inference
 
 # Load data
 
-## Load single dataset
+## Load single dataset for FactorModelARD
 
 ```{python}
 conversion._converter = None
@@ -84,8 +84,9 @@ sim_data_torch
 ```{python}
 conversion.set_conversion(default_converter)
 readRDS = robjects.r['readRDS']
-sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p100_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
+# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p100_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
 # sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n50p50_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
+sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p1000_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
 # n50p50_snr2.2_sparse0_rep1
 ```
 
@@ -448,8 +449,8 @@ pyro.clear_param_store()
 
 
 MINIBATCH_SIZE = 32
-NUM_EPOCHS = 500
-initial_lr = 0.01
+NUM_EPOCHS = 1000
+initial_lr = 0.005 
 
 gamma = 0.1  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
@@ -471,7 +472,8 @@ svi, opt = do_inference(
     # opt = "ClippedAdam",
     # opt_args = {"lr": initial_lr, "lrd": lrd},
     tol = 0.5, # tolerance is epoch loss per datum
-    min_epochs = 100,
+    variational_tol = 0.001,
+    min_epochs = 10,
     epochs = NUM_EPOCHS,
     minibatch_flag = True,
     minibatch_size = MINIBATCH_SIZE
@@ -488,6 +490,24 @@ print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epoc
 ```
 
 
+```{python}
+params1 = pyro.get_param_store()
+params2 = pyro.get_param_store()
+# pa
+param_diff_norm_dict = {k: torch.norm(params1[k] - params2[k]).item() for k in pyro.get_param_store()}
+```
+
+```{python}
+
+```
+
+```{python}
+all(n < 0.01 for n in param_diff_norm_dict.values())
+```
+
+```{python}
+params1['AutoNormal.locs.Lambda_l1']
+```
 ### FactorModelARD
 ```{python}
 # X_clean.shape
@@ -563,6 +583,16 @@ p = sns.relplot(
 )
 p.set_axis_labels("Epochs", "Negative ELBO")
 p.fig.suptitle("Minibatch loss per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+p = sns.relplot(
+    data = factor_model.var_param_convergence_history,
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Norm difference")
+p.fig.suptitle("Variational parameter convergence per epoch")
 # factor_model.loss_history
 ```
 
@@ -867,7 +897,7 @@ post_sample_y = post_samples.get('y').mean(dim = 0)
 post_sample_y
 ```
 ```{python}
-post_sample_y = post_samples.get('y').mean(dim = 0)
+post_sample_y = post_samples_outcome.get('y').mean(dim = 0)
 torch.nn.functional.mse_loss(post_sample_y, y_clean.squeeze())
 ```
 
@@ -901,14 +931,17 @@ sns.regplot(x = sim_y.tolist(), y = y_clean.T.tolist()[0], scatter = False, ax =
 
 
 ```{python}
+y_clean.squeeze().tolist()
+```
+```{python}
 # USING POSTERIOR SAMPLES
 # p = sns.scatterplot(x = sim_y.tolist(), y = y_clean.T.tolist()[0])
-p = sns.scatterplot(x = post_sample_y.tolist(), y = y_clean.T.tolist()[0])
+p = sns.scatterplot(x = post_sample_y.tolist(), y = y_clean.squeeze().tolist())
 p.set(xlabel = "Predicted y", ylabel = "Simulated y")
 p.set_title("Predicted vs. actual outcome")
 # plt.plot([-3, -3], [3, 3])
 p.axline((0, 0), slope = 1, color = "black", ls = "--")
-sns.regplot(x = post_sample_y.tolist(), y = y_clean.T.tolist()[0], scatter = False, ax = p)
+sns.regplot(x = post_sample_y.tolist(), y = y_clean.squeeze().tolist(), scatter = False, ax = p)
 
 ```
 
@@ -1047,23 +1080,43 @@ guide = pyro.infer.autoguide.AutoNormal(
     create_plates = subsample_create_plates)
 ```
 
-Posterior samples for all latent avriables
+Posterior samples for all latent variables
+
+```{python}
+# predictive = pyro.infer.Predictive(factor_model, guide = guide, num_samples = 1000)
+# # predictive = pyro.infer.Predictive(guide, num_samples = 1000)
+
+# post_samples = predictive(
+#     X_l_list_clean,
+#     torch.arange(n)
+#     )
+# post_samples_with_y = predictive(
+#     X_l_list_clean,
+#     torch.arange(n),
+#     y.squeeze()
+#     )
+```
+
+```{python}
+X_l_list_clean
+```
 
 Predictions of y
-```{python}
-predictive = pyro.infer.Predictive(factor_model, guide = guide, num_samples = 1000)
-# predictive = pyro.infer.Predictive(guide, num_samples = 1000)
 
-post_samples = predictive(
+```{python}
+predictive_outcome = pyro.infer.Predictive(factor_model, guide = guide, num_samples = 1000,
+    return_sites=["y"])
+    
+post_samples_outcome = predictive(
     X_l_list_clean,
     torch.arange(n)
     )
-post_samples_with_y = predictive(
-    X_l_list_clean,
-    torch.arange(n),
-    y.squeeze()
-    )
 ```
+
+```{python}
+post_samples_outcome.get('y')
+```
+
 
 ```{python}
 post_samples.keys()
@@ -1077,14 +1130,53 @@ post_samples_with_y.keys()
 
 
 ```{python}
-post_samples_with_y.get("y")
+post_samples_outcome.get("y").shape
 ```
 
 ```{python}
-torch.mean(post_samples.get("joint_structure_l0"), dim = 0) - \
-    torch.mean(post_samples_with_y.get("joint_structure_l0"), dim = 0)
+torch.norm(torch.mean(post_samples.get("joint_structure_l0"), dim = 0) - \
+    torch.mean(post_samples_with_y.get("joint_structure_l0"), dim = 0))
 ```
 
+```{python}
+torch.norm(torch.mean(post_samples.get("joint_structure_l0"), dim = 0) - \
+    EST_Struct_shared_l_list_rescaled[0])
+```
+
+```{python}
+EST_Struct_shared_l_list_rescaled[0]
+```
+
+```{python}
+# EST_decomp = 
+PRED_Struct_shared_l_list = [torch.mean(post_samples.get(f"joint_structure_l{l}"), dim = 0) \
+    for l in range(L)]
+
+# EST_Struct_shared_l_list = list(map(calc_struct, \
+#     [EST_decomp.get("EST_Z")] * L, EST_decomp.get("EST_Lambda_l_list")))
+# EST_Struct_view_l_list = list(map(calc_struct, \
+#     EST_decomp.get("EST_Phi_l_list"), EST_decomp.get("EST_Gamma_l_list")))
+```
+
+```{python}
+PRED_Struct_shared_l_list
+```
+
+```{python}
+EST_Struct_shared_l_list
+```
+
+```{python}
+eval_rse(PRED_Struct_shared_l_list[0], SIM_Struct_shared_l_list_rescaled[0])
+```
+```{python}
+EST_Struct_shared_l_list
+SIM_Struct_shared_l_list_rescaled
+```
+
+```{python}
+y_post_pred = torch.mean(post_samples_outcome.get("y"), dim = 0)
+```
 
 Compare posterior sample mean/median with variational location params in the param store.
 
@@ -1135,6 +1227,34 @@ individual_coverage = eval_credible_interval(
 individual_coverage
 ```
 
+
+```{python}
+post_outcome_summary = summarise_post_samples(post_samples_outcome.get("y"))
+```
+
+```{python}
+y_clean.squeeze()
+# post_outcome_summary.get('q2.5')
+```
+
+```{python}
+eval_post_coverage(y_clean.squeeze(),
+    post_outcome_summary.get('q2.5'),
+    post_outcome_summary.get('q97.5'))
+```
+
+```{python}
+torch.sum(torch.logical_and(
+            torch.less_equal(post_outcome_summary.get('q2.5'), y_clean),
+            torch.greater_equal(post_outcome_summary.get('q97.5'), y_clean)
+        )) #/ torch.numel(sim_struct)
+```
+
+```{python}
+# torch.numel(y_clean)
+post_outcome_summary.get('q97.5')
+```
+
 ```{python}
 pd.DataFrame({
             "joint.rse": shared_rse,
@@ -1146,14 +1266,33 @@ pd.DataFrame({
 ```
 
 ```{python}
+outcome_mse = eval_mse(post_sample_y, y_clean.squeeze()).item()
+outcome_coverage = eval_post_coverage(y_clean.squeeze(),
+    post_outcome_summary.get('q2.5'),
+    post_outcome_summary.get('q97.5')).item()
+```
+```{python}
+pd.DataFrame({
+            "joint.rse": shared_rse,
+            "individual.rse": view_rse,
+            "joint.95p_coverage": joint_coverage,
+            "individual.95p_coverage": individual_coverage,
+            "outcome.rse": outcome_mse,
+            "outcome.95pcoverage": outcome_coverage
+            }
+            ).rename_axis('view').reset_index()
+```
+```{python}
 pd.wide_to_long(pd.DataFrame({
             "joint.rse": shared_rse,
             "individual.rse": view_rse,
             "joint.95p_coverage": joint_coverage,
-            "individual.95p_coverage": individual_coverage
+            "individual.95p_coverage": individual_coverage,
+            "outcome.mse": outcome_mse,
+            "outcome.95p_coverage": outcome_coverage
             }
             ).rename_axis('view').reset_index(),
-            stubnames = ['joint', 'individual'],
+            stubnames = ['joint', 'individual', 'outcome'],
             i = 'view',
             j = 'metric',
             sep = '.',
@@ -1164,6 +1303,7 @@ pd.wide_to_long(pd.DataFrame({
                 snr_y = 2,
                 runtime = 0
                 )
+                
 ```
 
 ```{python}
