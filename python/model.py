@@ -26,10 +26,16 @@ class SupMultiviewDecomp(PyroModule):
                  k_l_list,
                  n,
                  include_view_factors = False,
-                 a_sigma_joint=2.0, # Hyperparams: ARD prior per factor: IG same for all views
-                 b_sigma_joint=2.0,
-                 a_sigma_view=2.0, # Hyperparams: ARD prior per factor: IG same for all views
-                 b_sigma_view=2.0,
+                #  a_sigma_joint=2.0, # Hyperparams: gamma process prior per factor loadings
+                #  b_sigma_joint=2.0,
+                #  a_sigma_view=2.0, # Hyperparams: gamma process prior per factor loadings
+                #  b_sigma_view=2.0,
+                 a1_sigma_joint=2.1, # Hyperparams: gamma process prior per factor loadings
+                 a2_sigma_joint=3.1,
+                 a1_sigma_view=2.1, # Hyperparams: gamma process prior per factor loadings
+                 a2_sigma_view=3.1,
+                 alpha_joint = 3.0,
+                 alpha_individual = 3.0,
                  a_psi=2.0, # Hyperparams: per-view error: IG same for all views
                  b_psi=2.0,
                  a_sigma_y = 2.0, # Hyperparams: outcome error: IG
@@ -45,10 +51,16 @@ class SupMultiviewDecomp(PyroModule):
         self.p_l = None
         
         # Hyperparams
-        self.a_sigma_joint = a_sigma_joint
-        self.b_sigma_joint = b_sigma_joint
-        self.a_sigma_view = a_sigma_view
-        self.b_sigma_view = b_sigma_view
+        # self.a_sigma_joint = a_sigma_joint
+        # self.b_sigma_joint = b_sigma_joint
+        # self.a_sigma_view = a_sigma_view
+        # self.b_sigma_view = b_sigma_view
+        self.a1_sigma_joint = a1_sigma_joint
+        self.a2_sigma_joint = a2_sigma_joint
+        self.a1_sigma_view = a1_sigma_view
+        self.a2_sigma_view = a2_sigma_view
+        self.alpha_joint = 3.0
+        self.alpha_individual = 3.0
         self.a_psi = a_psi
         self.b_psi = b_psi
         self.a_sigma_y = a_sigma_y
@@ -65,8 +77,147 @@ class SupMultiviewDecomp(PyroModule):
         self.loss_history = []
         self.var_param_convergence_history = []
         
-    
     def forward(self, 
+                X_list, 
+                batch_idx,
+                y = None):
+        """
+        X_l = Z @ Lambda_l^T + Phi_l @ Gamma_l^T + E,   l = 1, ... , L
+        y = Z @ beta + e
+        With shrinkage of factor loadings
+        """
+        m = len(batch_idx)
+        p_l_list = [X_l.shape[1] for X_l in X_list]
+        
+        ########################
+        # ---- Loadings --------
+        # Loadings Lambda: sample rows across features (p, k)
+        # ARD prior
+        # Lambda_j ~ N_k(0, sigma_k^2 I)
+        #   ==> Lambda^l_jk ~ N(0, (rho^l_{jk})^-1 * (tau^l_k)^-12)
+        # sigma^l_k^2 ~ InvGamma(a_sigma, b_sigma))
+        #
+        # Gamma^l_jk ~ N(0, sigma_gamma^l_k^2)
+        ########################
+        # VIEW SPECIFIC
+        Gamma_l_list = []
+        for l, (p_l, k_l) in enumerate(zip(p_l_list, self.k_l_list)):
+            sigma2_gamma_l = pyro.sample(f"sigma2_gamma_l{l}", 
+                                   dist.InverseGamma(self.a_sigma_view, self.b_sigma_view).expand([k_l]).to_event(1))
+            sigma_gamma_l = torch.sqrt(sigma2_gamma_l)
+        
+            # sigma is broadcast across rows of Lambda
+            Gamma_l = pyro.sample(f"Gamma_l{l}", dist.Normal(torch.zeros(p_l, k_l), sigma_gamma_l).to_event(2))
+            
+            Gamma_l_list.append(Gamma_l)
+        
+        # SHARED
+        # tau - global shrinkage
+        delta_joint = []
+        for k in range(self.k):
+            shape = self.a1_sigma_joint if k == 0 else self.a2_sigma_joint
+            delta_k = pyro.sample(f"delta_joint_k{k}", dist.Gamma(shape, 1.0))
+            delta_joint.append(delta_k)
+        tau_k_joint_list = torch.cumprod(torch.stack(delta_joint), dim = 0)
+        
+        Lambda_l_list = []
+        for l, p_l in enumerate(p_l_list):
+            # rho - local shrinkage
+            rho_joint = pyro.sample(f'rho_joint_l{l}', 
+                                dist.Gamma(self.alpha_joint / 2, self.alpha_joint / 2).expand([p_l, self.k]))
+            
+            sigma_lambda_l = (rho_joint * tau_k_joint_list).pow_(-0.5)
+            
+            # sigma2_lambda_l = pyro.sample(f"sigma2_lambda_l{l}", 
+            #                        dist.InverseGamma(self.a_sigma_joint, self.b_sigma_joint).expand([self.k]).to_event(1))
+            # sigma_lambda_l = torch.sqrt(sigma2_lambda_l)
+        
+            # sigma is broadcast across rows of Lambda
+            Lambda_l = pyro.sample(f"Lambda_l{l}", dist.Normal(torch.zeros(p_l, self.k), sigma_lambda_l).to_event(2))
+            
+            Lambda_l_list.append(Lambda_l)
+        
+        
+        ########################
+        # ---- Observations --------
+        # Working with minibatches of data (subsamples of rows of X)
+        # The plate statement defines conditional independence over each observation
+        # We assume the full dataset cannot fit in memory, so a data loader is used OUTSIDE this
+        #   function to perform minibatching. 
+        #
+        # Outcome y can be dependent on just shared factors, or all factors
+        ########################
+        
+        # Idiosyncratic error variance 
+        psi_sqrt_l_list = []           
+        for l, p_l in enumerate(p_l_list):
+            psi_l = pyro.sample(f"psi_l{l}", dist.InverseGamma(self.a_psi, self.b_psi).expand([p_l]).to_event(1))
+            psi_sqrt = torch.sqrt(psi_l)
+            psi_sqrt_l_list.append(psi_sqrt)
+            
+        
+        # Outcome model coefficients
+        sigma2_beta = pyro.sample("sigma2_beta",
+                                  dist.InverseGamma(self.a_sigma_beta, self.b_sigma_beta).expand([self.num_outcome_factors]).to_event(1))
+        beta = pyro.sample("beta",
+                           dist.Normal(torch.zeros(self.num_outcome_factors), sigma2_beta).to_event(1)).\
+                               squeeze(0)
+        
+        # Outcome variances
+        sigma2_y = pyro.sample("sigma2_y",
+                            dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
+        sigma_y = torch.sqrt(sigma2_y)
+        
+        # Local latent variables and observations
+        with pyro.plate("obs", self.n, subsample = batch_idx):
+            Z = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
+            
+            Phi_l_list = []
+            for l, k_l in enumerate(self.k_l_list):
+                Phi_l = pyro.sample(f"Phi_l{l}", dist.Normal(0., 1.).expand([k_l]).to_event(1))
+                Phi_l_list.append(Phi_l)
+                
+            
+            # Compute structures
+            joint_structure_list = []
+            for l in range(len(X_list)):
+                joint_structure_l = pyro.deterministic(f"joint_structure_l{l}", 
+                                                       torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
+                view_structure_l = pyro.deterministic(f"view_structure_l{l}",
+                                                    torch.matmul(Phi_l_list[l], Gamma_l_list[l].squeeze(0).T))
+                
+                total_structure_l = torch.add(joint_structure_l, view_structure_l)
+                
+                joint_structure_list.append(joint_structure_l)
+                
+                pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
+                                                   psi_sqrt_l_list[l]).to_event(1), 
+                            obs = X_list[l])
+            
+                # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
+                #                                    psi_sqrt_l_list[l]).to_event(1), 
+                #             obs = X_list[l].index_select(0, batch_idx))
+            
+            
+            # Outcome model
+            if self.include_view_factors:
+                full_factors = torch.cat((Z, *Phi_l_list), 1)
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(full_factors, beta))
+                pyro.sample("y", dist.Normal(outcome_structure, 
+                                            sigma_y), #.to_event(1),
+                            obs = y)
+            else:
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(Z, beta))
+                pyro.sample("y", dist.Normal(outcome_structure, 
+                                            sigma_y), #.to_event(1),
+                            obs = y)
+            # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx), 
+            #                              sigma_y),
+            #             obs = y.index_select(0, batch_idx))
+    
+    def _old_forward(self, 
                 X_list, 
                 batch_idx,
                 y = None):
