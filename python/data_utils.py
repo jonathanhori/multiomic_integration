@@ -162,13 +162,13 @@ def summarise_post_samples(sample_tensor):
     """
     summary = {
         "mean": torch.mean(sample_tensor, dim = 0),
-        "std": torch.std(sample_tensor, dim = 0),
+        # "std": torch.std(sample_tensor, dim = 0),
         "q2.5": torch.quantile(sample_tensor, 0.025, dim = 0),
-        "q5": torch.quantile(sample_tensor, 0.05, dim = 0),
-        "q25": torch.quantile(sample_tensor, 0.25, dim = 0),
+        # "q5": torch.quantile(sample_tensor, 0.05, dim = 0),
+        # "q25": torch.quantile(sample_tensor, 0.25, dim = 0),
         "q50": torch.quantile(sample_tensor, 0.50, dim = 0),
-        "q75": torch.quantile(sample_tensor, 0.75, dim = 0),
-        "q95": torch.quantile(sample_tensor, 0.95, dim = 0),
+        # "q75": torch.quantile(sample_tensor, 0.75, dim = 0),
+        # "q95": torch.quantile(sample_tensor, 0.95, dim = 0),
         "q97.5": torch.quantile(sample_tensor, 0.975, dim = 0)
     }
     return summary

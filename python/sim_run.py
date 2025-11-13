@@ -44,12 +44,12 @@ dirs = [os.path.join(sim_data_path, dir) \
 filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in dirs}
 
 
-n_array = (50, 100, 500, 1000)
+n_array = (50, 100, 500) #, 1000)
 p_array = (50, 100, 1000)
-snr_x_array = (2, 1, 0.5)
-snr_y_array = (2, 1, 0.5)
+snr_x_array = [2] #(2, 1, 0.5)
+snr_y_array = [2] #(2, 1, 0.5)
 reps = 10
-loading_sparsity = 0
+loading_sparsity = 0.25
 
 sim_grid = itertools.product(
     n_array,
@@ -61,7 +61,8 @@ sim_grid = itertools.product(
 )
 
 N_POSTERIOR_SAMPLES = 1000
-
+TOL = 1
+VARIATIONAL_TOL = 0.3
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 1000
 initial_lr = 0.005
@@ -72,10 +73,10 @@ lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
 file_dir_base = "n{}p{}_snr{}.{}_sparse{}" #/sim_data_ywithview_rep{}.rds"
 file_name_base = "sim_data_ywithview_rep{}"
 
-model_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/models")
+model_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/sparse0.25/models")
 model_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_rep{}"
 
-metric_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/metrics")
+metric_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/sparse0.25/metrics")
 metric_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_rep{}"
 
 # Create output paths if don't exist
@@ -168,8 +169,6 @@ if __name__ == "__main__":
             # OPT = Adam({"lr": initial_lr})
             OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
             LOSS = Trace_ELBO(num_particles = 1)
-            TOL = 1
-            VARIATIONAL_TOL = 0.001
             # if n == 50: 
             #     TOL = 0.001
             # elif n == 100:
@@ -243,7 +242,7 @@ if __name__ == "__main__":
             #################
             # Sample from posterior
             print('Sampling from posterior')
-            sites = [f'joint_structure_l{l}' for l in range(L)] + ['view_structure_l{l}' for l in range(L)]
+            sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
             predictive = Predictive(factor_model, 
                                     guide = guide, 
                                     num_samples = N_POSTERIOR_SAMPLES,
@@ -318,6 +317,8 @@ if __name__ == "__main__":
                     p = p_l,
                     snr_x = snr_x,
                     snr_y = snr_y,
+                    rep = rep,
+                    sparsity = loading_sparsity,
                     runtime = run_minibatch
                     )
 

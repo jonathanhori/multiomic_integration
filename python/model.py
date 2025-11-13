@@ -26,10 +26,10 @@ class SupMultiviewDecomp(PyroModule):
                  k_l_list,
                  n,
                  include_view_factors = False,
-                #  a_sigma_joint=2.0, # Hyperparams: gamma process prior per factor loadings
-                #  b_sigma_joint=2.0,
-                #  a_sigma_view=2.0, # Hyperparams: gamma process prior per factor loadings
-                #  b_sigma_view=2.0,
+                 a_sigma_joint=2.0, # Hyperparams: gamma process prior per factor loadings
+                 b_sigma_joint=2.0,
+                 a_sigma_view=2.0, # Hyperparams: gamma process prior per factor loadings
+                 b_sigma_view=2.0,
                  a1_sigma_joint=2.1, # Hyperparams: gamma process prior per factor loadings
                  a2_sigma_joint=3.1,
                  a1_sigma_view=2.1, # Hyperparams: gamma process prior per factor loadings
@@ -41,7 +41,8 @@ class SupMultiviewDecomp(PyroModule):
                  a_sigma_y = 2.0, # Hyperparams: outcome error: IG
                  b_sigma_y = 2.0,
                  a_sigma_beta = 2.0, # Hyperparams: outcome coefficients: IG
-                 b_sigma_beta = 2.0
+                 b_sigma_beta = 2.0,
+                 dense = True
                  ):
         super().__init__()
         # Model parameters
@@ -50,17 +51,22 @@ class SupMultiviewDecomp(PyroModule):
         self.k_l_list = k_l_list # assumes k_l > 0 for all l
         self.p_l = None
         
+        self.dense = dense
+        
         # Hyperparams
-        # self.a_sigma_joint = a_sigma_joint
-        # self.b_sigma_joint = b_sigma_joint
-        # self.a_sigma_view = a_sigma_view
-        # self.b_sigma_view = b_sigma_view
-        self.a1_sigma_joint = a1_sigma_joint
-        self.a2_sigma_joint = a2_sigma_joint
-        self.a1_sigma_view = a1_sigma_view
-        self.a2_sigma_view = a2_sigma_view
-        self.alpha_joint = 3.0
-        self.alpha_individual = 3.0
+        if dense:
+            self.a_sigma_joint = a_sigma_joint
+            self.b_sigma_joint = b_sigma_joint
+            self.a_sigma_view = a_sigma_view
+            self.b_sigma_view = b_sigma_view
+        if not dense:
+            self.a1_sigma_joint = a1_sigma_joint
+            self.a2_sigma_joint = a2_sigma_joint
+            self.a1_sigma_view = a1_sigma_view
+            self.a2_sigma_view = a2_sigma_view
+            self.alpha_joint = alpha_joint
+            self.alpha_individual = alpha_individual
+        
         self.a_psi = a_psi
         self.b_psi = b_psi
         self.a_sigma_y = a_sigma_y
@@ -78,6 +84,23 @@ class SupMultiviewDecomp(PyroModule):
         self.var_param_convergence_history = []
         
     def forward(self, 
+                X_list, 
+                batch_idx,
+                y = None):
+        """
+        Should we run model with sparsity prior or not?
+        """
+        if self.dense:
+            return self.forward_dense(X_list, 
+                batch_idx,
+                y)
+        else:
+            return self.forward_mgp(X_list, 
+                batch_idx,
+                y)
+        
+        
+    def forward_mgp(self, 
                 X_list, 
                 batch_idx,
                 y = None):
@@ -102,37 +125,43 @@ class SupMultiviewDecomp(PyroModule):
         # VIEW SPECIFIC
         Gamma_l_list = []
         for l, (p_l, k_l) in enumerate(zip(p_l_list, self.k_l_list)):
-            sigma2_gamma_l = pyro.sample(f"sigma2_gamma_l{l}", 
-                                   dist.InverseGamma(self.a_sigma_view, self.b_sigma_view).expand([k_l]).to_event(1))
-            sigma_gamma_l = torch.sqrt(sigma2_gamma_l)
-        
-            # sigma is broadcast across rows of Lambda
+            # tau - global shrinkage
+            delta_gamma = []
+            for m in range(k_l):
+                shape = self.a1_sigma_view if m == 0 else self.a2_sigma_view
+                delta_l_m = pyro.sample(f"delta_gamma_l{l}_k{m}", dist.Gamma(shape, 1.0))
+                delta_gamma.append(delta_l_m)
+            tau_gamma_k_list = torch.cumprod(torch.stack(delta_gamma), dim = 0).squeeze()
+                
+            # rho - local shrinkage
+            rho_gamma = pyro.sample(f"rho_gamma_l{l}",
+                                    dist.Gamma(self.alpha_individual / 2, self.alpha_individual / 2).expand([p_l, k_l]).to_event(2)).squeeze()
+            
+            # print('tau shape', tau_gamma_k_list.shape)
+            # print('rho shape', rho_gamma.shape)
+            sigma_gamma_l = (rho_gamma * tau_gamma_k_list).pow_(-0.5)
             Gamma_l = pyro.sample(f"Gamma_l{l}", dist.Normal(torch.zeros(p_l, k_l), sigma_gamma_l).to_event(2))
             
             Gamma_l_list.append(Gamma_l)
         
-        # SHARED
-        # tau - global shrinkage
-        delta_joint = []
-        for k in range(self.k):
-            shape = self.a1_sigma_joint if k == 0 else self.a2_sigma_joint
-            delta_k = pyro.sample(f"delta_joint_k{k}", dist.Gamma(shape, 1.0))
-            delta_joint.append(delta_k)
-        tau_k_joint_list = torch.cumprod(torch.stack(delta_joint), dim = 0)
-        
+        # SHARED        
         Lambda_l_list = []
         for l, p_l in enumerate(p_l_list):
-            # rho - local shrinkage
-            rho_joint = pyro.sample(f'rho_joint_l{l}', 
-                                dist.Gamma(self.alpha_joint / 2, self.alpha_joint / 2).expand([p_l, self.k]))
-            
-            sigma_lambda_l = (rho_joint * tau_k_joint_list).pow_(-0.5)
-            
-            # sigma2_lambda_l = pyro.sample(f"sigma2_lambda_l{l}", 
-            #                        dist.InverseGamma(self.a_sigma_joint, self.b_sigma_joint).expand([self.k]).to_event(1))
-            # sigma_lambda_l = torch.sqrt(sigma2_lambda_l)
+            # tau - global shrinkage
+            delta_lambda = []
+            for m in range(self.k):
+                shape = self.a1_sigma_joint if m == 0 else self.a2_sigma_joint
+                delta_l_m = pyro.sample(f"delta_lambda_l{l}_k{m}", dist.Gamma(shape, 1.0))
+                delta_lambda.append(delta_l_m)
+            tau_lambda_k_list = torch.cumprod(torch.stack(delta_lambda), dim = 0).squeeze()
         
-            # sigma is broadcast across rows of Lambda
+            # rho - local shrinkage
+            rho_lambda = pyro.sample(f'rho_lambda_l{l}', 
+                                dist.Gamma(self.alpha_joint / 2, self.alpha_joint / 2).expand([p_l, self.k]).to_event(2)).squeeze()
+            
+            # print('tau shape', tau_lambda_k_list.shape)
+            # print('rho shape', rho_lambda.shape)
+            sigma_lambda_l = (rho_lambda * tau_lambda_k_list).pow_(-0.5)        
             Lambda_l = pyro.sample(f"Lambda_l{l}", dist.Normal(torch.zeros(p_l, self.k), sigma_lambda_l).to_event(2))
             
             Lambda_l_list.append(Lambda_l)
@@ -217,7 +246,7 @@ class SupMultiviewDecomp(PyroModule):
             #                              sigma_y),
             #             obs = y.index_select(0, batch_idx))
     
-    def _old_forward(self, 
+    def forward_dense(self, 
                 X_list, 
                 batch_idx,
                 y = None):
@@ -473,9 +502,6 @@ def do_inference(X_list,
                 loss = svi.step(batch, batch_idx, y_batch)
                 # print(loss)
                 epoch_loss += loss
-            if verbose:
-                print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
-                print(f"Loss at epoch {epoch+1}: {loss / model.n}")
             
             model.loss_history.append(epoch_loss)
             
@@ -494,6 +520,11 @@ def do_inference(X_list,
             model.var_param_convergence_history.append(max(param_diff_norm_dict.values()))
             # print(params_epoch_curr.items())
             params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())
+            
+            if verbose:
+                print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
+                print(f"Loss at epoch {epoch+1}: {loss / model.n}")
+                print(f"Max variational parameter difference: {model.var_param_convergence_history[-1]}")
             
             # Converged?
             if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch)\
