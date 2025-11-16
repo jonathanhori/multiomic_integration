@@ -220,14 +220,14 @@ reps = 10
 
 n_array <- c(50, 100, 500, 1000) #, 5000)
 p_array <- c(50, 100, 1000) #, 10000)
-snr_x_array <- c(2, 1, 0.5)
-snr_y_array <- c(2, 1, 0.5)
+snr_x_array <- c(2) #c(2, 1, 0.5)
+snr_y_array <- c(2) #c(2, 1, 0.5)
 # snr_x_array <- c(0.5)
 # snr_y_array <- c(0.5)
 L = 3
 K = 5
 K_l = 5
-loading_sparsity = 0
+loading_sparsity = .25 # 25% of entries are 0
 getwd()
 
 sim_grid <- expand.grid(n = n_array,

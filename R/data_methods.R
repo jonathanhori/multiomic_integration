@@ -54,32 +54,91 @@ standardize_outcome <- function(data, training_data = NA) {
 # mean(y)
 # 
 # scale(y)
-
-calc_jafar_posterior_means <- function(mcmc_supervised) {
-  jafar_loadings.shared <- lapply(mcmc_supervised$Lambda_m,
+# calc_jafar_posterior_means
+summarise_post_samples <- function(mcmc_supervised) {
+  
+  ######
+  # Posterior means
+  jafar_loadings.shared_mean <- lapply(mcmc_supervised$Lambda_m,
                                   function(mat) {
                                     apply(mat, c(2, 3), mean)
                                   })
   
-  jafar_loadings.view_specific <- lapply(mcmc_supervised$Gamma_m,
+  jafar_loadings.view_specific_mean <- lapply(mcmc_supervised$Gamma_m,
                                          function(mat) {
                                            apply(mat, c(2, 3), mean)
                                          })
   
   
-  jafar_scores.shared <- apply(mcmc_supervised$eta, c(2, 3), mean)
+  jafar_scores.shared_mean <- apply(mcmc_supervised$eta, c(2, 3), mean)
   
-  jafar_scores.view_specific <- lapply(mcmc_supervised$phi_m,
+  jafar_scores.view_specific_mean <- lapply(mcmc_supervised$phi_m,
                                        function(mat) {
                                          apply(mat, c(2, 3), mean)
                                        })
   
+  
+  ######
+  # Percentile: 2.5%
+  jafar_loadings.shared_lower <- lapply(mcmc_supervised$Lambda_m,
+                                       function(mat) {
+                                         apply(mat, c(2, 3), quantile, probs = 0.025)
+                                       })
+  
+  jafar_loadings.view_specific_lower <- lapply(mcmc_supervised$Gamma_m,
+                                              function(mat) {
+                                                apply(mat, c(2, 3), quantile, probs = 0.025)
+                                              })
+  
+  
+  jafar_scores.shared_lower <- apply(mcmc_supervised$eta, c(2, 3), quantile, probs = 0.025)
+  
+  jafar_scores.view_specific_lower <- lapply(mcmc_supervised$phi_m,
+                                            function(mat) {
+                                              apply(mat, c(2, 3), quantile, probs = 0.025)
+                                            })
+  
+  ######
+  # Percentile: 97.5%
+  jafar_loadings.shared_upper <- lapply(mcmc_supervised$Lambda_m,
+                                       function(mat) {
+                                         apply(mat, c(2, 3), quantile, probs = 0.975)
+                                       })
+  
+  jafar_loadings.view_specific_upper <- lapply(mcmc_supervised$Gamma_m,
+                                              function(mat) {
+                                                apply(mat, c(2, 3), quantile, probs = 0.975)
+                                              })
+  
+  
+  jafar_scores.shared_upper <- apply(mcmc_supervised$eta, c(2, 3), quantile, probs = 0.975)
+  
+  jafar_scores.view_specific_upper <- lapply(mcmc_supervised$phi_m,
+                                            function(mat) {
+                                              apply(mat, c(2, 3), quantile, probs = 0.975)
+                                            })
+  
   return(list(
-    shared_scores = jafar_scores.shared,
-    view_scores = jafar_scores.view_specific,
-    shared_loadings = jafar_loadings.shared,
-    view_loadings = jafar_loadings.view_specific
-  ))
+    mean = list(
+      shared_scores = jafar_scores.shared_mean,
+      view_scores = jafar_scores.view_specific_mean,
+      shared_loadings = jafar_loadings.shared_mean,
+      view_loadings = jafar_loadings.view_specific_mean
+    ),
+    q2.5 = list(
+      shared_scores = jafar_scores.shared_lower,
+      view_scores = jafar_scores.view_specific_lower,
+      shared_loadings = jafar_loadings.shared_lower,
+      view_loadings = jafar_loadings.view_specific_lower
+    ),
+    q97.5 = list(
+      shared_scores = jafar_scores.shared_upper,
+      view_scores = jafar_scores.view_specific_upper,
+      shared_loadings = jafar_loadings.shared_upper,
+      view_loadings = jafar_loadings.view_specific_upper
+    )
+  )
+  )
 }
 
 
@@ -234,4 +293,11 @@ eval_model <- function(est_obj,
   }
   
   return(results)
+}
+
+
+eval_post_coverage <- function(data, 
+                               lower, 
+                               upper) {
+  mean(data > lower & data < upper)
 }
