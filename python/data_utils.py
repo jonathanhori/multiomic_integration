@@ -9,6 +9,8 @@ from rpy2.robjects import vectors
 
 from pathlib import Path
 
+import pandas as pd
+
 ######## 
 # Utilities for converting data from R
 def floatmatrix_to_torch(m):
@@ -143,6 +145,52 @@ def scale_est_struct(struct_list, mean_list, sd_list):
 def scale_sim_struct(struct_list, mean_list, sd_list):
     return [(struct - mean) / sd for struct, mean, sd in zip(struct_list, mean_list, sd_list)]
     # return [struct_list[i] * sd_list[i] + mean_list[i] for i in range(len(struct_list))]
+    
+    
+def calc_all_structures_with_rescaling(L,
+                                        X_l_mean_list,
+                                        X_l_sd_list,
+                                        post_pred_structure_samples,
+                                        post_pred_outcome_samples,
+                                        sim_decomp,
+                                        sim_outcome):
+
+    SIM_joint_struct_l_list = list(map(calc_struct, \
+        [sim_decomp.get("SIM_Z")] * L, sim_decomp.get("SIM_Lambda_l_list")))
+    SIM_individual_struct_l_list = list(map(calc_struct, \
+        sim_decomp.get("SIM_Phi_l_list"), sim_decomp.get("SIM_Gamma_l_list")))
+
+    # EST_Struct_shared_l_list_rescaled = scale_est_struct(EST_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
+    SIM_joint_struct_l_list_rescaled = scale_sim_struct(SIM_joint_struct_l_list, X_l_mean_list, X_l_sd_list)
+
+    # EST_Struct_view_l_list_rescaled = scale_est_struct(EST_Struct_view_l_list, X_l_mean_list, X_l_sd_list)
+    SIM_individual_struct_l_list_rescaled = scale_sim_struct(SIM_individual_struct_l_list, X_l_mean_list, X_l_sd_list)
+    
+    
+    
+    # Structures
+    joint_structure_summaries = summarise_structure_list(post_pred_structure_samples, L, "joint")
+    individual_structure_summaries = summarise_structure_list(post_pred_structure_samples, L, "individual")
+    
+    POST_joint_struct_l_list = [summary.get('mean') for summary in joint_structure_summaries]
+    POST_individual_struct_l_list = [summary.get('mean') for summary in individual_structure_summaries]
+    print('Sampling outcomes from posterior')
+    
+    
+    PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples.get("y"))
+    PRED_y = PRED_outcome_summary.get('mean')
+    
+    return {
+        'sim_joint_data_struct': SIM_joint_struct_l_list_rescaled, 
+        'post_pred_joint_data_struct': POST_joint_struct_l_list,
+        'post_pred_joint_summaries': joint_structure_summaries,
+        'sim_individual_data_struct': SIM_individual_struct_l_list_rescaled, 
+        'post_pred_individual_data_struct': POST_individual_struct_l_list,
+        'post_pred_individual_summaries': individual_structure_summaries,
+        'sim_outcome': sim_outcome, 
+        'post_pred_outcome': PRED_y,
+        'post_pred_outcome_summaries': PRED_outcome_summary
+    }
 
 
 ###############
@@ -208,3 +256,56 @@ def eval_credible_interval(sim_structure_list, summary_list, region = '95'):
         upper = 'q75'
     return [eval_post_coverage(sim_struct, post_summary.get(lower), post_summary.get(upper)).item() \
         for sim_struct, post_summary in zip(sim_structure_list, summary_list)]
+
+    
+def eval_performance(sim_joint_data_struct, 
+                     post_pred_joint_data_struct,
+                     post_pred_joint_summaries,
+                     sim_individual_data_struct, 
+                     post_pred_individual_data_struct,
+                     post_pred_individual_summaries,
+                     sim_outcome, 
+                     post_pred_outcome,
+                     post_pred_outcome_summaries):    
+    """
+    Inputs for each structure (joint, individual, outcome) are:
+        - simulated strucures (ground truth)
+        - posterior predicted point estimates (means)
+        - posterior prediction summary statistics (for intervals)
+    """
+    joint_rse = [eval_rse(est, sim).detach().item() for est, sim in \
+        zip(post_pred_joint_data_struct, sim_joint_data_struct)]
+    individual_rse = [eval_rse(est, sim).detach().item() for est, sim in \
+        zip(post_pred_individual_data_struct, sim_individual_data_struct)]
+    
+    joint_coverage = eval_credible_interval(
+        sim_joint_data_struct,
+        post_pred_joint_summaries,
+        '95')
+    individual_coverage = eval_credible_interval(
+        sim_individual_data_struct,
+        post_pred_individual_summaries,
+        '95')
+    
+    outcome_mse = eval_mse(post_pred_outcome, sim_outcome).item()
+    outcome_coverage = eval_post_coverage(
+        sim_outcome,
+        post_pred_outcome_summaries.get('q2.5'),
+        post_pred_outcome_summaries.get('q97.5')
+        ).item()
+
+    eval_metric_table = pd.wide_to_long(pd.DataFrame({
+        "joint.rse": joint_rse,
+        "individual.rse": individual_rse,
+        "joint.95p_coverage": joint_coverage,
+        "individual.95p_coverage": individual_coverage,
+        "outcome.mse": outcome_mse,
+        "outcome.95p_coverage": outcome_coverage
+        }
+        ).rename_axis('view').reset_index(),
+        stubnames = ['joint', 'individual', 'outcome'],
+        i = 'view',
+        j = 'metric',
+        sep = '.',
+        suffix = '.+')
+    return eval_metric_table
