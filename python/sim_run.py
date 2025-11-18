@@ -5,20 +5,20 @@ import rpy2.robjects as robjects
 from rpy2.robjects import r, vectors
 from rpy2 import rinterface
 
-import pandas as pd
-import seaborn as sns
+# import pandas as pd
+# import seaborn as sns
 import itertools
 
-from rpy2.robjects import pandas2ri, default_converter, conversion
+# from rpy2.robjects import pandas2ri, default_converter, conversion
 
 import torch
 import pyro
 from pyro.optim import Adam, ClippedAdam
-from pyro.infer import SVI, Trace_ELBO, Predictive
+from pyro.infer import Trace_ELBO
 
-import importlib
+# import importlib
 
-from torchvision import transforms
+# from torchvision import transforms
 
 from pathlib import Path
 import time
@@ -26,14 +26,12 @@ import time
 sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/python")
 
 from data_utils import load_and_process_rds_data_for_condition, normalize_tensor_by_col, \
-    calc_all_structures_with_rescaling, \
-    extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, \
-        summarise_structure_list, eval_rse, eval_mse, eval_credible_interval, \
-            eval_post_coverage, summarise_post_samples, eval_performance
+    zero_variance_col_filter, obtain_posterior_pred_samples, \
+        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance
 from model import SupMultiviewDecomp, do_inference
 
 
-sim_data_path = "~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/"
+sim_data_path = "~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/"
 
 # Absolute paths to directories containing dataset replicates
 dirs = [os.path.join(sim_data_path, dir) \
@@ -50,7 +48,7 @@ p_array = (50, 100, 1000)
 snr_x_array = [2] #(2, 1, 0.5)
 snr_y_array = [2] #(2, 1, 0.5)
 reps = 10
-loading_sparsity = 0.25
+loading_sparsity = 0.5
 
 sim_grid = itertools.product(
     n_array,
@@ -74,10 +72,10 @@ lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
 file_dir_base = "n{}p{}_snr{}.{}_sparse{}" #/sim_data_ywithview_rep{}.rds"
 file_name_base = "sim_data_ywithview_rep{}"
 
-model_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/sparse0.25/models")
+model_out_path = os.path.expanduser(f"~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/sparse{loading_sparsity}/models")
 model_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_rep{}"
 
-metric_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/sparse0.25/metrics")
+metric_out_path = os.path.expanduser(f"~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/sparse{loading_sparsity}/metrics")
 metric_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_rep{}"
 
 # Create output paths if don't exist
@@ -136,13 +134,11 @@ if __name__ == "__main__":
             n = X_l_list[0].shape[0]
             p_l = int(sim_data.get("p_l")[0])
 
-            # Clean
-            clean_X_dict_list = list(map(normalize_tensor_by_col, X_l_list))
-            # normalize_tensor_by_col(X)
+            # Clean: remove 0 variance columns and standardize            
+            X_l_list_column_filters = [zero_variance_col_filter(X) for X in X_l_list]
+            X_l_list = [X[:, col_filter] for X, col_filter in zip(X_l_list, X_l_list_column_filters)]
 
-            # X_clean = clean_X_dict.get("data_clean")
-            # X_means = clean_X_dict.get("means")
-            # X_stds = clean_X_dict.get("sds")
+            clean_X_dict_list = list(map(normalize_tensor_by_col, X_l_list))
         
             X_l_list_clean = [clean["data_clean"] for clean in clean_X_dict_list]
             X_l_mean_list = [clean["means"] for clean in clean_X_dict_list]
@@ -158,7 +154,8 @@ if __name__ == "__main__":
                 k,
                 k_l_list,
                 n,
-                include_view_factors = True
+                include_view_factors = True,
+                dense = True
             )
 
             def subsample_create_plates(X, batch_idx, y = None):
@@ -170,104 +167,98 @@ if __name__ == "__main__":
             # OPT = Adam({"lr": initial_lr})
             OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
             LOSS = Trace_ELBO(num_particles = 1)
-            
-            t0 = time.time()
-            svi, opt = do_inference(
-                X_l_list_clean,
-                y_clean,
-                model = factor_model,
-                guide = guide,
-                opt = OPT,
-                elbo = LOSS,
-                # tol = TOL, # tolerance is on epoch loss per datum,
-                variational_tol = VARIATIONAL_TOL,
-                epochs = NUM_EPOCHS,
-                minibatch_flag = True,
-                minibatch_size = MINIBATCH_SIZE,
-                verbose = False
-                )
-            t1 = time.time()
-            run_minibatch = t1 - t0
-            
-            #################
-            # Inference finished, save and evaluate
-            # Save model parameters
-
-            print("Exporting:")
-            print(model_out_filename)
-
-            torch.save({
-                "inference_time": run_minibatch,
-                "epochs": factor_model.total_epochs,
-                # "model_param_store": pyro.get_param_store(),
-                "model_state_dict": pyro.get_param_store().get_state(),
-                "optimizer_state": opt.get_state(),
-                "loss_history": factor_model.loss_history,
-                "param_convergence_history": factor_model.var_param_convergence_history                
-            }, model_out_filename + ".pth")
-
-            pyro.get_param_store().save(model_out_filename + "_paramstore.pth") #os.path.join(model_out_path, model_out_filename + "_paramstore.pth"))
-            
-            
-            #################
-            # Sample from posterior
-            print('Sampling from posterior')
-            sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
-            predictive = Predictive(factor_model, 
-                                    guide = guide, 
-                                    num_samples = N_POSTERIOR_SAMPLES,
-                                    return_sites = sites)
-            post_samples = predictive(
-                X_l_list_clean,
-                torch.arange(n)
-                )
-
-            # Sample posterior predictive for outcome - specify return_sites
-            predictive_y = Predictive(factor_model, 
-                                    guide = guide, 
-                                    num_samples = N_POSTERIOR_SAMPLES,
-                                    return_sites = ["y"])
-            # Do not supply y
-            post_samples_y = predictive_y(
-                X_l_list_clean,
-                torch.arange(n)
-                )
-            
-            #################
-            # Calculate simulated and posterior sample structures
-            SIM_decomp = extract_sim_decomp(sim_data)
-           
-            eval_structures = calc_all_structures_with_rescaling(L,
-                                                  X_l_mean_list,
-                                                  X_l_sd_list,
-                                                  post_samples,
-                                                  post_samples_y,
-                                                  SIM_decomp,
-                                                  y_clean.squeeze())
-                
-
-            #################
-            # Evaluate
-            # Compare estimated structures (targeting mean 0 var 1 data) with 
-            #   RESCALED simulated structures
-            
-            eval_metric_table = eval_performance(**eval_structures)
-            eval_metric_table = eval_metric_table.\
-                assign(n = n,
-                    p = p_l,
-                    snr_x = snr_x,
-                    snr_y = snr_y,
-                    rep = rep,
-                    sparsity = loading_sparsity,
-                    runtime = run_minibatch
+            try:
+                t0 = time.time()
+                svi, opt = do_inference(
+                    X_l_list_clean,
+                    y_clean,
+                    model = factor_model,
+                    guide = guide,
+                    opt = OPT,
+                    elbo = LOSS,
+                    # tol = TOL, # tolerance is on epoch loss per datum,
+                    variational_tol = VARIATIONAL_TOL,
+                    epochs = NUM_EPOCHS,
+                    minibatch_flag = True,
+                    minibatch_size = MINIBATCH_SIZE,
+                    verbose = False
                     )
+                t1 = time.time()
+                run_minibatch = t1 - t0
+                
+                #################
+                # Inference finished, save and evaluate
+                # Save model parameters
 
-            # Save evaluation
-            metric_out_filename = os.path.join(
-                metric_out_path, 
-                metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, rep))
-            print("Exporting metrics:")
-            print(metric_out_filename + ".csv")
+                print("Exporting:")
+                print(model_out_filename)
 
-            eval_metric_table.to_csv(metric_out_filename)
-            metric_list.append(eval_metric_table)
+                torch.save({
+                    "inference_time": run_minibatch,
+                    "epochs": factor_model.total_epochs,
+                    # "model_param_store": pyro.get_param_store(),
+                    "model_state_dict": pyro.get_param_store().get_state(),
+                    "optimizer_state": opt.get_state(),
+                    "loss_history": factor_model.loss_history,
+                    "param_convergence_history": factor_model.var_param_convergence_history                
+                }, model_out_filename + ".pth")
+
+                pyro.get_param_store().save(model_out_filename + "_paramstore.pth") #os.path.join(model_out_path, model_out_filename + "_paramstore.pth"))
+                
+                
+                #################
+                # Sample from posterior
+                print('Sampling from posterior')
+                sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
+                outcome_sites = ["y"]
+                post_samples, post_samples_y = obtain_posterior_pred_samples(factor_model,
+                                                                            guide,
+                                                                            N_POSTERIOR_SAMPLES,
+                                                                            X_l_list_clean,
+                                                                            sites,
+                                                                            outcome_sites)
+                    
+                
+                #################
+                # Calculate simulated and posterior sample structures
+                SIM_decomp = extract_sim_decomp(sim_data)
+            
+                eval_structures = calc_all_structures_with_rescaling(L,
+                                                                     X_l_list_column_filters,
+                                                                    X_l_mean_list,
+                                                                    X_l_sd_list,
+                                                                    post_samples,
+                                                                    post_samples_y,
+                                                                    SIM_decomp,
+                                                                    y_clean.squeeze())
+                    
+
+                #################
+                # Evaluate
+                # Compare estimated structures (targeting mean 0 var 1 data) with 
+                #   RESCALED simulated structures
+                
+                eval_metric_table = eval_performance(**eval_structures)
+                eval_metric_table = eval_metric_table.\
+                    assign(n = n,
+                        p = p_l,
+                        snr_x = snr_x,
+                        snr_y = snr_y,
+                        rep = rep,
+                        sparsity = loading_sparsity,
+                        runtime = run_minibatch
+                        )
+
+                # Save evaluation
+                metric_out_filename = os.path.join(
+                    metric_out_path, 
+                    metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, rep))
+                print("Exporting metrics:")
+                print(metric_out_filename)
+
+                eval_metric_table.to_csv(metric_out_filename + ".csv")
+                metric_list.append(eval_metric_table)
+            except Exception as e:
+                print(e)
+                
+                

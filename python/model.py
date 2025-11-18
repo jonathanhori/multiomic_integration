@@ -26,6 +26,8 @@ class SupMultiviewDecomp(PyroModule):
                  k_l_list,
                  n,
                  include_view_factors = False,
+                 dense = True,
+                 outcome = "gaussian",
                  a_sigma_joint=2.0, # Hyperparams: gamma process prior per factor loadings
                  b_sigma_joint=2.0,
                  a_sigma_view=2.0, # Hyperparams: gamma process prior per factor loadings
@@ -41,8 +43,7 @@ class SupMultiviewDecomp(PyroModule):
                  a_sigma_y = 2.0, # Hyperparams: outcome error: IG
                  b_sigma_y = 2.0,
                  a_sigma_beta = 2.0, # Hyperparams: outcome coefficients: IG
-                 b_sigma_beta = 2.0,
-                 dense = True
+                 b_sigma_beta = 2.0
                  ):
         super().__init__()
         # Model parameters
@@ -52,6 +53,7 @@ class SupMultiviewDecomp(PyroModule):
         self.p_l = None
         
         self.dense = dense
+        self.outcome = outcome
         
         # Hyperparams
         if dense:
@@ -139,7 +141,10 @@ class SupMultiviewDecomp(PyroModule):
             
             # print('tau shape', tau_gamma_k_list.shape)
             # print('rho shape', rho_gamma.shape)
-            sigma_gamma_l = (rho_gamma * tau_gamma_k_list).pow_(-0.5)
+            # sigma_gamma_l = (rho_gamma * tau_gamma_k_list).pow_(-0.5)
+            precision = rho_gamma * tau_gamma_k_list
+            precision = torch.clamp(precision, min=1e-10, max=1e10)  # Prevent extreme values
+            sigma_gamma_l = precision.pow_(-0.5)
             Gamma_l = pyro.sample(f"Gamma_l{l}", dist.Normal(torch.zeros(p_l, k_l), sigma_gamma_l).to_event(2))
             
             Gamma_l_list.append(Gamma_l)
@@ -161,7 +166,10 @@ class SupMultiviewDecomp(PyroModule):
             
             # print('tau shape', tau_lambda_k_list.shape)
             # print('rho shape', rho_lambda.shape)
-            sigma_lambda_l = (rho_lambda * tau_lambda_k_list).pow_(-0.5)        
+            # sigma_lambda_l = (rho_lambda * tau_lambda_k_list).pow_(-0.5)   
+            precision = rho_lambda * tau_lambda_k_list
+            precision = torch.clamp(precision, min=1e-10, max=1e10)
+            sigma_lambda_l = precision.pow_(-0.5)     
             Lambda_l = pyro.sample(f"Lambda_l{l}", dist.Normal(torch.zeros(p_l, self.k), sigma_lambda_l).to_event(2))
             
             Lambda_l_list.append(Lambda_l)
@@ -193,9 +201,12 @@ class SupMultiviewDecomp(PyroModule):
                                squeeze(0)
         
         # Outcome variances
-        sigma2_y = pyro.sample("sigma2_y",
-                            dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
-        sigma_y = torch.sqrt(sigma2_y)
+        if self.outcome == "gaussian":
+            sigma2_y = pyro.sample("sigma2_y",
+                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
+            sigma_y = torch.sqrt(sigma2_y)
+        else:
+            raise NotImplementedError
         
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx):
@@ -219,9 +230,13 @@ class SupMultiviewDecomp(PyroModule):
                 
                 joint_structure_list.append(joint_structure_l)
                 
-                pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
+                X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
                                                    psi_sqrt_l_list[l]).to_event(1), 
                             obs = X_list[l])
+                if torch.isnan(X_l).any():
+                    print("NaN values found in X_l_tensor!")
+                if torch.isinf(X_l).any():
+                    print("Inf values found in X_l_tensor!")
             
                 # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
                 #                                    psi_sqrt_l_list[l]).to_event(1), 
@@ -229,22 +244,22 @@ class SupMultiviewDecomp(PyroModule):
             
             
             # Outcome model
-            if self.include_view_factors:
-                full_factors = torch.cat((Z, *Phi_l_list), 1)
-                outcome_structure = pyro.deterministic("outcome_structure",
-                                                    torch.matmul(full_factors, beta))
-                pyro.sample("y", dist.Normal(outcome_structure, 
-                                            sigma_y), #.to_event(1),
-                            obs = y)
+            if self.outcome == "gaussian":
+                if self.include_view_factors:
+                    full_factors = torch.cat((Z, *Phi_l_list), 1)
+                    outcome_structure = pyro.deterministic("outcome_structure",
+                                                        torch.matmul(full_factors, beta))
+                    pyro.sample("y", dist.Normal(outcome_structure, 
+                                                sigma_y), #.to_event(1),
+                                obs = y)
+                else:
+                    outcome_structure = pyro.deterministic("outcome_structure",
+                                                        torch.matmul(Z, beta))
+                    pyro.sample("y", dist.Normal(outcome_structure, 
+                                                sigma_y), #.to_event(1),
+                                obs = y)
             else:
-                outcome_structure = pyro.deterministic("outcome_structure",
-                                                    torch.matmul(Z, beta))
-                pyro.sample("y", dist.Normal(outcome_structure, 
-                                            sigma_y), #.to_event(1),
-                            obs = y)
-            # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx), 
-            #                              sigma_y),
-            #             obs = y.index_select(0, batch_idx))
+                raise NotImplementedError
     
     def forward_dense(self, 
                 X_list, 
@@ -312,8 +327,18 @@ class SupMultiviewDecomp(PyroModule):
         # Idiosyncratic error variance 
         psi_sqrt_l_list = []           
         for l, p_l in enumerate(p_l_list):
-            psi_l = pyro.sample(f"psi_l{l}", dist.InverseGamma(self.a_psi, self.b_psi).expand([p_l]).to_event(1))
+            # psi_l = pyro.sample(f"psi_l{l}", dist.InverseGamma(self.a_psi, self.b_psi).expand([p_l]).to_event(1))
+            psi_l_inv = pyro.sample(f"psi_l{l}", dist.Gamma(self.a_psi, self.b_psi).expand([p_l]).to_event(1))
+            psi_l = psi_l_inv.pow_(-1)
+            
+            # print(f"psi_l{l} min: {psi_l.min().item()}, max: {psi_l.max().item()}")
+            # print(f"psi_l{l} has NaN: {torch.isnan(psi_l).any()}")
+            # print(f"psi_l{l} has negative: {(psi_l < 0).any()}")
+            
             psi_sqrt = torch.sqrt(psi_l)
+            
+            # print(f"psi_sqrt_l{l} has NaN: {torch.isnan(psi_sqrt).any()}")
+            
             psi_sqrt_l_list.append(psi_sqrt)
             
         
@@ -351,9 +376,16 @@ class SupMultiviewDecomp(PyroModule):
                 
                 joint_structure_list.append(joint_structure_l)
                 
-                pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
+                X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
                                                    psi_sqrt_l_list[l]).to_event(1), 
                             obs = X_list[l])
+                if torch.isnan(X_l).any():
+                    print("NaN values found in X_l_tensor!")
+                    print(torch.where(torch.isnan(X_l)))
+                    print(X_l)
+                if torch.isinf(X_l).any():
+                    print("Inf values found in X_l_tensor!")
+                
             
                 # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
                 #                                    psi_sqrt_l_list[l]).to_event(1), 
@@ -447,6 +479,7 @@ def do_inference(X_list,
                  opt = Adam({"lr": 0.001}), #"Adam",
                  elbo = Trace_ELBO(),
                 #  opt_args = {"lr": 0.001},
+                 inference = "svi",
                  min_epochs = 10,
                  epochs = 20,
                  max_iter = 20000,
