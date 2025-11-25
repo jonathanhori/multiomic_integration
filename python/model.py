@@ -13,8 +13,9 @@ from pyro.nn import PyroModule
 from pyro.optim import Adam, ClippedAdam
 from pyro.infer import SVI, Trace_ELBO, Predictive, TraceGraph_ELBO
 from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNormal
+from pyro.poutine import mask
 
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 
 pyro.enable_validation(True)
 pyro.set_rng_seed(0)
@@ -50,7 +51,8 @@ class SupMultiviewDecomp(PyroModule):
         self.n = n
         self.k = k
         self.k_l_list = k_l_list # assumes k_l > 0 for all l
-        self.p_l = None
+        # self.p_l = None
+        self.p_l_list = None
         
         self.dense = dense
         self.outcome = outcome
@@ -105,19 +107,20 @@ class SupMultiviewDecomp(PyroModule):
     def forward_mgp(self, 
                 X_list, 
                 batch_idx,
-                y = None):
+                y = None,
+                cens = None):
         """
         X_l = Z @ Lambda_l^T + Phi_l @ Gamma_l^T + E,   l = 1, ... , L
         y = Z @ beta + e
         With shrinkage of factor loadings
         """
         m = len(batch_idx)
-        p_l_list = [X_l.shape[1] for X_l in X_list]
+        if self.p_l_list is None:
+            self.p_l_list = [X_l.shape[1] for X_l in X_list]
         
         ########################
         # ---- Loadings --------
         # Loadings Lambda: sample rows across features (p, k)
-        # ARD prior
         # Lambda_j ~ N_k(0, sigma_k^2 I)
         #   ==> Lambda^l_jk ~ N(0, (rho^l_{jk})^-1 * (tau^l_k)^-12)
         # sigma^l_k^2 ~ InvGamma(a_sigma, b_sigma))
@@ -126,7 +129,7 @@ class SupMultiviewDecomp(PyroModule):
         ########################
         # VIEW SPECIFIC
         Gamma_l_list = []
-        for l, (p_l, k_l) in enumerate(zip(p_l_list, self.k_l_list)):
+        for l, (p_l, k_l) in enumerate(zip(self.p_l_list, self.k_l_list)):
             # tau - global shrinkage
             delta_gamma = []
             for m in range(k_l):
@@ -139,8 +142,8 @@ class SupMultiviewDecomp(PyroModule):
             rho_gamma = pyro.sample(f"rho_gamma_l{l}",
                                     dist.Gamma(self.alpha_individual / 2, self.alpha_individual / 2).expand([p_l, k_l]).to_event(2)).squeeze()
             
-            # print('tau shape', tau_gamma_k_list.shape)
-            # print('rho shape', rho_gamma.shape)
+            # print('Gamma - tau shape', tau_gamma_k_list.shape)
+            # print('Gamma - rho shape', rho_gamma.shape)
             # sigma_gamma_l = (rho_gamma * tau_gamma_k_list).pow_(-0.5)
             precision = rho_gamma * tau_gamma_k_list
             precision = torch.clamp(precision, min=1e-10, max=1e10)  # Prevent extreme values
@@ -151,7 +154,7 @@ class SupMultiviewDecomp(PyroModule):
         
         # SHARED        
         Lambda_l_list = []
-        for l, p_l in enumerate(p_l_list):
+        for l, p_l in enumerate(self.p_l_list):
             # tau - global shrinkage
             delta_lambda = []
             for m in range(self.k):
@@ -164,8 +167,8 @@ class SupMultiviewDecomp(PyroModule):
             rho_lambda = pyro.sample(f'rho_lambda_l{l}', 
                                 dist.Gamma(self.alpha_joint / 2, self.alpha_joint / 2).expand([p_l, self.k]).to_event(2)).squeeze()
             
-            # print('tau shape', tau_lambda_k_list.shape)
-            # print('rho shape', rho_lambda.shape)
+            # print('Lambda - tau shape', tau_lambda_k_list.shape)
+            # print('Lambda - rho shape', rho_lambda.shape)
             # sigma_lambda_l = (rho_lambda * tau_lambda_k_list).pow_(-0.5)   
             precision = rho_lambda * tau_lambda_k_list
             precision = torch.clamp(precision, min=1e-10, max=1e10)
@@ -187,7 +190,7 @@ class SupMultiviewDecomp(PyroModule):
         
         # Idiosyncratic error variance 
         psi_sqrt_l_list = []           
-        for l, p_l in enumerate(p_l_list):
+        for l, p_l in enumerate(self.p_l_list):
             psi_l = pyro.sample(f"psi_l{l}", dist.InverseGamma(self.a_psi, self.b_psi).expand([p_l]).to_event(1))
             psi_sqrt = torch.sqrt(psi_l)
             psi_sqrt_l_list.append(psi_sqrt)
@@ -200,12 +203,15 @@ class SupMultiviewDecomp(PyroModule):
                            dist.Normal(torch.zeros(self.num_outcome_factors), sigma2_beta).to_event(1)).\
                                squeeze(0)
         
-        # Outcome variances
+        ## Outcome error distribution parameters:
+        # Continuous: Normal variances
         if self.outcome == "gaussian":
             sigma2_y = pyro.sample("sigma2_y",
                                 dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
             sigma_y = torch.sqrt(sigma2_y)
+        # Right-censored: Weibull shape (Gamma)
         else:
+            # outcome_concentration = pyro.sample("")
             raise NotImplementedError
         
         # Local latent variables and observations
@@ -244,20 +250,28 @@ class SupMultiviewDecomp(PyroModule):
             
             
             # Outcome model
+            if self.include_view_factors:
+                full_factors = torch.cat((Z, *Phi_l_list), 1)
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(full_factors, beta))
+            else:
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(Z, beta))
+                # pyro.sample("y", dist.Normal(outcome_structure, 
+                #                             sigma_y), #.to_event(1),
+                #             obs = y)
+            
             if self.outcome == "gaussian":
-                if self.include_view_factors:
-                    full_factors = torch.cat((Z, *Phi_l_list), 1)
-                    outcome_structure = pyro.deterministic("outcome_structure",
-                                                        torch.matmul(full_factors, beta))
-                    pyro.sample("y", dist.Normal(outcome_structure, 
-                                                sigma_y), #.to_event(1),
-                                obs = y)
-                else:
-                    outcome_structure = pyro.deterministic("outcome_structure",
-                                                        torch.matmul(Z, beta))
-                    pyro.sample("y", dist.Normal(outcome_structure, 
-                                                sigma_y), #.to_event(1),
-                                obs = y)
+                pyro.sample("y", dist.Normal(outcome_structure, 
+                                            sigma_y), #.to_event(1),
+                            obs = y)
+            elif self.outcome == "censored":
+                weibull = dist.Weibull(outcome_structure, outcome_concentration)
+                with mask(mask = (cens == 1)):
+                    pyro.sample("y", weibull, obs = y)
+                with mask(mask = (cens == 0)):
+                    survival_prob = 1 - weibull.cdf(y)
+                    pyro.sample("censored", dist.Bernoulli(survival_prob), obs = 1)
             else:
                 raise NotImplementedError
     
@@ -271,6 +285,7 @@ class SupMultiviewDecomp(PyroModule):
         """
         m = len(batch_idx)
         p_l_list = [X_l.shape[1] for X_l in X_list]
+        # print('p_l', p_l_list)
         # if torch.is_tensor(X):
         #     m, p = X.shape # Working with minibatches of size m
         # elif isinstance(X, TensorDataset): # working with full dataset directly
@@ -397,15 +412,21 @@ class SupMultiviewDecomp(PyroModule):
                 full_factors = torch.cat((Z, *Phi_l_list), 1)
                 outcome_structure = pyro.deterministic("outcome_structure",
                                                     torch.matmul(full_factors, beta))
+                # pyro.sample("y", dist.Normal(outcome_structure, 
+                #                             sigma_y), #.to_event(1),
+                #             obs = y)
+            else:
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                    torch.matmul(Z, beta))
+                # pyro.sample("y", dist.Normal(outcome_structure, 
+                #                             sigma_y), #.to_event(1),
+                #             obs = y)
+            if self.outcome == "gaussian":
                 pyro.sample("y", dist.Normal(outcome_structure, 
                                             sigma_y), #.to_event(1),
                             obs = y)
             else:
-                outcome_structure = pyro.deterministic("outcome_structure",
-                                                    torch.matmul(Z, beta))
-                pyro.sample("y", dist.Normal(outcome_structure, 
-                                            sigma_y), #.to_event(1),
-                            obs = y)
+                raise NotImplementedError
             # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx), 
             #                              sigma_y),
             #             obs = y.index_select(0, batch_idx))
@@ -414,76 +435,205 @@ class SupMultiviewDecomp(PyroModule):
     def guide(self, 
               X_list, 
               batch_idx,
-              y = None):
-        raise NotImplementedError
-        # TODO
-    
-        # if torch.is_tensor(X):
-        #     m, p = X.shape # Working with minibatches of size m
-        # elif isinstance(X, TensorDataset): # working with full dataset directly
-        #     # print("is tensordataset")
-        #     m = len(X)
-        #     p = X[0][0].shape[0]
+              y = None,
+              cens = None):
+        if self.dense:
+            raise NotImplementedError
+        
+        m = len(batch_idx)
+        if self.p_l_list is None:
+            self.p_l_list = [X_l.shape[1] for X_l in X_list]
+        
+        ########################
+        # ---- Loadings --------
+        ########################
+        # VIEW SPECIFIC
+        Gamma_l_list = []
+        for l, (p_l, k_l) in enumerate(zip(self.p_l_list, self.k_l_list)):
+            for m in range(k_l):
+                a_delta_gamma_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 2.1,
+                                               constraint = dist.constraints.positive)
+                b_delta_gamma_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 1.0,
+                                               constraint = dist.constraints.positive)
+                pyro.sample(f"delta_gamma_l{l}_k{m}", dist.Gamma(a_delta_gamma_l_m, b_delta_gamma_l_m))
+                
+                a_rho_gamma_l_m = pyro.param(f"a_rho_gamma_l{l}_k{m}", 1.5,
+                                             constraint = dist.constraints.positive)
+                b_rho_gamma_l_m = pyro.param(f"b_rho_gamma_l{l}_k{m}", 1.5,
+                                             constraint = dist.constraints.positive)
+                pyro.sample(f"rho_gamma_l{l}",
+                            dist.Gamma(a_rho_gamma_l_m, b_rho_gamma_l_m).expand([p_l, k_l]).to_event(2)).squeeze()
+
+            loc_Gamma_l = pyro.param(f"loc_Gamma_l{l}", torch.zeros(p_l, k_l))
+            scale_Gamma_l = pyro.param(f"scale_Gamma_l{l}", torch.ones(p_l, k_l),
+                                       constraint = dist.constraints.positive)
+            Gamma_l = pyro.sample(f"Gamma_l{l}", dist.Normal(loc_Gamma_l, scale_Gamma_l).to_event(2))
             
-        # ######
-        # # Loadings
-        # # The model specifies 
-        # ######
-        # # Sigma2: Variational parameters a, b
-        # a_sigma_q = pyro.param("a_sigma_q", 
-        #                        lambda: torch.ones((self.k)),
-        #                        constraint = dist.constraints.positive)
-        # b_sigma_q = pyro.param("b_sigma_q", 
-        #                        lambda: torch.ones((self.k)),
-        #                        constraint = dist.constraints.positive)
+            Gamma_l_list.append(Gamma_l)
         
-        # sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_q, b_sigma_q).to_event(1))
-        # # sigma = torch.sqrt(sigma2)
-        
-        # # Lambda: Variational parameters loc, scale
-        # Lambda_loc = pyro.param("Lambda_loc", lambda: torch.zeros(p, self.k))
-        # Lambda_scale = pyro.param("Lambda_scale", lambda: torch.ones(p, self.k),
-        #                           constraint = dist.constraints.positive)
-        # Lambda = pyro.sample("Lambda", dist.Normal(Lambda_loc, Lambda_scale).to_event(2))
-        
-        # ########################
-        # # Scores
-        # ########################
-        # # Psi: Variational params a, b
-        # a_psi_q = pyro.param("a_psi_q",
-        #                      lambda: torch.ones((p)),
-        #                      constraint = dist.constraints.positive)     
-        # b_psi_q = pyro.param("b_psi_q",
-        #                      lambda: torch.ones((p)),
-        #                      constraint = dist.constraints.positive)  
-        # psi = pyro.sample("psi", dist.InverseGamma(a_psi_q, b_psi_q).to_event(1))
-        # # psi_sqrt = torch.sqrt(psi)
-        
-        # # Local latent variables Z: Variational params loc, scale
-        # Z_loc = pyro.param("Z_loc", lambda: torch.zeros(self.n, self.k))
-        # Z_scale = pyro.param("Z_scale", lambda: torch.ones(self.n, self.k),
-        #                         constraint = dist.constraints.positive)
-        # with pyro.plate("obs", self.n, subsample = batch_idx):
-        #     Z_loc_batch = Z_loc[batch_idx]
-        #     Z_scale_batch = Z_scale[batch_idx]
-        #     Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
+        # SHARED        
+        Lambda_l_list = []
+        for l, p_l in enumerate(self.p_l_list):
+            for m in range(self.k):
+                a_delta_lambda_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 2.1,
+                                                constraint = dist.constraints.positive)
+                b_delta_lambda_l_m = pyro.param(f"b_delta_gamma_l{l}_k{m}", 1.0,
+                                                constraint = dist.constraints.positive)
+                pyro.sample(f"delta_lambda_l{l}_k{m}", dist.Gamma(a_delta_lambda_l_m, b_delta_lambda_l_m))
+
+                a_rho_lambda_l_m = pyro.param(f"a_rho_lambda_l{l}_k{m}", 1.5,
+                                              constraint = dist.constraints.positive)
+                b_rho_lambda_l_m = pyro.param(f"b_rho_lambda_l{l}_k{m}", 1.5,
+                                              constraint = dist.constraints.positive)
+                pyro.sample(f'rho_lambda_l{l}', 
+                            dist.Gamma(a_rho_lambda_l_m, b_rho_lambda_l_m).expand([p_l, self.k]).to_event(2)).squeeze()
             
-        #     pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+            loc_Lambda_l = pyro.param(f"loc_Lambda_l{l}", torch.zeros(p_l, self.k))
+            scale_Lambda_l = pyro.param(f"scale_Lambda_l{l}", torch.ones(p_l, self.k),
+                                        constraint = dist.constraints.positive)
+            Lambda_l = pyro.sample(f"Lambda_l{l}", dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
+            
+            Lambda_l_list.append(Lambda_l)
+        
+        
+        ########################
+        # ---- Observations --------
+        # Outcome y can be dependent on just shared factors, or all factors
+        ########################
+        
+        # Idiosyncratic error variance 
+        psi_sqrt_l_list = []           
+        for l, p_l in enumerate(self.p_l_list):
+            a_psi_l = pyro.param(f"a_psi_l{l}", self.a_psi,
+                                 constraint = dist.constraints.positive)
+            b_psi_l = pyro.param(f"b_psi_l{l}", self.b_psi,
+                                 constraint = dist.constraints.positive)
+            psi_l = pyro.sample(f"psi_l{l}", dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+            # psi_sqrt = torch.sqrt(psi_l)
+            # psi_sqrt_l_list.append(psi_sqrt)
+            
+        
+        # Outcome model coefficients
+        a_sigma_beta = pyro.param("a_sigma_beta", self.a_sigma_beta,
+                                  constraint = dist.constraints.positive)
+        b_sigma_beta = pyro.param("b_sigma_beta", self.b_sigma_beta,
+                                  constraint = dist.constraints.positive)
+        sigma2_beta = pyro.sample("sigma2_beta",
+                                  dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.num_outcome_factors]).to_event(1))
+        
+        loc_beta = pyro.param("loc_beta", torch.zeros(self.num_outcome_factors))
+        scale_beta = pyro.param("scale_beta", torch.ones(self.num_outcome_factors),
+                                constraint = dist.constraints.positive)
+        beta = pyro.sample("beta",
+                           dist.Normal(loc_beta, scale_beta).to_event(1)).\
+                               squeeze(0)
+        
+        ## Outcome error distribution parameters:
+        # Continuous: Normal variances
+        if self.outcome == "gaussian":
+            a_sigma_y = pyro.param("a_sigma_y", self.a_sigma_y,
+                                   constraint = dist.constraints.positive)
+            b_sigma_y = pyro.param("b_sigma_y", self.b_sigma_y,
+                                   constraint = dist.constraints.positive)
+            sigma2_y = pyro.sample("sigma2_y",
+                                dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            # sigma_y = torch.sqrt(sigma2_y)
+        # Right-censored: Weibull shape (Gamma)
+        else:
+            # outcome_concentration = pyro.sample("")
+            raise NotImplementedError
+        
+        # Local latent variables and observations
+        loc_Z = pyro.param("loc_Z", torch.zeros(self.n, self.k))
+        scale_Z = pyro.param("scale_Z", torch.ones(self.n, self.k),
+                                constraint = dist.constraints.positive)
+        loc_Phi_list = []
+        scale_Phi_list = []
+        for l, k_l in enumerate(self.k_l_list):
+            loc_Phi_l = pyro.param(f"loc_Phi_l{l}", torch.zeros(self.n, k_l))
+            scale_Phi_l = pyro.param(f"scale_Phi_l{l}", torch.ones(self.n, k_l),
+                                     constraint = dist.constraints.positive)
+            loc_Phi_list.append(loc_Phi_l)
+            scale_Phi_list.append(scale_Phi_l)
+            
+        with pyro.plate("obs", self.n, subsample = batch_idx):
+            loc_Z_batch = loc_Z[batch_idx]
+            scale_Z_batch = scale_Z[batch_idx]
+            Z = pyro.sample("Z", dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
+            
+            # Phi_l_list = []
+            for l, k_l in enumerate(self.k_l_list):
+                # loc_Z
+                loc_Phi = loc_Phi_list[l][batch_idx]
+                scale_Phi = scale_Phi_list[l][batch_idx]
+                Phi_l = pyro.sample(f"Phi_l{l}", dist.Normal(loc_Phi, scale_Phi).to_event(1))
+                # Phi_l_list.append(Phi_l)
+                
+            
+            # # Compute structures
+            # joint_structure_list = []
+            # for l in range(len(X_list)):
+            #     joint_structure_l = pyro.deterministic(f"joint_structure_l{l}", 
+            #                                            torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
+            #     view_structure_l = pyro.deterministic(f"view_structure_l{l}",
+            #                                         torch.matmul(Phi_l_list[l], Gamma_l_list[l].squeeze(0).T))
+                
+            #     total_structure_l = torch.add(joint_structure_l, view_structure_l)
+                
+            #     joint_structure_list.append(joint_structure_l)
+                
+            #     X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
+            #                                        psi_sqrt_l_list[l]).to_event(1), 
+            #                 obs = X_list[l])
+            #     if torch.isnan(X_l).any():
+            #         print("NaN values found in X_l_tensor!")
+            #     if torch.isinf(X_l).any():
+            #         print("Inf values found in X_l_tensor!")
+            
+            #     # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
+            #     #                                    psi_sqrt_l_list[l]).to_event(1), 
+            #     #             obs = X_list[l].index_select(0, batch_idx))
+            
+            
+            # # Outcome model
+            # if self.include_view_factors:
+            #     full_factors = torch.cat((Z, *Phi_l_list), 1)
+            #     outcome_structure = pyro.deterministic("outcome_structure",
+            #                                         torch.matmul(full_factors, beta))
+            # else:
+            #     outcome_structure = pyro.deterministic("outcome_structure",
+            #                                         torch.matmul(Z, beta))
+            #     # pyro.sample("y", dist.Normal(outcome_structure, 
+            #     #                             sigma_y), #.to_event(1),
+            #     #             obs = y)
+            
+            # if self.outcome == "gaussian":
+            #     pyro.sample("y", dist.Normal(outcome_structure, 
+            #                                 sigma_y), #.to_event(1),
+            #                 obs = y)
+            # elif self.outcome == "censored":
+            #     raise NotImplementedError
+            #     # weibull = dist.Weibull(outcome_structure, outcome_concentration)
+            #     # with mask(mask = (cens == 1)):
+            #     #     pyro.sample("y", weibull, obs = y)
+            #     # with mask(mask = (cens == 0)):
+            #     #     survival_prob = 1 - weibull.cdf(y)
+            #     #     pyro.sample("censored", dist.Bernoulli(survival_prob), obs = 1)
+            # else:
+            #     raise NotImplementedError
             
     
 ##############
-def do_inference(X_list, 
-                 y,
+def do_inference(train_dataset,
                  model, 
                  guide, 
                  opt = Adam({"lr": 0.001}), #"Adam",
                  elbo = Trace_ELBO(),
-                #  opt_args = {"lr": 0.001},
                  inference = "svi",
                  min_epochs = 10,
                  epochs = 20,
                  max_iter = 20000,
-                 minibatch_flag = False,
+                 minibatch_flag = True,
                  minibatch_size = 32,
                  tol = 1e-4,
                  variational_tol = 1e-4,
@@ -499,8 +649,7 @@ def do_inference(X_list,
     ########################
     # Handle minibatching of dataset
     ########################
-    tensor_dataset = TensorDataset(torch.arange(X_list[0].shape[0]), *X_list, y)
-    loader = DataLoader(tensor_dataset, batch_size = minibatch_size, shuffle = True, drop_last=True)
+    loader = DataLoader(train_dataset, batch_size = minibatch_size, shuffle = True, drop_last=True)
     
     ########################
     # Initialize instances for optimization
@@ -570,30 +719,6 @@ def do_inference(X_list,
             
             # prev_loss = epoch_loss
     else:
-        raise NotImplementedError
-        # # total_loss = 0.
-        # prev_loss = None
-        # for iter in range(max_iter):
-        #     # total_loss = 0.
-        #     loss = svi.step(X, torch.arange(X.shape[0])) #batch[0])
-        #     # print(loss)
-        #     # total_loss += loss
-        #     # for batch in loader:
-        #     #     loss = svi.step(batch[0])
-        #     #     epoch_loss += loss
-        #     if iter % 100 == 0:
-        #         print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
-        #         model.loss_history.append(loss)
-        #         # print(f"Epoch {iter+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss:.4f}")
-                
-        #     # if prev_loss is not None and abs((loss- prev_loss) / prev_loss) < tol:
-        #     if prev_loss is not None and abs((loss- prev_loss)) < tol:
-        #         # print(f"Stopping: {abs((loss- prev_loss) / prev_loss)} < {tol}")
-        #         print(f"Iteration {iter-1}  loss: {prev_loss / model.n:.4f}")
-        #         print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
-        #         model.total_iters = iter
-        #         break
-        #     prev_loss = loss
-            
+        raise NotImplementedError            
         
     return svi, opt
