@@ -2,6 +2,8 @@ import os
 import torch
 
 import pyro
+from pyro.infer import Predictive
+
 import rpy2.robjects as robjects
 from rpy2.robjects import pandas2ri, default_converter, conversion
 from rpy2 import rinterface
@@ -87,15 +89,23 @@ def load_and_process_rds_data_for_condition(
 
 ##########
 # Input data processing
-def normalize_tensor_by_col(data):
+def normalize_tensor_by_col(data, training_means = None, training_stds = None):
     # Means and sds are are broadcast across rows
-    data_means = torch.mean(data, 0)
-    data_stds = torch.std(data, 0)
+    if training_means is None and training_stds is None:
+        data_means = torch.mean(data, 0)
+        data_stds = torch.std(data, 0)
+    else:
+        data_means = training_means
+        data_stds = training_stds
     return {
         "data_clean": (data - data_means) / data_stds,
         "means": data_means,
         "sds": data_stds
     }
+
+# Remove columns that are all 0s
+def zero_variance_col_filter(tens_2d):
+    return tens_2d.abs().sum(dim=0).bool()
     
 ###########
 # Use estimated and simulated data
@@ -134,6 +144,36 @@ def extract_sim_decomp(sim_data_dict):
             "SIM_Phi_l_list": SIM_Phi_l_list
         }
     
+def obtain_posterior_pred_samples(model,
+                                guide,
+                                num_samples,
+                                train_X_l_list_clean,
+                                test_X_l_list_clean,
+                                structure_return_sites,
+                                outcome_return_sites):
+    n_train = train_X_l_list_clean[0].shape[0]
+    predictive = Predictive(model, 
+                        guide = guide, 
+                        num_samples = num_samples,
+                        return_sites = structure_return_sites)
+    post_samples = predictive(
+        train_X_l_list_clean,
+        torch.arange(n_train)
+        )
+
+    # Sample posterior predictive for outcome - specify return_sites
+    n_test = test_X_l_list_clean[0].shape[0]
+    predictive_y = Predictive(model, 
+                            guide = guide, 
+                            num_samples = num_samples,
+                            return_sites = outcome_return_sites)
+    # Do not supply y
+    post_samples_y = predictive_y(
+        test_X_l_list_clean,
+        torch.arange(n_test)
+        )
+    return (post_samples, post_samples_y)
+    
     
 def calc_struct(scores, loadings):
     return scores @ loadings.T
@@ -148,6 +188,7 @@ def scale_sim_struct(struct_list, mean_list, sd_list):
     
     
 def calc_all_structures_with_rescaling(L,
+                                       column_filters,
                                         X_l_mean_list,
                                         X_l_sd_list,
                                         post_pred_structure_samples,
@@ -159,6 +200,13 @@ def calc_all_structures_with_rescaling(L,
         [sim_decomp.get("SIM_Z")] * L, sim_decomp.get("SIM_Lambda_l_list")))
     SIM_individual_struct_l_list = list(map(calc_struct, \
         sim_decomp.get("SIM_Phi_l_list"), sim_decomp.get("SIM_Gamma_l_list")))
+    
+    # Filter out zero variance columns from sim data structures
+    SIM_joint_struct_l_list = [struct[:, filter] for struct, filter 
+                               in zip(SIM_joint_struct_l_list, column_filters)]
+    SIM_individual_struct_l_list = [struct[:, filter] for struct, filter 
+                               in zip(SIM_individual_struct_l_list, column_filters)]
+    
 
     # EST_Struct_shared_l_list_rescaled = scale_est_struct(EST_Struct_shared_l_list, X_l_mean_list, X_l_sd_list)
     SIM_joint_struct_l_list_rescaled = scale_sim_struct(SIM_joint_struct_l_list, X_l_mean_list, X_l_sd_list)
