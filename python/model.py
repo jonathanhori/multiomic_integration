@@ -451,18 +451,22 @@ class SupMultiviewDecomp(PyroModule):
         Gamma_l_list = []
         for l, (p_l, k_l) in enumerate(zip(self.p_l_list, self.k_l_list)):
             for m in range(k_l):
-                a_delta_gamma_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 2.1,
+                a_delta_gamma_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 
+                                               torch.tensor(2.1),
                                                constraint = dist.constraints.positive)
-                b_delta_gamma_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 1.0,
+                b_delta_gamma_l_m = pyro.param(f"b_delta_gamma_l{l}_k{m}", 
+                                               torch.tensor(1.0),
                                                constraint = dist.constraints.positive)
                 pyro.sample(f"delta_gamma_l{l}_k{m}", dist.Gamma(a_delta_gamma_l_m, b_delta_gamma_l_m))
                 
-                a_rho_gamma_l_m = pyro.param(f"a_rho_gamma_l{l}_k{m}", 1.5,
-                                             constraint = dist.constraints.positive)
-                b_rho_gamma_l_m = pyro.param(f"b_rho_gamma_l{l}_k{m}", 1.5,
-                                             constraint = dist.constraints.positive)
-                pyro.sample(f"rho_gamma_l{l}",
-                            dist.Gamma(a_rho_gamma_l_m, b_rho_gamma_l_m).expand([p_l, k_l]).to_event(2)).squeeze()
+            a_rho_gamma_l = pyro.param(f"a_rho_gamma_l{l}", 
+                                            torch.tensor(self.alpha_individual / 2),
+                                            constraint = dist.constraints.positive)
+            b_rho_gamma_l = pyro.param(f"b_rho_gamma_l{l}", 
+                                            torch.tensor(self.alpha_individual / 2),
+                                            constraint = dist.constraints.positive)
+            pyro.sample(f"rho_gamma_l{l}",
+                        dist.Gamma(a_rho_gamma_l, b_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
 
             loc_Gamma_l = pyro.param(f"loc_Gamma_l{l}", torch.zeros(p_l, k_l))
             scale_Gamma_l = pyro.param(f"scale_Gamma_l{l}", torch.ones(p_l, k_l),
@@ -475,18 +479,20 @@ class SupMultiviewDecomp(PyroModule):
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             for m in range(self.k):
-                a_delta_lambda_l_m = pyro.param(f"a_delta_gamma_l{l}_k{m}", 2.1,
+                a_delta_lambda_l_m = pyro.param(f"a_delta_lambda_l{l}_k{m}", torch.tensor(2.1),
                                                 constraint = dist.constraints.positive)
-                b_delta_lambda_l_m = pyro.param(f"b_delta_gamma_l{l}_k{m}", 1.0,
+                b_delta_lambda_l_m = pyro.param(f"b_delta_lambda_l{l}_k{m}", torch.tensor(1.0),
                                                 constraint = dist.constraints.positive)
                 pyro.sample(f"delta_lambda_l{l}_k{m}", dist.Gamma(a_delta_lambda_l_m, b_delta_lambda_l_m))
 
-                a_rho_lambda_l_m = pyro.param(f"a_rho_lambda_l{l}_k{m}", 1.5,
-                                              constraint = dist.constraints.positive)
-                b_rho_lambda_l_m = pyro.param(f"b_rho_lambda_l{l}_k{m}", 1.5,
-                                              constraint = dist.constraints.positive)
-                pyro.sample(f'rho_lambda_l{l}', 
-                            dist.Gamma(a_rho_lambda_l_m, b_rho_lambda_l_m).expand([p_l, self.k]).to_event(2)).squeeze()
+            a_rho_lambda_l = pyro.param(f"a_rho_lambda_l{l}", 
+                                            torch.tensor(self.alpha_joint / 2),
+                                            constraint = dist.constraints.positive)
+            b_rho_lambda_l = pyro.param(f"b_rho_lambda_l{l}", 
+                                            torch.tensor(self.alpha_joint / 2),
+                                            constraint = dist.constraints.positive)
+            pyro.sample(f'rho_lambda_l{l}', 
+                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
             
             loc_Lambda_l = pyro.param(f"loc_Lambda_l{l}", torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(f"scale_Lambda_l{l}", torch.ones(p_l, self.k),
@@ -504,9 +510,11 @@ class SupMultiviewDecomp(PyroModule):
         # Idiosyncratic error variance 
         psi_sqrt_l_list = []           
         for l, p_l in enumerate(self.p_l_list):
-            a_psi_l = pyro.param(f"a_psi_l{l}", self.a_psi,
+            a_psi_l = pyro.param(f"a_psi_l{l}", 
+                                 torch.tensor(self.a_psi),
                                  constraint = dist.constraints.positive)
-            b_psi_l = pyro.param(f"b_psi_l{l}", self.b_psi,
+            b_psi_l = pyro.param(f"b_psi_l{l}", 
+                                 torch.tensor(self.b_psi),
                                  constraint = dist.constraints.positive)
             psi_l = pyro.sample(f"psi_l{l}", dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
             # psi_sqrt = torch.sqrt(psi_l)
@@ -514,9 +522,11 @@ class SupMultiviewDecomp(PyroModule):
             
         
         # Outcome model coefficients
-        a_sigma_beta = pyro.param("a_sigma_beta", self.a_sigma_beta,
+        a_sigma_beta = pyro.param("a_sigma_beta", 
+                                  torch.tensor(self.a_sigma_beta),
                                   constraint = dist.constraints.positive)
-        b_sigma_beta = pyro.param("b_sigma_beta", self.b_sigma_beta,
+        b_sigma_beta = pyro.param("b_sigma_beta", 
+                                  torch.tensor(self.b_sigma_beta),
                                   constraint = dist.constraints.positive)
         sigma2_beta = pyro.sample("sigma2_beta",
                                   dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.num_outcome_factors]).to_event(1))
@@ -531,9 +541,11 @@ class SupMultiviewDecomp(PyroModule):
         ## Outcome error distribution parameters:
         # Continuous: Normal variances
         if self.outcome == "gaussian":
-            a_sigma_y = pyro.param("a_sigma_y", self.a_sigma_y,
+            a_sigma_y = pyro.param("a_sigma_y", 
+                                   torch.tensor(self.a_sigma_y),
                                    constraint = dist.constraints.positive)
-            b_sigma_y = pyro.param("b_sigma_y", self.b_sigma_y,
+            b_sigma_y = pyro.param("b_sigma_y", 
+                                   torch.tensor(self.b_sigma_y),
                                    constraint = dist.constraints.positive)
             sigma2_y = pyro.sample("sigma2_y",
                                 dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
