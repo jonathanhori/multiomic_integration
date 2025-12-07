@@ -32,6 +32,7 @@ from data_utils import load_and_process_rds_data_for_condition, normalize_tensor
     zero_variance_col_filter, obtain_posterior_pred_samples, \
         calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance
 from model import SupMultiviewDecomp, do_inference
+from handler import ModelHandler
 
 
 sim_data_path = "~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/"
@@ -191,46 +192,48 @@ if __name__ == "__main__":
             test_y_clean = (test_y - y_mean) / y_std
             
             
-            # Package data into dataset and 
+            # Package data into dataset
             train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]), 
                                         *train_X_l_list_clean, 
                                         train_y_clean)
-            # if TRAINING_SPLIT:
-            #     train_subset, test_subset = random_split(tensor_dataset, 
-            #                                             (0.8, 0.2), 
-            #                                             generator = torch.Generator().manual_seed(RANDOM_SEED))
-            # else:
-            #     train_subset = tensor_dataset
+            test_subset = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]), 
+                                        *test_X_l_list_clean, 
+                                        test_y_clean)
                 
             ##################
             # Perform model inference
             factor_model = SupMultiviewDecomp(
                 k,
                 k_l_list,
-                n,
                 include_view_factors = True,
                 dense = False
             )
 
-            def subsample_create_plates(X, batch_idx, y = None):
-                return pyro.plate("obs", factor_model.n, subsample = batch_idx)
-            guide = pyro.infer.autoguide.AutoNormal(
-                factor_model, 
-                create_plates = subsample_create_plates)
+            # def subsample_create_plates(X, batch_idx, y = None):
+            #     return pyro.plate("obs", factor_model.n, subsample = batch_idx)
+            # guide = pyro.infer.autoguide.AutoNormal(
+            #     factor_model, 
+            #     create_plates = subsample_create_plates)
 
             # OPT = Adam({"lr": initial_lr})
             OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
             LOSS = Trace_ELBO(num_particles = 1)
+            
+            train_handler = ModelHandler("train",
+                                         factor_model,
+                                         OPT, 
+                                         LOSS)
+            
             try:
                 t0 = time.time()
-                svi, opt = do_inference(
+                svi, opt = train_handler.do_inference(
                     # X_l_list_clean,
                     # y_clean,
                     train_subset,
-                    model = factor_model,
-                    guide = guide,
-                    opt = OPT,
-                    elbo = LOSS,
+                    # model = factor_model,
+                    # guide = guide,
+                    # opt = OPT,
+                    # elbo = LOSS,
                     # tol = TOL, # tolerance is on epoch loss per datum,
                     variational_tol = VARIATIONAL_TOL,
                     min_epochs = MIN_EPOCHS,
@@ -265,19 +268,58 @@ if __name__ == "__main__":
                 #     print()
                 # else:
                 #     print()
+                
+                
+                #################
+                # Inference for predictive model
+                LOCAL_OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
+                LOCAL_LOSS = Trace_ELBO(num_particles = 1)
+                
+                test_handler = ModelHandler("test",
+                                            factor_model,
+                                            LOCAL_OPT, 
+                                            LOCAL_LOSS)
+                
+                t0 = time.time()
+                svi, opt = test_handler.do_inference(
+                    test_subset,
+                    variational_tol = VARIATIONAL_TOL,
+                    min_epochs = MIN_EPOCHS,
+                    epochs = NUM_EPOCHS,
+                    minibatch_flag = True,
+                    minibatch_size = MINIBATCH_SIZE,
+                    verbose = False
+                    )
+                t1 = time.time()
+                test_run_minibatch = t1 - t0
+                
+                torch.save({
+                    "inference_time": run_minibatch,
+                    "epochs": factor_model.local_epochs,
+                    # "model_param_store": pyro.get_param_store(),
+                    "model_state_dict": pyro.get_param_store().get_state(),
+                    "optimizer_state": opt.get_state(),
+                    "loss_history": factor_model.local_loss_history,
+                    "param_convergence_history": factor_model.local_var_param_convergence_history                
+                }, model_out_filename + "_local.pth")
+
+                pyro.get_param_store().save(model_out_filename + "_local_paramstore.pth")
                     
                 #################
                 # Sample from posterior
                 print('Sampling from posterior')
                 sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
                 outcome_sites = ["y"]
-                post_samples, post_samples_y = obtain_posterior_pred_samples(factor_model,
-                                                                            guide,
-                                                                            N_POSTERIOR_SAMPLES,
-                                                                            train_X_l_list_clean,
-                                                                            test_X_l_list_clean,
-                                                                            sites,
-                                                                            outcome_sites)
+                post_samples = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
+                post_samples_y = test_handler.predict(test_X_l_list_clean, N_POSTERIOR_SAMPLES, outcome_sites)
+                
+                # post_samples, post_samples_y = obtain_posterior_pred_samples(factor_model,
+                #                                                             guide,
+                #                                                             N_POSTERIOR_SAMPLES,
+                #                                                             train_X_l_list_clean,
+                #                                                             test_X_l_list_clean,
+                #                                                             sites,
+                #                                                             outcome_sites)
                     
                 
                 #################
@@ -315,7 +357,8 @@ if __name__ == "__main__":
                         rep = rep,
                         sparsity = sparsity,
                         k = k,
-                        runtime = run_minibatch
+                        runtime = run_minibatch,
+                        predict_runtime = test_run_minibatch
                         )
 
                 # Save evaluation

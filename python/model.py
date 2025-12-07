@@ -21,7 +21,7 @@ class SupMultiviewDecomp(PyroModule):
     def __init__(self, 
                  k, 
                  k_l_list,
-                 n,
+                #  n,
                  include_view_factors = False,
                  dense = True,
                  outcome = "gaussian",
@@ -44,7 +44,7 @@ class SupMultiviewDecomp(PyroModule):
                  ):
         super().__init__()
         # Model parameters
-        self.n = n
+        self.n = None
         self.k = k
         self.k_l_list = k_l_list # assumes k_l > 0 for all l
         # self.p_l = None
@@ -83,6 +83,11 @@ class SupMultiviewDecomp(PyroModule):
         self.loss_history = []
         self.var_param_convergence_history = []
         
+        self.local_epochs = 0
+        self.local_total_iters = None
+        self.local_loss_history = []
+        self.local_var_param_convergence_history = []
+        
         self.params = None
         
     def forward(self, 
@@ -115,6 +120,9 @@ class SupMultiviewDecomp(PyroModule):
         m = len(batch_idx)
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
+        # n = X_list[0].shape[0]
+        # if self.n is None:
+        #     self.n = n
         
         ########################
         # ---- Loadings --------
@@ -266,9 +274,10 @@ class SupMultiviewDecomp(PyroModule):
                 #             obs = y)
             
             if self.outcome == "gaussian":
-                pyro.sample(Sites.y, dist.Normal(outcome_structure, 
+                y = pyro.sample(Sites.y, dist.Normal(outcome_structure, 
                                             sigma_y), #.to_event(1),
                             obs = y)
+                return y
             elif self.outcome == "censored":
                 weibull = dist.Weibull(outcome_structure, outcome_concentration)
                 with mask(mask = (cens == 1)):
@@ -293,6 +302,9 @@ class SupMultiviewDecomp(PyroModule):
         m = len(batch_idx)
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
+        # n = X_list[0].shape[0]
+        # if self.n is None:
+        #     self.n = n
         
         ########################
         # ---- Loadings --------
@@ -319,8 +331,8 @@ class SupMultiviewDecomp(PyroModule):
             # tau_gamma_k_list = torch.cumprod(torch.stack(delta_gamma), dim = 0).squeeze()
                 
             # rho - local shrinkage
-            a_rho_gamma_l = self.params[Params.a_rho_gamma_l]
-            b_rho_gamma_l = self.params[Params.b_rho_gamma_l]
+            a_rho_gamma_l = self.params[Params.a_rho_gamma_l.format(l = l)]
+            b_rho_gamma_l = self.params[Params.b_rho_gamma_l.format(l = l)]
             rho_gamma = pyro.sample(Sites.rho_gamma_l.format(l = l),
                                     dist.Gamma(a_rho_gamma_l, b_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
             
@@ -466,9 +478,10 @@ class SupMultiviewDecomp(PyroModule):
                 #             obs = y)
             
             if self.outcome == "gaussian":
-                pyro.sample(Sites.y, dist.Normal(outcome_structure, 
+                y = pyro.sample(Sites.y, dist.Normal(outcome_structure, 
                                             sigma_y), #.to_event(1),
                             obs = y)
+                return y
             elif self.outcome == "censored":
                 weibull = dist.Weibull(outcome_structure, outcome_concentration)
                 with mask(mask = (cens == 1)):
@@ -489,14 +502,10 @@ class SupMultiviewDecomp(PyroModule):
         """
         m = len(batch_idx)
         p_l_list = [X_l.shape[1] for X_l in X_list]
-        # print('p_l', p_l_list)
-        # if torch.is_tensor(X):
-        #     m, p = X.shape # Working with minibatches of size m
-        # elif isinstance(X, TensorDataset): # working with full dataset directly
-        #     # print("is tensordataset")
-        #     m = len(X)
-        #     p = X[0][0].shape[0]
-        # self.p = 
+        n = X_list[0].shape[0]
+        if self.n is None:
+            self.n = n
+
         
         ########################
         # ---- Loadings --------
@@ -647,6 +656,7 @@ class SupMultiviewDecomp(PyroModule):
         m = len(batch_idx)
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
+        # n = X_list[0].shape[0]
         
         ########################
         # ---- Loadings --------
@@ -851,12 +861,16 @@ class SupMultiviewDecomp(PyroModule):
               batch_idx,
               y = None,
               cens = None):
+        print(dir(self))
+        assert self.params is not None, "Param dict is None"
+        
         if self.dense:
             raise NotImplementedError
         
         m = len(batch_idx)
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
+        # n = X_list[0].shape[0]
         
         ########################
         # ---- Loadings --------
@@ -881,8 +895,8 @@ class SupMultiviewDecomp(PyroModule):
             # b_rho_gamma_l = pyro.param(Params.b_rho_gamma_l.format(l = l), 
             #                                 torch.tensor(self.alpha_individual / 2),
             #                                 constraint = dist.constraints.positive)
-            a_rho_gamma_l = self.params[Params.a_rho_gamma_l]
-            b_rho_gamma_l = self.params[Params.b_rho_gamma_l]
+            a_rho_gamma_l = self.params[Params.a_rho_gamma_l.format(l = l)]
+            b_rho_gamma_l = self.params[Params.b_rho_gamma_l.format(l = l)]
             pyro.sample(Sites.rho_gamma_l.format(l = l),
                         dist.Gamma(a_rho_gamma_l, b_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
 
@@ -996,8 +1010,8 @@ class SupMultiviewDecomp(PyroModule):
             raise NotImplementedError
         
         # Local latent variables and observations
-        loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
-        scale_Z = pyro.param(Params.scale_Z, torch.ones(self.n, self.k),
+        loc_Z = pyro.param(Params.loc_Z, torch.zeros(n, self.k))
+        scale_Z = pyro.param(Params.scale_Z, torch.ones(n, self.k),
                                 constraint = dist.constraints.positive)
         loc_Phi_list = []
         scale_Phi_list = []

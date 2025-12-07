@@ -144,27 +144,30 @@ def extract_sim_decomp(sim_data_dict):
             "SIM_Phi_l_list": SIM_Phi_l_list
         }
     
-def obtain_posterior_pred_samples(model,
-                                guide,
+def obtain_posterior_pred_samples(#model,
+                                # guide,
+                                handler,
                                 num_samples,
                                 train_X_l_list_clean,
                                 test_X_l_list_clean,
                                 structure_return_sites,
                                 outcome_return_sites):
+    """TODO: possibly remove, handler is specific to train/test set"""
     n_train = train_X_l_list_clean[0].shape[0]
-    predictive = Predictive(model, 
-                        guide = guide, 
+    predictive = Predictive(handler.model, 
+                        guide = handler.guide, 
                         num_samples = num_samples,
                         return_sites = structure_return_sites)
     post_samples = predictive(
         train_X_l_list_clean,
         torch.arange(n_train)
         )
+    # post_samples = handler.predict(train_X_l_list_clean, structure_return_sites)
 
     # Sample posterior predictive for outcome - specify return_sites
     n_test = test_X_l_list_clean[0].shape[0]
-    predictive_y = Predictive(model, 
-                            guide = guide, 
+    predictive_y = Predictive(handler.model, 
+                            guide = handler.guide, 
                             num_samples = num_samples,
                             return_sites = outcome_return_sites)
     # Do not supply y
@@ -172,6 +175,7 @@ def obtain_posterior_pred_samples(model,
         test_X_l_list_clean,
         torch.arange(n_test)
         )
+    # post_samples_y = handler.predict(test_X_l_list_clean, outcome_return_sites)
     return (post_samples, post_samples_y)
     
     
@@ -222,7 +226,6 @@ def calc_all_structures_with_rescaling(L,
     
     POST_joint_struct_l_list = [summary.get('mean') for summary in joint_structure_summaries]
     POST_individual_struct_l_list = [summary.get('mean') for summary in individual_structure_summaries]
-    print('Sampling outcomes from posterior')
     
     
     PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples.get("y"))
