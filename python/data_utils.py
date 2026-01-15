@@ -227,8 +227,10 @@ def calc_all_structures_with_rescaling(L,
     POST_joint_struct_l_list = [summary.get('mean') for summary in joint_structure_summaries]
     POST_individual_struct_l_list = [summary.get('mean') for summary in individual_structure_summaries]
     
-    
-    PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples.get("y"))
+    if "y" in post_pred_outcome_samples.keys():
+        PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples.get("y"))
+    elif "y_pred" in post_pred_outcome_samples.keys():
+        PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples.get("y_pred"))
     PRED_y = PRED_outcome_summary.get('mean')
     
     return {

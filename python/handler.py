@@ -18,13 +18,11 @@ class ModelHandler:
                  loss = Trace_ELBO(),
                  local = False
                  ):
-        assert mode in ("train", "test"), \
-            "Argument 'mode' must be set to 'train' or 'test'. If any new observations are present, set 'test'."
+        assert mode in ("train", "predict"), \
+            "Argument 'mode' must be set to 'train' or 'predict'. If any new observations are present, set 'predict'."
             
         self.model = model
         
-        assert self.model.params is not None, "params are None"
-        print(self.model.params.keys())
         self.mode = mode
         # if local:
         #     self.forward = self.model.predict_forward
@@ -35,7 +33,7 @@ class ModelHandler:
             self.guide = self.model.guide
         # elif mode == "train_local":
         #     self.forward = self.model.
-        elif self.mode == "test":
+        elif self.mode == "predict":
             self.forward = self.model.predict_forward
             self.guide = self.model.predict_guide
         # self.guide = guide
@@ -46,7 +44,8 @@ class ModelHandler:
         return
     
     def _set_model_n(self, n):
-        self.model.n = n
+        if self.mode == "train": self.model.n = n
+        elif self.mode == "predict": self.model.n_predict = n
     
     def do_inference(self,
                      train_dataset,
@@ -61,7 +60,7 @@ class ModelHandler:
                     minibatch_flag = True,
                     minibatch_size = 32,
                     tol = 1e-4,
-                    variational_tol = 1e-4,
+                    variational_tol = 0.1,
                     variational_diff_func = np.mean,
                     device = "cpu",
                     verbose = False):
@@ -106,18 +105,22 @@ class ModelHandler:
                     # print(loss)
                     epoch_loss += loss
                 
-                self.model.loss_history.append(epoch_loss)
+                # self.model.loss_history.append(epoch_loss)
                 
                 # Determine the epoch when the min loss is obtained
                 if epoch_loss < min_loss:
                     min_loss = epoch_loss
                     epoch_at_min_loss = epoch
                 
-                self.model.total_epochs += 1
+                
+                
                 
                 # Check Euclidean norm of difference in variational params for convergence
                 param_store_curr = pyro.get_param_store()
                 if self.mode == "train":
+                    self.model.total_epochs += 1
+                    self.model.loss_history.append(epoch_loss)
+                    
                     params_epoch_curr = {k: v.detach().clone() for k, v in param_store_curr.items()}
                     if epoch == 0: 
                         params_epoch_last = params_epoch_curr
@@ -127,7 +130,15 @@ class ModelHandler:
                         variational_diff_func(list(param_diff_norm_dict.values()))
                         )
                     params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())                    
-                elif self.mode == "test":
+                    if verbose:
+                        print("--------------------")
+                        print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
+                        print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
+                        print(f"Variational parameter difference: {self.model.var_param_convergence_history[-1]}")
+                        print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
+                elif self.mode == "predict":
+                    self.model.local_epochs += 1
+                    self.model.local_loss_history.append(epoch_loss)
                     # only consider convergence in local params
                     params_epoch_curr = {k: v.detach().clone() 
                                          for k, v in param_store_curr.items()
@@ -136,14 +147,17 @@ class ModelHandler:
                         params_epoch_last = params_epoch_curr
                     param_diff_norm_dict = {k: torch.norm(params_epoch_last[k] - params_epoch_curr[k]).item() 
                                             for k in params_epoch_curr}
-                    self.model.local_var_param_convergence_history.append(variational_diff_func(param_diff_norm_dict.values()))
+                    self.model.local_var_param_convergence_history.append(
+                        variational_diff_func(list(param_diff_norm_dict.values()))
+                        )
                     params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())   
                     
                     
-                if verbose:
-                        print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
-                        print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
-                        print(f"Variational parameter difference: {self.model.var_param_convergence_history[-1]}")
+                    if verbose:
+                            print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
+                            print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
+                            print(f"Variational parameter difference: {self.model.local_var_param_convergence_history[-1]}")
+                            print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
                     
                     # Converged?
                 if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch)\
@@ -172,7 +186,7 @@ class ModelHandler:
                 num_samples,
                 return_sites):
         n = X_list[0].shape[0]
-        predictive = Predictive(self.model, 
+        predictive = Predictive(self.forward, 
                                 guide = self.guide, 
                                 num_samples = num_samples,
                                 return_sites = return_sites)
