@@ -8,7 +8,7 @@ import torch
 import pyro
 import pyro.distributions as dist
 from pyro.nn import PyroModule
-from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNormal
+# from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNormal
 from pyro.poutine import mask
 
 from constants import Sites, Params
@@ -45,6 +45,7 @@ class SupMultiviewDecomp(PyroModule):
         super().__init__()
         # Model parameters
         self.n = None
+        self.n_predict = None
         self.k = k
         self.k_l_list = k_l_list # assumes k_l > 0 for all l
         # self.p_l = None
@@ -225,6 +226,9 @@ class SupMultiviewDecomp(PyroModule):
             # outcome_concentration = pyro.sample("")
             raise NotImplementedError
         
+        # orthogonality_weight = pyro.sample("ortho_weight", dist.InverseGamma(1, 1))
+        orthogonality_weight = 100.
+        
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx):
             Z = pyro.sample(Sites.Z, dist.Normal(0., 1.).expand([self.k]).to_event(1))
@@ -238,6 +242,7 @@ class SupMultiviewDecomp(PyroModule):
             
             # Compute structures
             joint_structure_list = []
+            view_structure_list = []
             for l in range(len(X_list)):
                 joint_structure_l = pyro.deterministic(Sites.joint_structure_l.format(l = l), 
                                                        torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
@@ -247,6 +252,7 @@ class SupMultiviewDecomp(PyroModule):
                 total_structure_l = torch.add(joint_structure_l, view_structure_l)
                 
                 joint_structure_list.append(joint_structure_l)
+                view_structure_list.append(view_structure_l)
                 
                 X_l = pyro.sample(Sites.X_l.format(l = l), 
                                   dist.Normal(total_structure_l, psi_sqrt_l_list[l]).to_event(1), 
@@ -260,6 +266,16 @@ class SupMultiviewDecomp(PyroModule):
                 #                                    psi_sqrt_l_list[l]).to_event(1), 
                 #             obs = X_list[l].index_select(0, batch_idx))
             
+            # Orthogonality in structures
+            joint_structure_full = torch.cat(joint_structure_list, 1)
+            # Calculate penalty terms
+            total_penalty = torch.tensor(0.0)
+            for l in range(len(X_list)):
+                cross_prod = view_structure_list[l].T @ joint_structure_full
+                total_penalty += torch.sum(cross_prod ** 2)
+                
+            # pyro.factor("orthogonality", 
+            #             -orthogonality_weight * total_penalty)
             
             # Outcome model
             if self.include_view_factors:
@@ -274,10 +290,10 @@ class SupMultiviewDecomp(PyroModule):
                 #             obs = y)
             
             if self.outcome == "gaussian":
-                y = pyro.sample(Sites.y, dist.Normal(outcome_structure, 
+                y_pred = pyro.sample(Sites.y, dist.Normal(outcome_structure, 
                                             sigma_y), #.to_event(1),
                             obs = y)
-                return y
+                return y_pred
             elif self.outcome == "censored":
                 weibull = dist.Weibull(outcome_structure, outcome_concentration)
                 with mask(mask = (cens == 1)):
@@ -287,6 +303,7 @@ class SupMultiviewDecomp(PyroModule):
                     pyro.sample(Sites.censored, dist.Bernoulli(survival_prob), obs = 1)
             else:
                 raise NotImplementedError
+            
     
     def predict_forward(self,
                         X_list, 
@@ -430,12 +447,12 @@ class SupMultiviewDecomp(PyroModule):
             raise NotImplementedError
         
         # Local latent variables and observations
-        with pyro.plate("obs", self.n, subsample = batch_idx):
-            Z = pyro.sample(Sites.Z, dist.Normal(0., 1.).expand([self.k]).to_event(1))
+        with pyro.plate("obs_pred", self.n_predict, subsample = batch_idx):
+            Z = pyro.sample(Sites.Z_pred, dist.Normal(0., 1.).expand([self.k]).to_event(1))
             
             Phi_l_list = []
             for l, k_l in enumerate(self.k_l_list):
-                Phi_l = pyro.sample(Sites.Phi_l.format(l = l), 
+                Phi_l = pyro.sample(Sites.Phi_l_pred.format(l = l), 
                                     dist.Normal(0., 1.).expand([k_l]).to_event(1))
                 Phi_l_list.append(Phi_l)
                 
@@ -443,16 +460,16 @@ class SupMultiviewDecomp(PyroModule):
             # Compute structures
             joint_structure_list = []
             for l in range(len(X_list)):
-                joint_structure_l = pyro.deterministic(Sites.joint_structure_l.format(l = l), 
+                joint_structure_l = pyro.deterministic(Sites.joint_structure_l_pred.format(l = l), 
                                                        torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
-                view_structure_l = pyro.deterministic(Sites.view_structure_l.format(l = l),
+                view_structure_l = pyro.deterministic(Sites.view_structure_l_pred.format(l = l),
                                                     torch.matmul(Phi_l_list[l], Gamma_l_list[l].squeeze(0).T))
                 
                 total_structure_l = torch.add(joint_structure_l, view_structure_l)
                 
                 joint_structure_list.append(joint_structure_l)
                 
-                X_l = pyro.sample(Sites.X_l.format(l = l), 
+                X_l = pyro.sample(Sites.X_l_pred.format(l = l), 
                                   dist.Normal(total_structure_l, psi_sqrt_l_list[l]).to_event(1), 
                             obs = X_list[l])
                 if torch.isnan(X_l).any():
@@ -468,20 +485,20 @@ class SupMultiviewDecomp(PyroModule):
             # Outcome model
             if self.include_view_factors:
                 full_factors = torch.cat((Z, *Phi_l_list), 1)
-                outcome_structure = pyro.deterministic(Sites.outcome_structure,
+                outcome_structure = pyro.deterministic(Sites.outcome_structure_pred,
                                                     torch.matmul(full_factors, beta))
             else:
-                outcome_structure = pyro.deterministic(Sites.outcome_structure,
+                outcome_structure = pyro.deterministic(Sites.outcome_structure_pred,
                                                     torch.matmul(Z, beta))
                 # pyro.sample("y", dist.Normal(outcome_structure, 
                 #                             sigma_y), #.to_event(1),
                 #             obs = y)
             
             if self.outcome == "gaussian":
-                y = pyro.sample(Sites.y, dist.Normal(outcome_structure, 
+                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, 
                                             sigma_y), #.to_event(1),
                             obs = y)
-                return y
+                return y_pred
             elif self.outcome == "censored":
                 weibull = dist.Weibull(outcome_structure, outcome_concentration)
                 with mask(mask = (cens == 1)):
@@ -789,44 +806,70 @@ class SupMultiviewDecomp(PyroModule):
             loc_Phi_list.append(loc_Phi_l)
             scale_Phi_list.append(scale_Phi_l)
             
+        # ortho_a = pyro.param("ortho_a",
+        #                         torch.tensor(1.),
+        #                         constraint = dist.constraints.positive)
+        # ortho_b = pyro.param("ortho_b", 
+        #                         torch.tensor(1.),
+        #                         constraint = dist.constraints.positive)
+        # orthogonality_weight = pyro.sample("ortho_weight", 
+        #                                     dist.InverseGamma(ortho_a, ortho_b))
+        orthogonality_weight = 100.
+            
         with pyro.plate("obs", self.n, subsample = batch_idx):
             loc_Z_batch = loc_Z[batch_idx]
             scale_Z_batch = scale_Z[batch_idx]
             Z = pyro.sample(Sites.Z, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
             
-            # Phi_l_list = []
+            Phi_l_list = []
             for l, k_l in enumerate(self.k_l_list):
                 # loc_Z
                 loc_Phi = loc_Phi_list[l][batch_idx]
                 scale_Phi = scale_Phi_list[l][batch_idx]
                 Phi_l = pyro.sample(Sites.Phi_l.format(l = l), 
                                     dist.Normal(loc_Phi, scale_Phi).to_event(1))
-                # Phi_l_list.append(Phi_l)
+                Phi_l_list.append(Phi_l)
                 
             
-            # # Compute structures
-            # joint_structure_list = []
-            # for l in range(len(X_list)):
-            #     joint_structure_l = pyro.deterministic(f"joint_structure_l{l}", 
-            #                                            torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
-            #     view_structure_l = pyro.deterministic(f"view_structure_l{l}",
-            #                                         torch.matmul(Phi_l_list[l], Gamma_l_list[l].squeeze(0).T))
+            # Compute structures
+            joint_structure_list = []
+            view_structure_list = []
+            for l in range(len(X_list)):
+                joint_structure_l = pyro.deterministic(f"joint_structure_l{l}", 
+                                                       torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
+                view_structure_l = pyro.deterministic(f"view_structure_l{l}",
+                                                    torch.matmul(Phi_l_list[l], Gamma_l_list[l].squeeze(0).T))
                 
-            #     total_structure_l = torch.add(joint_structure_l, view_structure_l)
+                total_structure_l = torch.add(joint_structure_l, view_structure_l)
                 
-            #     joint_structure_list.append(joint_structure_l)
+                joint_structure_list.append(joint_structure_l)
+                view_structure_list.append(view_structure_l)
                 
-            #     X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
-            #                                        psi_sqrt_l_list[l]).to_event(1), 
-            #                 obs = X_list[l])
-            #     if torch.isnan(X_l).any():
-            #         print("NaN values found in X_l_tensor!")
-            #     if torch.isinf(X_l).any():
-            #         print("Inf values found in X_l_tensor!")
+            joint_structure_full = torch.cat(joint_structure_list, 1)
+                
+            # Calculate penalty terms
+            total_penalty = torch.tensor(0.0)
+            for l in range(len(X_list)):
+                # cross_prod = view_structure_list[l].T @ joint_structure_full
+                cross_prod = Phi_l_list[l].T @ Z
+                
+                total_penalty += torch.sum(cross_prod ** 2)
+                
+            pyro.factor("orthogonality", 
+                        orthogonality_weight * total_penalty,
+                        has_rsample = True)
+                
+                # X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
+                #                                    psi_sqrt_l_list[l]).to_event(1), 
+                #             obs = X_list[l])
+                # if torch.isnan(X_l).any():
+                #     print("NaN values found in X_l_tensor!")
+                # if torch.isinf(X_l).any():
+                #     print("Inf values found in X_l_tensor!")
             
-            #     # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
-            #     #                                    psi_sqrt_l_list[l]).to_event(1), 
-            #     #             obs = X_list[l].index_select(0, batch_idx))
+                # pyro.sample(f"X_l{l}", dist.Normal(total_structure_l.index_select(0, batch_idx), 
+                #                                    psi_sqrt_l_list[l]).to_event(1), 
+                #             obs = X_list[l].index_select(0, batch_idx))
             
             
             # # Outcome model
@@ -861,7 +904,7 @@ class SupMultiviewDecomp(PyroModule):
               batch_idx,
               y = None,
               cens = None):
-        print(dir(self))
+        # print(dir(self))
         assert self.params is not None, "Param dict is None"
         
         if self.dense:
@@ -1010,28 +1053,28 @@ class SupMultiviewDecomp(PyroModule):
             raise NotImplementedError
         
         # Local latent variables and observations
-        loc_Z = pyro.param(Params.loc_Z, torch.zeros(n, self.k))
-        scale_Z = pyro.param(Params.scale_Z, torch.ones(n, self.k),
+        loc_Z = pyro.param(Params.loc_Z_pred, torch.zeros(self.n_predict, self.k))
+        scale_Z = pyro.param(Params.scale_Z_pred, torch.ones(self.n_predict, self.k),
                                 constraint = dist.constraints.positive)
         loc_Phi_list = []
         scale_Phi_list = []
         for l, k_l in enumerate(self.k_l_list):
-            loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
-            scale_Phi_l = pyro.param(Params.scale_Phi_l.format(l = l), torch.ones(self.n, k_l),
+            loc_Phi_l = pyro.param(Params.loc_Phi_l_pred.format(l = l), torch.zeros(self.n_predict, k_l))
+            scale_Phi_l = pyro.param(Params.scale_Phi_l_pred.format(l = l), torch.ones(self.n_predict, k_l),
                                      constraint = dist.constraints.positive)
             loc_Phi_list.append(loc_Phi_l)
             scale_Phi_list.append(scale_Phi_l)
             
-        with pyro.plate("obs", self.n, subsample = batch_idx):
+        with pyro.plate("obs_pred", self.n_predict, subsample = batch_idx):
             loc_Z_batch = loc_Z[batch_idx]
             scale_Z_batch = scale_Z[batch_idx]
-            Z = pyro.sample(Sites.Z, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
+            Z = pyro.sample(Sites.Z_pred, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
             
             # Phi_l_list = []
             for l, k_l in enumerate(self.k_l_list):
                 # loc_Z
                 loc_Phi = loc_Phi_list[l][batch_idx]
                 scale_Phi = scale_Phi_list[l][batch_idx]
-                Phi_l = pyro.sample(Sites.Phi_l.format(l = l), 
+                Phi_l = pyro.sample(Sites.Phi_l_pred.format(l = l), 
                                     dist.Normal(loc_Phi, scale_Phi).to_event(1))
 ##############
