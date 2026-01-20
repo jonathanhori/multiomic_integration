@@ -20,6 +20,13 @@ class Sites:
     outcome_structure = "outcome_structure"
     y = "y"
     censored = "censored"
+    Z_pred = "Z_pred"
+    Phi_l_pred = "Phi_l{l}_pred"
+    joint_structure_l_pred = "joint_structure_l{l}_pred"
+    view_structure_l_pred = "view_structure_l{l}_pred"
+    X_l_pred = "X_l{l}_pred"
+    outcome_structure_pred = "outcome_structure_pred"
+    y_pred = "y_pred"
 
    
 class Params:
@@ -48,3 +55,7 @@ class Params:
     scale_Z = "scale_Z"
     loc_Phi_l = "loc_Phi_l{l}"
     scale_Phi_l = "scale_Phi_l{l}"
+    loc_Z_pred = "loc_Z_pred"
+    scale_Z_pred = "scale_Z_pred"
+    loc_Phi_l_pred = "loc_Phi_l{l}_pred"
+    scale_Phi_l_pred = "scale_Phi_l{l}_pred"
