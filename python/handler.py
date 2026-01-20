@@ -136,6 +136,7 @@ class ModelHandler:
                         print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
                         print(f"Variational parameter difference: {self.model.var_param_convergence_history[-1]}")
                         print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
+                        print(f"Params converged? {str(params_converged)}")
                 elif self.mode == "predict":
                     self.model.local_epochs += 1
                     self.model.local_loss_history.append(epoch_loss)
@@ -150,7 +151,10 @@ class ModelHandler:
                     self.model.local_var_param_convergence_history.append(
                         variational_diff_func(list(param_diff_norm_dict.values()))
                         )
-                    params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())   
+                    param_converge_metric = variational_diff_func(param_diff_norm_dict.values())
+                    params_converged = self.model.local_var_param_convergence_history[-1] < variational_tol
+                    # param_converge_metric < variational_tol
+                    # params_converged = variational_diff_func(n < variational_tol for n in param_diff_norm_dict.values())   
                     
                     
                     if verbose:
@@ -158,6 +162,7 @@ class ModelHandler:
                             print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
                             print(f"Variational parameter difference: {self.model.local_var_param_convergence_history[-1]}")
                             print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
+                            # print(f"Variational param Param convergence metric: ")
                     
                     # Converged?
                 if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch)\
