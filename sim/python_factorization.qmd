@@ -5,18 +5,38 @@ jupyter: python3
 ```{python}
 import os
 import sys
+```
+
+```{python}
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+# r_home = "/Library/Frameworks/R.framework/Resources"
+```
+
+```{python}
+os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ["PATH"]
+os.environ['PATH']
+```
+
+```{python}
+import shutil
+```
+
+```{python}
+
 
 import rpy2.robjects as robjects
 from rpy2.robjects import r, vectors
 from rpy2 import rinterface
 
 import pandas as pd
+import numpy as np
 import seaborn as sns
 import itertools
 
 from rpy2.robjects import pandas2ri, default_converter, conversion
 
 import torch
+from torch.utils.data import TensorDataset
 from torchvision import transforms
 import pyro
 import pyro.distributions as dist
@@ -25,13 +45,17 @@ from pyro.infer import SVI, Trace_ELBO, RBFSteinKernel
 
 import importlib
 
+# import sklearn
+from sklearn.model_selection import train_test_split
+
+
 from pathlib import Path
 import time
 ```
 
 ```{python}
 #| label: Insert path
-sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/python")
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 ```
 
 ```{python}
@@ -41,16 +65,21 @@ sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~Cloud
 # from data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition, normalize_tensor_by_col, extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, eval_rse, eval_mse, summarise_post_samples, summarise_structure_list, eval_post_coverage, eval_credible_interval, obtain_posterior_pred_samples, calc_all_structures_with_rescaling, eval_performance
 from data_utils import r_to_torch, normalize_tensor_by_col, \
     zero_variance_col_filter, obtain_posterior_pred_samples, \
-        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance
+        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance, varimax, align_tensor_shapes
 ```
 
 ```{python}
 #| label: Load model objects
-# importlib.reload(sys.modules["model"])
+# importlib.reload(sys.modules["matrix_decomp"])
+# importlib.reload(sys.modules["handler"])
 
 from matrix_decomp import MatrixDecomp
 from handler import ModelHandler
 # from model import SupMultiviewDecomp, do_inference
+```
+
+```{python}
+from constants import Params, Sites
 ```
 
 # Load data
@@ -62,7 +91,7 @@ conversion._converter = None
 conversion.set_conversion(default_converter)
 readRDS = robjects.r['readRDS']
 
-sim_data = readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/single_view/factor_data_n1000p500_snr2.2_sparse0.25.rds')
+sim_data = readRDS('~/multiomic_integration/sim/data/single_view/factor_data_n500p1000_snr2.2_sparse0.25.rds')
 # sim_data = readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/simple_data/factor_data_n2000p10000_snr2.2.rds')
         
 ```
@@ -80,262 +109,50 @@ sim_data_torch
 ```
 
 ```{python}
-# os.path.isdir(os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n50p100_snr2.2_sparse0"))
-# os.path.isdir("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3")
+sim_data_torch
 ```
-
-## Load multiview data
-
-```{python}
-conversion.set_conversion(default_converter)
-readRDS = robjects.r['readRDS']
-# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p100_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
-# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n50p50_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
-# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p1000_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
-# n50p50_snr2.2_sparse0_rep1
-```
-
-```{python}
-conversion.set_conversion(default_converter)
-readRDS = robjects.r['readRDS']
-sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/n50p50_snr2.2_sparse0.5/sim_data_ywithview_rep3.rds')
-
-
-# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/n500p100_snr2.2_sparse0.25/sim_data_ywithview_rep1.rds')
-
-
-# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n50p50_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
-# sim_data_multiview = readRDS('/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/n500p1000_snr2.2_sparse0/sim_data_ywithview_rep1.rds')
-# n50p50_snr2.2_sparse0_rep1
-```
-
-
-```{python}
-conversion.set_conversion(default_converter)
-
-sim_data_multiview_torch = {name: r_to_torch(sim_data_multiview.rx2(name)) for name in sim_data_multiview.names}
-
-sim_data_multiview_torch
-```
-
 
 ```{python}
 sns.heatmap(
-sim_data_multiview_torch.get('Lambda_l')[0],
-cmap="coolwarm"
+    sim_data_torch.get('Lambda_l')[0],
+    cmap="coolwarm"
 )
 ```
 
 
-```{python}
-sum((sim_data_multiview_torch.get('Lambda_l')[0] == 0).flatten()).item() / (sim_data_multiview_torch.get('Lambda_l')[0] == 0).flatten().size()[0]
-```
-
-## Load data from path
-```{python}
-sim_data_path = "~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data3/"
-
-# Absolute paths to directories containing dataset replicates
-dirs = [os.path.join(sim_data_path, dir) \
-    for dir in os.listdir(os.path.expanduser(sim_data_path)) \
-        if os.path.isdir(os.path.expanduser(os.path.join(sim_data_path, dir)))]
-
-dirs[0:5]
-```
-
-```{python}
-filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in dirs}
-```
-
-
-```{python}
-
-files_for_condition = load_and_process_rds_data_for_condition("n100p100_snr2.2_sparse0", 
-    sim_data_path, 
-    filename_dict,
-    1)
-```
-
-```{python}
-sim_data = files_for_condition.get("sim_data_ywithview_rep1")
-```
-
-```{python}
-
-print(files.get("sim_data_ywithview_rep1"))
-```
-```{python}
-dirs[0]
-filename_dict.keys()
-```
-
-```{python}
-files.get("sim_data_ywithview_rep1")
-```
-
-```{python}
-files_for_condition.get("sim_data_ywithview_rep1").get("X_l")
-```
-
-Example of how to load data from imported RDS object
-
-
-```{python}
-# conversion._converter = None
-# conversion.set_conversion(default_converter)
-
-# y = sim_data.rx2("y")
-# y = torch.tensor(y)
-
-# y.shape
-
-# input_dims = [tuple(robjects.r['dim'](x)) for x in sim_data.rx2("X_l")]
-
-# conversion.set_conversion(default_converter)
-# X_l_list = [torch.reshape(torch.tensor(X_l), dim[::-1]).t() for X_l, dim in zip(sim_data.rx2("X_l"), input_dims)]
-```
-
-```{python}
-sim_data_multiview_torch.keys()
-```
-
-## Extract and clean
-```{python}
-#| label: Extract features to use
-
-
-X_l_list = sim_data_multiview_torch.get("X_l")
-X_l_list
-
-y = sim_data_multiview_torch.get("y")
-y
-
-k = sim_data_multiview_torch.get("K")
-k_l_list = sim_data_multiview_torch.get("K_l")
-
-n = X_l_list[0].shape[0]
-```
-
-```{python}
-
-
-
-[X[:, zero_variance_col_filter(X)].shape for X in X_l_list]
-```
-
-
-```{python}
-X_l_list_column_filters = [zero_variance_col_filter(X) for X in X_l_list]
-X_l_list = [X[:, col_filter] for X, col_filter in zip(X_l_list, X_l_list_column_filters)]
-
-clean_X_dict_list = list(map(normalize_tensor_by_col, X_l_list))
-
-X_l_list_clean = [clean["data_clean"] for clean in clean_X_dict_list]
-
-X_l_mean_list = [clean["means"] for clean in clean_X_dict_list]
-X_l_sd_list = [clean["sds"] for clean in clean_X_dict_list]
-
-y_mean = torch.mean(y)
-y_std = torch.std(y)
-y_clean = (y - y_mean) / y_std
-```
-
-```{python}
-[X.shape for X in X_l_list_clean]
-```
-
-```{python}
-torch.isnan(X_l_list[0]).any()
-```
-
-Single tensor data
-
-
-```{python}
-clean_data_dict = normalize_tensor_by_col(X)
-# X_clean = clean_data_dict.get("data_clean")
-# X_means = clean_data_dict.get("means")
-# X_stds = clean_data_dict.get("sds")
-# torch.mean(X_clean, 0)
-
-```
-
-
-```{python}
-# For each view, check columns 8 and 17
-for l, X_l in enumerate(X_l_list):
-    print(f"\n=== View {l} ===")
-    if X_l.shape[1] > 8:
-        print(f"Column 8 - mean: {X_l[:, 8].mean():.4f}, std: {X_l[:, 8].std():.4f}")
-        print(f"  min: {X_l[:, 8].min():.4f}, max: {X_l[:, 8].max():.4f}")
-        print(f"  Has NaN: {torch.isnan(X_l[:, 8]).any()}")
-        print(f"  Has Inf: {torch.isinf(X_l[:, 8]).any()}")
-        print(f"  All zeros: {(X_l[:, 8] == 0).all()}")
-        print(f"  Constant: {X_l[:, 8].std() < 1e-10}")
-    
-    if X_l.shape[1] > 17:
-        print(f"Column 17 - mean: {X_l[:, 17].mean():.4f}, std: {X_l[:, 17].std():.4f}")
-        print(f"  min: {X_l[:, 17].min():.4f}, max: {X_l[:, 17].max():.4f}")
-        print(f"  Has NaN: {torch.isnan(X_l[:, 17]).any()}")
-        print(f"  Has Inf: {torch.isinf(X_l[:, 17]).any()}")
-        print(f"  All zeros: {(X_l[:, 17] == 0).all()}")
-        print(f"  Constant: {X_l[:, 17].std() < 1e-10}")
-```
-
-### Debugging minibatches with data loader
-
-```{python}
-loader = torch.utils.data.DataLoader(X_l_list_tensordataset, batch_size = 2)
-one_batch = next(iter(loader))
-one_batch
-```
-
-```{python}
-# for batch in loader:
-#     print(batch)
-indx = one_batch.pop(0)
-y = one_batch.pop(-1)
-```
-
-```{python}
-y.squeeze()
-```
-
-```{python}
-one_batch
-```
-
-Process entire RDS file
-
-```{python}
-conversion.set_conversion(default_converter)
-[floatmatrix_to_torch(x[1]) for x in sim_data.items()]
-```
-
-```{python}
-conversion.set_conversion(default_converter)
-[name for name in sim_data.names()]
-```
-
-```{python}
-conversion.set_conversion(default_converter)
-X = floatmatrix_to_torch(next(sim_data.items())[1])
-# X = 
-```
-
+### Extract single view data
 ```{python}
 X = sim_data_torch["X_l"][0]
+col_filter = zero_variance_col_filter(X)
+
+X_summaries = normalize_tensor_by_col(X[:, col_filter])
+
+X_clean = X_summaries['data_clean']
+
 k = int(sim_data_torch["K"].item())
 n = X.shape[0]
 ```
 
 ```{python}
-print(X.shape)
+X_summaries.keys()
+```
+
+```{python}
+torch.isfinite(X).all()
+torch.isfinite(X_clean).all()
+```
+
+```{python}
+print(X_clean.shape)
 print(k)
 print(n)
 ```
 
 
+```{python}
+train_subset = TensorDataset(torch.arange(X_clean.shape[0]), 
+                                         X_clean)
+```
 
 
 
@@ -344,7 +161,6 @@ print(n)
 ```{python}
 import importlib
 ```
-
 
 
 
@@ -361,53 +177,21 @@ one_batch.shape
 
 # Visualize model structure
 
-### SupMultiviewDecomp
+## MatrixDecomp
 ```{python}
-factor_model = SupMultiviewDecomp(int(k), k_l_list.int().tolist(), n, dense = False)
-
+factor_model = MatrixDecomp(k)
+factor_model.n = X_clean.shape[0]
 pyro.render_model(
     factor_model, #bayesian_factor_model, 
-    model_args = (X_l_list,
-                  torch.arange(X_l_list[0].shape[0]),
-                  y
+    model_args = (X_clean,
+                  torch.arange(X_clean.shape[0])
     ),
     render_distributions=True, 
     render_params=True,
     render_deterministic = True)
 ```
 
-### FactorModelARD
-```{python}
-factor_model = FactorModelARD(k, n)
-pyro.render_model(
-    factor_model, #bayesian_factor_model, 
-    model_args = (X,
-                  torch.arange(X.shape[0])
-    ),
-    render_distributions=True, 
-    render_params=True,
-    render_deterministic = True)
-```
 
-```{python}
-pyro.clear_param_store()
-```
-
-```{python}
-
-# X = one_batch
-# k = 5
-n = X.shape[0]
-```
-
-
-```{python}
-pyro.get_param_store().get_all_param_names()
-```
-
-```{python}
-pyro.clear_param_store()
-```
 
 
 
@@ -415,55 +199,27 @@ pyro.clear_param_store()
 
 ## Run model: with minibatching
 
-### SupMultiviewDecomp
-
-
-```{python}
-delta_joint = []
-# rho_joint = []
-for k in range(5):
-    shape = 2.1 if k == 0 else 3.2
-    delta_k = pyro.sample(f"delta_joint_k{k}", dist.Gamma(shape, 1.0))
-    delta_joint.append(delta_k)
-```
-
-```{python}
-tau_joint = torch.cumprod(torch.stack(delta_joint), dim = 0)
-```
-
-```{python}
-rho_joint = pyro.sample(f'rho_joint', 
-                                dist.Gamma(3 / 2, 3 / 2).expand([10, 5]))
-rho_joint
-# torch.stack(rho_joint)
-```
-
-```{python}
-sigma_lambda_l = (rho_joint * tau_joint).pow_(-0.5)
-```
-
-```{python}
-Lambda_l = pyro.sample(f"Lambda_l{0}", dist.Normal(torch.zeros(10, 5), sigma_lambda_l).to_event(2))
-```
-
-```{python}
-Lambda_l
-```
+### MatrixDecomp
 
 Check trace for data dimensions
 
 ```{python}
 
-trace = pyro.poutine.trace(
-    SupMultiviewDecomp(
-    int(k),
-    k_l_list.int().tolist(),
-    n
+loader = torch.utils.data.DataLoader(train_subset, batch_size = train_subset.__len__())
+one_batch = next(iter(loader))
+factor_model = MatrixDecomp(
+        int(k),
+        dense = False
     )
-    ).get_trace(X_l_list,
-                #   torch.arange(32), #
-                  torch.arange(X_l_list[0].shape[0]),
-                  y.squeeze())
+factor_model.n = train_subset.__len__()
+
+trace = pyro.poutine.trace(
+    factor_model
+    ).get_trace(
+        one_batch[1],
+        one_batch[0])
+        # X_clean,
+        # torch.arange(X_clean.shape[0]))
 
 trace.compute_log_prob() # optional, but allows printing of log_prob shapes
 
@@ -471,64 +227,37 @@ print(trace.format_shapes())
 ```
 
 
-ClippedAdam with learning rate decay.
-Start lr = 0.001. Over 1000 epochs 
-
+```{python}
+factor_model.n
+```
 
 ```{python}
-
-# hyperparam = 5.0
-factor_model = SupMultiviewDecomp(
-    int(k),
-    k_l_list.int().tolist(),
-    n,
-    include_view_factors = True,
-    dense = False#,
-    # a_sigma_joint=hyperparam, # Hyperparams: gamma process prior per factor loadings
-    # b_sigma_joint=hyperparam,
-    # a_sigma_view=hyperparam, # Hyperparams: gamma process prior per factor loadings
-    # b_sigma_view=hyperparam,
-    # a_psi=hyperparam, # Hyperparams: per-view error: IG same for all views
-    # b_psi=hyperparam
-)
-
-def subsample_create_plates(X, batch_idx, y = None):
-    # m = len(batch_idx)
-    return pyro.plate("obs", factor_model.n, subsample = batch_idx)
-# guide = factor_model.guide
-
-guide = pyro.infer.autoguide.AutoNormal(
-    factor_model, 
-    create_plates = subsample_create_plates)
-
 pyro.clear_param_store()
-
 
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 1000
 initial_lr = 0.005 
-
 gamma = 0.1  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
+LOSS = Trace_ELBO(num_particles = 2)
 
-OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-LOSS = Trace_ELBO(num_particles = 1)
+k_upper = int(k) + 10
+
+factor_model = MatrixDecomp(k_upper)
+train_handler = ModelHandler("train", factor_model, OPT, LOSS)
 
 t0 = time.time()
-svi, opt = do_inference(
-    X_l_list_clean,
-    y_clean,
-    factor_model,
-    guide,
-    opt = OPT,
-    elbo = LOSS,
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
     inference = "svi",
     tol = 0.5, # tolerance is epoch loss per datum
-    variational_tol = 0.3,
-    min_epochs = 20,
+    variational_tol = 0.2,
+    min_epochs = 30,
     epochs = NUM_EPOCHS,
     minibatch_flag = True,
     minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
     verbose = True
     )
 
@@ -538,81 +267,41 @@ print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epoc
 ```
 
 
+## Run model with loading target
+
+
 ```{python}
-# pyro.set_rng_seed(41)
+# TARGET = sim_data_torch.get('Lambda_l')[0][col_filter, :]
+```
+```{python}
 pyro.clear_param_store()
-hyperparam = 2.0
-factor_model = SupMultiviewDecomp(
-    int(k),
-    k_l_list.int().tolist(),
-    n,
-    include_view_factors = True,
-    dense = True,
-    a_sigma_joint=hyperparam, # Hyperparams: gamma process prior per factor loadings
-    b_sigma_joint=hyperparam,
-    a_sigma_view=hyperparam, # Hyperparams: gamma process prior per factor loadings
-    b_sigma_view=hyperparam,
-    a_psi=hyperparam, # Hyperparams: per-view error: IG same for all views
-    b_psi=hyperparam
-)
-
-predictive_prior = pyro.infer.Predictive(factor_model, num_samples=10)
-samples = predictive_prior(X_l_list_clean, torch.arange(n))
-```
-
-```{python}
-sim_data_multiview_torch['Lambda_l']
-# torch.isnan(samples['X_l1'][0]).any()
-```
-
-```{python}
-samples.keys()
-```
-
-```{python}
-samples['X_l1'][1]
-```
-
-Using SVGD
-
-```{python}
-factor_model = SupMultiviewDecomp(
-    int(k),
-    k_l_list.int().tolist(),
-    n,
-    include_view_factors = True,
-    dense = False
-)
-
-pyro.clear_param_store()
-
 
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 1000
 initial_lr = 0.005 
-
 gamma = 0.1  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
+LOSS = Trace_ELBO(num_particles = 2)
 
-OPT = Adam({"lr": initial_lr})
-# OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-kernel = RBFSteinKernel()
+k_upper = int(k) + 10
+TARGET = sim_data_torch.get('Lambda_l')[0][col_filter, :]
+
+factor_model = MatrixDecomp(k_upper, 
+                            loading_target = TARGET)
+train_handler = ModelHandler("train", factor_model, OPT, LOSS)
 
 t0 = time.time()
-svi, opt = do_inference(
-    X_l_list_clean,
-    y_clean,
-    factor_model,
-    kernel,
-    opt = OPT,
-    # elbo = LOSS,
-    inference = "svgd",
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
+    inference = "svi",
     tol = 0.5, # tolerance is epoch loss per datum
-    variational_tol = 0.3,
-    min_epochs = 10,
+    variational_tol = 0.2,
+    min_epochs = 30,
     epochs = NUM_EPOCHS,
     minibatch_flag = True,
     minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
     verbose = True
     )
 
@@ -621,45 +310,11 @@ run_minibatch = t1 - t0
 print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
 ```
 
+### Ignore_________
 ```{python}
-params1 = pyro.get_param_store()
-params2 = pyro.get_param_store()
-# pa
-param_diff_norm_dict = {k: torch.norm(params1[k] - params2[k]).item() for k in pyro.get_param_store()}
-```
+# OLD VERSION
 
-```{python}
-
-```
-
-```{python}
-all(n < 0.01 for n in param_diff_norm_dict.values())
-```
-
-```{python}
-params1['AutoNormal.locs.Lambda_l1']
-```
-
-### FactorModelARD
-```{python}
-# X_clean.shape
-# X_dataset = torch.utils.data.TensorDataset(torch.arange(X_clean.shape[0]), X_clean)
-```
-
-```{python}
-# loader = torch.utils.data.DataLoader(X_dataset, batch_size = 32, shuffle = True, drop_last=True)
-```
-
-```{python}
-# for batch in loader:
-#     # print(idx)
-#     print(batch)
-```
-
-
-```{python}
-
-factor_model = FactorModelARD(k, n)
+factor_model = MatrixDecomp(k)
 
 def subsample_create_plates(X, batch_idx):
     # m = len(batch_idx)
@@ -949,6 +604,54 @@ sim_data_multiview_torch.get('Lambda_l')[0]
 
 # Evaluate
 ## Evaluate latent structure reconstruction
+
+### New
+```{python}
+L = int(sim_data_torch.get("L"))
+sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
+outcome_sites = ["y"]
+
+post_samples = train_handler.predict(train_X_l_list_clean, 100, sites)
+post_samples_y_train = train_handler.predict(train_X_l_list_clean, 100, outcome_sites)
+post_samples_y = train_handler.predict(test_X_l_list_clean, 100, outcome_sites)
+```
+
+```{python}
+SIM_decomp = extract_sim_decomp(sim_data_multiview_torch)
+                
+# Filter corresponding rows of test set structures
+train_SIM_decomp = {k: v for k, v in SIM_decomp.items()}
+train_SIM_decomp['SIM_Z'] = train_SIM_decomp['SIM_Z'][train_idx, :]
+train_SIM_decomp['SIM_Phi_l_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_list']]
+
+eval_structures = calc_all_structures_with_rescaling(L,
+                                                    X_l_list_column_filters,
+                                                    X_l_mean_list,
+                                                    X_l_sd_list,
+                                                    post_samples,
+                                                    post_samples_y,
+                                                    train_SIM_decomp,
+                                                    # train_y_clean.squeeze()) 
+                                                    test_y_clean.squeeze())
+
+eval_structures_train = calc_all_structures_with_rescaling(L,
+                                                    X_l_list_column_filters,
+                                                    X_l_mean_list,
+                                                    X_l_sd_list,
+                                                    post_samples,
+                                                    post_samples_y_train,
+                                                    train_SIM_decomp,
+                                                    # train_y_clean.squeeze()) 
+                                                    train_y_clean.squeeze())
+```
+
+```{python}
+eval_metric_table = eval_performance(**eval_structures)
+# eval_metric_table = eval_performance(**eval_structures_train)
+eval_metric_table 
+```
+
+
 ### SupMultiviewDecomp
 
 Using full helper functions
@@ -1146,6 +849,41 @@ sns.regplot(x = PRED_y.tolist(), y = y_clean.squeeze().tolist(), scatter = False
 ```
 
 ### FactorModelARD
+
+
+```{python}
+# num_to_pad = pyro.param(Params.loc_Lambda_l.format(l = 0)).shape[1] - sim_data_torch["Lambda_l"][0].shape[1]
+# torch.nn.functional.pad(sim_data_torch["Lambda_l"][0], (0, num_to_pad)).shape
+
+
+```
+
+```{python}
+# align_tensor_shapes(pyro.param(Params.loc_Lambda_l.format(l = 0)),
+# sim_data_torch["Lambda_l"][0]).shape
+```
+
+```{python}
+def evaluate_matrix_decomp(sim_Z, sim_Lambda, est_Z, est_Lambda, means, sds, col_filter):
+    Struct_est = est_Z @ est_Lambda.T
+    Struct_sim = sim_Z @ sim_Lambda.T
+
+    Struct_sim_rescaled = (Struct_sim[:,col_filter] - means) / sds
+
+    return torch.norm(Struct_sim_rescaled - Struct_est) ** 2 / torch.norm(Struct_sim_rescaled) ** 2
+
+```
+
+```{python}
+evaluate_matrix_decomp(sim_Z = sim_data_torch["Z"],
+                    sim_Lambda = sim_data_torch["Lambda_l"][0],
+                    est_Z = pyro.param("Z_loc"),
+                    est_Lambda = pyro.param(Params.loc_Lambda_l.format(l = 0)),
+                    means = X_summaries['means'],
+                    sds = X_summaries['sds'],
+                    col_filter = col_filter              
+    )
+```
 With AutoNormal guide
 ```{python}
 Lambda_est = pyro.param("AutoNormal.locs.Lambda")
@@ -1155,9 +893,13 @@ Z_est
 
 With custom guide
 ```{python}
-Lambda_est = pyro.param("Lambda_loc")
+Lambda_est = pyro.param(Params.loc_Lambda_l.format(l = 0)) #"Lambda_loc")
 Z_est = pyro.param("Z_loc")
 Z_est
+```
+
+```{python}
+Lambda_est
 ```
 
 ```{python}
@@ -1179,7 +921,12 @@ torch.std(Struct_est, 0)
 Rescaled structure to have ORIGINAL mean and variance
 
 ```{python}
-Struct_est_rescaled = (Struct_est * X_stds) + X_means
+
+```
+
+```{python}
+Struct_est_rescaled = (Struct_est * X_summaries['sds']) + X_summaries['means']
+# Struct_est_rescaled = (Struct_est * X_stds) + X_means
 Struct_est_rescaled
 ```
 
@@ -1193,7 +940,7 @@ Struct_sim
 Rescaled to have mean 0 and variance 1
 ```{python}
 # Struct_sim_rescaled = (Struct_sim * X_stds) + X_means
-Struct_sim_rescaled = (Struct_sim - X_means) /  X_stds
+Struct_sim_rescaled = (Struct_sim[:,col_filter] - X_summaries['means']) /  X_summaries['sds']
 Struct_sim_rescaled
 ```
 
@@ -1223,9 +970,90 @@ torch.norm(Struct_sim_rescaled - Struct_est) ** 2 / torch.norm(Struct_sim_rescal
 ```
 
 ```{python}
-torch.norm(Struct_sim - Struct_est_rescaled) ** 2 / torch.norm(Struct_sim) ** 2
+# torch.norm(Struct_sim - Struct_est_rescaled) ** 2 / torch.norm(Struct_sim) ** 2
 ```
 
+### Loading interpretation
+
+```{python}
+sns.heatmap(
+    Lambda_est.detach().numpy(),
+    cmap="coolwarm"
+)
+```
+
+```{python}
+Lambda_est_rotated = varimax(Lambda_est.detach().numpy())
+```
+
+```{python}
+sns.heatmap(
+    Lambda_est_rotated,
+    cmap="coolwarm"
+)
+```
+
+```{python}
+sns.relplot(
+    np.sum(Lambda_est.detach().numpy() ** 2, axis = 0),
+    # np.sum(Lambda_est_rotated ** 2, axis = 0),
+    kind="line"
+    )
+```
+
+```{python}
+# Lambda_est_svd = np.linalg.svd(Lambda_est_rotated)
+Lambda_est_svd = np.linalg.svd(Lambda_est.detach().numpy())
+np.cumsum(Lambda_est_svd.S ** 2) / sum(Lambda_est_svd.S ** 2)
+```
+
+```{python}
+Lambda_est_trunc = Lambda_est_svd.U[:,0:5] @ np.diag(Lambda_est_svd.S[0:5]) @ Lambda_est_svd.Vh[0:5, :]
+```
+
+```{python}
+sns.heatmap(
+    Lambda_est_trunc,
+    cmap="coolwarm"
+)
+```
+
+```{python}
+np.nonzero(Lambda_est_trunc[0,])
+```
+
+```{python}
+Lambda_est_svd.Vh.shape
+```
+When does variance explained decrease?
+```{python}
+Lambda_est_rotated
+Lambda_colsums = np.sum(Lambda_est_rotated ** 2, axis = 0)
+# Lambda_colsums = np.sum(Lambda_est.detach().numpy() ** 2, axis = 0)
+Lambda_totalsum = np.sum(Lambda_colsums)
+sns.relplot(
+    Lambda_colsums / Lambda_totalsum,
+    # np.sum(Lambda_est_rotated ** 2, axis = 0),
+    kind="line"
+    )
+```
+
+When does tau become large?
+```{python}
+delta_sites = [Sites.delta_lambda_l_k.format(l = 0, m = m) for m in range(k_upper)]
+delta_post_samples = train_handler.predict([X_clean], 100, delta_sites)
+```
+
+```{python}
+delta_means = [np.mean(delta_post_samples[site].squeeze().tolist()) for site in delta_sites]
+# delta_post_samples.items() #['delta_lambda_l0_k0'].shape
+sns.relplot(1 / np.cumprod(delta_means), kind = "scatter")
+```
+
+```{python}
+# np.mean(1 / (delta_post_samples[delta_sites[0]]).squeeze().tolist())
+# 1 / (delta_post_samples[delta_sites[0]])
+```
 
 # Predict 
 
