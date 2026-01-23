@@ -43,6 +43,8 @@ class SupMultiviewDecomp(PyroModule):
                  b_sigma_beta = 2.0
                  ):
         super().__init__()
+        
+        self.model_type = "SupMultiviewDecomp"
         # Model parameters
         self.n = None
         self.n_predict = None
