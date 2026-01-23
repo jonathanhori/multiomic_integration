@@ -26,28 +26,34 @@ from sklearn.model_selection import train_test_split
 from pathlib import Path
 import time
 
-sys.path.insert(1, "/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/python")
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
 from data_utils import load_and_process_rds_data_for_condition, normalize_tensor_by_col, \
     zero_variance_col_filter, obtain_posterior_pred_samples, \
         calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance
-from model import SupMultiviewDecomp, do_inference
+from model import SupMultiviewDecomp
 from handler import ModelHandler
+from constants import Sites, Params
 
 
-sim_data_path = "~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/data/"
+train_sim_data_path = "~/multiomic_integration/sim/data/train/"
+test_sim_data_path = "~/multiomic_integration/sim/data/test/"
 
 # Absolute paths to directories containing dataset replicates
-dirs = [os.path.join(sim_data_path, dir) \
-    for dir in os.listdir(os.path.expanduser(sim_data_path)) \
-        if os.path.isdir(os.path.expanduser(os.path.join(sim_data_path, dir)))]
+dirs = [os.path.join(train_sim_data_path, dir) \
+    for dir in os.listdir(os.path.expanduser(train_sim_data_path)) \
+        if os.path.isdir(os.path.expanduser(os.path.join(train_sim_data_path, dir)))]
+test_dirs = [os.path.join(test_sim_data_path, dir) \
+    for dir in os.listdir(os.path.expanduser(test_sim_data_path)) \
+        if os.path.isdir(os.path.expanduser(os.path.join(test_sim_data_path, dir)))]
 
 # dirs[0:5]
 
 filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in dirs}
+test_filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in test_dirs}
 
 RANDOM_SEED = 123
-TRAINING_SPLIT = True
+TRAINING_SPLIT = False
 TRAINING_SIZE = 0.8
 
 n_array = (50, 100, 500) #, 1000)
@@ -69,11 +75,14 @@ sim_grid = itertools.product(
     # [loading_sparsity]
 )
 
-N_POSTERIOR_SAMPLES = 1000
+N_POSTERIOR_SAMPLES = 500
 TOL = 1
 VARIATIONAL_TOL = 0.3
 MINIBATCH_SIZE = 32
-MIN_EPOCHS = 20
+MINIBATCH_SIZE_LOW = 16
+MIN_EPOCHS = 100
+MIN_EPOCHS_HIGH = 500
+MIN_EPOCHS_LOCAL = 100
 NUM_EPOCHS = 1000
 initial_lr = 0.005
 
@@ -83,10 +92,10 @@ lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
 file_dir_base = "n{}p{}_snr{}.{}_sparse{}" #/sim_data_ywithview_rep{}.rds"
 file_name_base = "sim_data_ywithview_rep{}"
 
-model_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/models")
+model_out_path = os.path.expanduser("~/multiomic_integration/sim/results/integration/models")
 model_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_deltak{}_rep{}"
 
-metric_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/metrics")
+metric_out_path = os.path.expanduser("~/multiomic_integration/sim/results/integration/metrics")
 metric_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_deltak{}_rep{}"
 
 # Create output paths if don't exist
@@ -114,9 +123,15 @@ if __name__ == "__main__":
         # file_name_base.format(n, p, snr_x, snr_y, sparsity) #, rep)
         files_for_condition = load_and_process_rds_data_for_condition(
             file_dir_base.format(n, p, snr_x, snr_y, sparsity), # "n100p100_snr2.2_sparse0", 
-            sim_data_path, # loaded above
+            train_sim_data_path, # loaded above
             filename_dict, # loaded above
             reps) # how many reps to import
+        if not TRAINING_SPLIT:
+            test_files_for_condition = load_and_process_rds_data_for_condition(
+                file_dir_base.format(n, p, snr_x, snr_y, sparsity), # "n100p100_snr2.2_sparse0", 
+                test_sim_data_path, # loaded above
+                test_filename_dict, # loaded above
+                reps) # how many reps to import
         
         # print("Files for sim configuration:")
         # print(files_for_condition.keys())
@@ -136,13 +151,22 @@ if __name__ == "__main__":
             # Setup replicate data
             print(file_name_base.format(rep))
             sim_data = files_for_condition.get(file_name_base.format(rep))
+            sim_data_test = test_files_for_condition.get(file_name_base.format(rep))
             
             L = int(sim_data.get("L"))
+            
             X_l_list = sim_data.get("X_l")
             y = sim_data.get("y")
+            
+            X_l_list_test = sim_data_test.get("X_l")
+            y_test = sim_data_test.get("y")
+            
             k = int(sim_data.get("K") + k_delta)
             k_l_list = [int(k_l + k_delta) for k_l in sim_data.get("K_l").int().tolist()]
+            
             n = X_l_list[0].shape[0]
+            n_test = X_l_list_test[0].shape[0]
+            
             p_l = int(sim_data.get("p_l")[0])
             
             # Perform train/test split if necessary
@@ -160,13 +184,13 @@ if __name__ == "__main__":
                 test_y = y[test_idx]
             else:
                 train_idx = torch.arange(n)
-                test_idx = torch.arange(n)
+                test_idx = torch.arange(n_test)
                 
                 train_X_l_list = X_l_list
-                test_X_l_list = train_X_l_list
+                test_X_l_list = X_l_list_test
                 
                 train_y = y
-                test_y = train_y
+                test_y = y_test
 
             # Clean: remove 0 variance columns and standardize. Using Training data            
             X_l_list_column_filters = [zero_variance_col_filter(X) for X in train_X_l_list]
@@ -225,21 +249,22 @@ if __name__ == "__main__":
                                          LOSS)
             
             try:
+                # if n is small, use more epochs
+                if n == 50: 
+                    epochs = MIN_EPOCHS_HIGH
+                    mini = MINIBATCH_SIZE_LOW
+                else: 
+                    epochs = MIN_EPOCHS
+                    mini = MINIBATCH_SIZE
+                    
                 t0 = time.time()
-                svi, opt = train_handler.do_inference(
-                    # X_l_list_clean,
-                    # y_clean,
+                svi = train_handler.do_inference(
                     train_subset,
-                    # model = factor_model,
-                    # guide = guide,
-                    # opt = OPT,
-                    # elbo = LOSS,
-                    # tol = TOL, # tolerance is on epoch loss per datum,
                     variational_tol = VARIATIONAL_TOL,
-                    min_epochs = MIN_EPOCHS,
+                    min_epochs = epochs,
                     epochs = NUM_EPOCHS,
                     minibatch_flag = True,
-                    minibatch_size = MINIBATCH_SIZE,
+                    minibatch_size = mini,
                     verbose = False
                     )
                 t1 = time.time()
@@ -257,7 +282,7 @@ if __name__ == "__main__":
                     "epochs": factor_model.total_epochs,
                     # "model_param_store": pyro.get_param_store(),
                     "model_state_dict": pyro.get_param_store().get_state(),
-                    "optimizer_state": opt.get_state(),
+                    "optimizer_state": train_handler.opt.get_state(),
                     "loss_history": factor_model.loss_history,
                     "param_convergence_history": factor_model.var_param_convergence_history                
                 }, model_out_filename + ".pth")
@@ -272,19 +297,20 @@ if __name__ == "__main__":
                 
                 #################
                 # Inference for predictive model
+                print('local training')
                 LOCAL_OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
                 LOCAL_LOSS = Trace_ELBO(num_particles = 1)
                 
-                test_handler = ModelHandler("test",
+                test_handler = ModelHandler("predict",
                                             factor_model,
                                             LOCAL_OPT, 
                                             LOCAL_LOSS)
                 
                 t0 = time.time()
-                svi, opt = test_handler.do_inference(
+                svi = test_handler.do_inference(
                     test_subset,
                     variational_tol = VARIATIONAL_TOL,
-                    min_epochs = MIN_EPOCHS,
+                    min_epochs = MIN_EPOCHS_LOCAL,
                     epochs = NUM_EPOCHS,
                     minibatch_flag = True,
                     minibatch_size = MINIBATCH_SIZE,
@@ -298,7 +324,7 @@ if __name__ == "__main__":
                     "epochs": factor_model.local_epochs,
                     # "model_param_store": pyro.get_param_store(),
                     "model_state_dict": pyro.get_param_store().get_state(),
-                    "optimizer_state": opt.get_state(),
+                    "optimizer_state": test_handler.opt.get_state(),
                     "loss_history": factor_model.local_loss_history,
                     "param_convergence_history": factor_model.local_var_param_convergence_history                
                 }, model_out_filename + "_local.pth")
@@ -308,8 +334,9 @@ if __name__ == "__main__":
                 #################
                 # Sample from posterior
                 print('Sampling from posterior')
-                sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
-                outcome_sites = ["y"]
+                sites = [Sites.joint_structure_l.format(l = l) for l in range(L)] \
+                    + [Sites.view_structure_l.format(l = l) for l in range(L)]
+                outcome_sites = [Sites.y_pred]
                 post_samples = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
                 post_samples_y = test_handler.predict(test_X_l_list_clean, N_POSTERIOR_SAMPLES, outcome_sites)
                 
