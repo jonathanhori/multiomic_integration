@@ -92,6 +92,10 @@ class ModelHandler:
             # prev_loss = None
             min_loss = math.inf
             epoch_at_min_loss = 0
+            
+            min_variational_diff = math.inf
+            epoch_at_min_diff = 0
+            
             params_epoch_last = None
             params_epoch_curr = None
             for epoch in range(epochs):
@@ -99,47 +103,42 @@ class ModelHandler:
                 for batch in loader:
                     # batch is subsampled [idx, X_l_list, y]
                     batch_idx = batch.pop(0)
-                    y_batch = batch.pop(-1).squeeze()
+                    # print(batch)
                     # print(batch.shape)
-                    loss = svi.step(batch, batch_idx, y_batch)
+                    # print(batch_idx)
+                    # print(batch_idx.shape)
+                    # print(batch.shape)
+                    if self.model.model_type == "MatrixDecomp":
+                        loss = svi.step(batch, batch_idx)
+                    elif self.model.model_type == "SupMultiviewDecomp":
+                        y_batch = batch.pop(-1).squeeze()
+                        loss = svi.step(batch, batch_idx, y_batch)
                     # print(loss)
                     epoch_loss += loss
                 
-                # self.model.loss_history.append(epoch_loss)
-                
-                # Determine the epoch when the min loss is obtained
-                if epoch_loss < min_loss:
-                    min_loss = epoch_loss
-                    epoch_at_min_loss = epoch
-                
-                
-                
-                
-                # Check Euclidean norm of difference in variational params for convergence
+                # Update running list of loss and variational param histories
                 param_store_curr = pyro.get_param_store()
                 if self.mode == "train":
                     self.model.total_epochs += 1
                     self.model.loss_history.append(epoch_loss)
                     
+                    ####
                     params_epoch_curr = {k: v.detach().clone() for k, v in param_store_curr.items()}
                     if epoch == 0: 
                         params_epoch_last = params_epoch_curr
                     param_diff_norm_dict = {k: torch.norm(params_epoch_last[k] - params_epoch_curr[k]).item() 
                                             for k in params_epoch_curr}
-                    self.model.var_param_convergence_history.append(
-                        variational_diff_func(list(param_diff_norm_dict.values()))
-                        )
-                    params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())                    
-                    if verbose:
-                        print("--------------------")
-                        print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
-                        print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
-                        print(f"Variational parameter difference: {self.model.var_param_convergence_history[-1]}")
-                        print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
-                        print(f"Params converged? {str(params_converged)}")
+                    # print(param_diff_norm_dict.values())
+                    variational_diff = variational_diff_func(list(param_diff_norm_dict.values()))
+                    self.model.var_param_convergence_history.append(variational_diff)
+                    
+                    # params_converged = variational_diff < variational_tol
+                    # params_converged = all(n < variational_tol for n in param_diff_norm_dict.values())      
                 elif self.mode == "predict":
                     self.model.local_epochs += 1
                     self.model.local_loss_history.append(epoch_loss)
+                    
+                    ####
                     # only consider convergence in local params
                     params_epoch_curr = {k: v.detach().clone() 
                                          for k, v in param_store_curr.items()
@@ -148,31 +147,53 @@ class ModelHandler:
                         params_epoch_last = params_epoch_curr
                     param_diff_norm_dict = {k: torch.norm(params_epoch_last[k] - params_epoch_curr[k]).item() 
                                             for k in params_epoch_curr}
-                    self.model.local_var_param_convergence_history.append(
-                        variational_diff_func(list(param_diff_norm_dict.values()))
-                        )
-                    param_converge_metric = variational_diff_func(param_diff_norm_dict.values())
-                    params_converged = self.model.local_var_param_convergence_history[-1] < variational_tol
+                    variational_diff = variational_diff_func(list(param_diff_norm_dict.values()))
+                    self.model.local_var_param_convergence_history.append(variational_diff)
+                    # variational_diff = variational_diff_func(param_diff_norm_dict.values())
+                    # params_converged = variational_diff < variational_tol
                     # param_converge_metric < variational_tol
                     # params_converged = variational_diff_func(n < variational_tol for n in param_diff_norm_dict.values())   
                     
                     
-                    if verbose:
-                            print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
-                            print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
-                            print(f"Variational parameter difference: {self.model.local_var_param_convergence_history[-1]}")
-                            print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
-                            # print(f"Variational param Param convergence metric: ")
+                    # if verbose:
+                    #         print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
+                    #         print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
+                    #         print(f"Variational parameter difference: {self.model.local_var_param_convergence_history[-1]}")
+                    #         print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
+                    #         # print(f"Variational param Param convergence metric: ")
+                
+                # Determine the epoch when the min loss is obtained
+                if epoch_loss < min_loss:
+                    min_loss = epoch_loss
+                    epoch_at_min_loss = epoch
                     
-                    # Converged?
-                if epoch > min_epochs and epoch - epoch_at_min_loss > math.sqrt(epoch)\
-                    and params_epoch_last is not None and params_converged:
-                # if prev_loss is not None and abs(epoch_loss - prev_loss) / model.n < tol:
-                    # model.total_epochs = epoch
+                # Determine the epoch when the minimum difference in variational params is obtained
+                if variational_diff < min_variational_diff and variational_diff != 0:
+                    min_variational_diff = variational_diff
+                    epoch_at_min_diff = epoch
+                
+                ########
+                # Convergence logic
+                past_min_epochs = epoch > min_epochs
+                loss_converged = epoch - epoch_at_min_loss > math.sqrt(epoch)
+                params_converged = epoch - epoch_at_min_diff > math.sqrt(epoch)
+                # params_converged = variational_diff < variational_tol
+                # params_converged = all(n < variational_tol for n in param_diff_norm_dict.values()) 
+                
+                if verbose:
+                        print("--------------------")
+                        print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
+                        print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
+                        print(f"Variational parameter difference: {variational_diff}")
+                        print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
+                        print(f"Loss converged? {str(loss_converged)}")
+                        print(f"Params converged? {str(params_converged)}")
+                
+                # Converged?
+                if past_min_epochs and loss_converged and params_converged \
+                    and params_epoch_last is not None :
                     break
                 params_epoch_last = params_epoch_curr
-                
-                # prev_loss = epoch_loss
         else:
             raise NotImplementedError    
         
@@ -180,22 +201,30 @@ class ModelHandler:
             
         return svi
     
-    # def do_local_inference(self,
-    #                        test_dataset,
-    #                        model, 
-    #                        guide):
-    #     pass
         
     def predict(self,
                 X_list,
                 num_samples,
                 return_sites):
-        n = X_list[0].shape[0]
-        predictive = Predictive(self.forward, 
-                                guide = self.guide, 
-                                num_samples = num_samples,
-                                return_sites = return_sites)
-        return predictive(
-            X_list,
-            torch.arange(n)
-            )
+        if self.model.model_type == "MatrixDecomp":
+            # X_list is just a single matrix
+            n = X_list[0].shape[0]
+            # n = X_list.shape[0]
+            predictive = Predictive(self.forward, 
+                                    guide = self.guide, 
+                                    num_samples = num_samples,
+                                    return_sites = return_sites)
+            return predictive(
+                X_list,
+                torch.arange(n)
+                )
+        elif self.model.model_type == "SupMultivewDecomp":
+            n = X_list[0].shape[0]
+            predictive = Predictive(self.forward, 
+                                    guide = self.guide, 
+                                    num_samples = num_samples,
+                                    return_sites = return_sites)
+            return predictive(
+                X_list,
+                torch.arange(n)
+                )
