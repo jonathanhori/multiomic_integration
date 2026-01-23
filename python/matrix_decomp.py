@@ -16,63 +16,87 @@ from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNor
 from torch.utils.data import TensorDataset, DataLoader
 
 from constants import Sites, Params
+from data_utils import align_tensor_shapes
 
 pyro.enable_validation(True)
 pyro.set_rng_seed(0)
-
+ 
 
 class MatrixDecomp(PyroModule):
-    def __init__(self, k, n,
+    def __init__(self, k,
+                 loading_target = None,
                  dense = False,
-                 a_sigma=2.0, # Hyperparams: ARD prior per factor: IG
+                 a_sigma=2.0, # Hyperparams: Conjugate prior per factor: IG
                  b_sigma=2.0,
+                 a1_sigma=2.1, # Hyperparams: Conjugate prior per factor: IG
+                 a2_sigma=3.1,
+                 alpha=3.0,
                  a_psi=2.0, # Hyperparams: per-view error: IG
                  b_psi=2.0):
         super().__init__()
+        
+        self.model_type = "MatrixDecomp"
         # Model parameters
         self.k = k
-        self.n = n
+        self.n = None
         self.p = None
         
+        # Should the loading matrix be penalized toward a target?
+        if loading_target is not None:
+            self.loading_target = align_tensor_shapes(loading_target, 
+                                                    additional = k - loading_target.shape[1])
+        else:
+            self.loading_target = None
+        
         # Hyperparams
-        self.a_sigma = a_sigma
-        self.b_sigma = b_sigma
+        # self.a_sigma = a_sigma
+        # self.b_sigma = b_sigma
         self.a_psi = a_psi
         self.b_psi = b_psi
         
+        if dense:
+            self.a_sigma = a_sigma
+            self.b_sigma = b_sigma
+        if not dense:
+            self.a1_sigma = a1_sigma
+            self.a2_sigma = a2_sigma
+            self.alpha = alpha
+        
         self.dense = False
+        # self.loss_history = []
+        
+        self.total_epochs = 0
+        self.total_iters = None
         self.loss_history = []
+        self.var_param_convergence_history = []
         
         
     def forward(self, 
                 X, 
-                batch_idx,
-                y = None):
+                batch_idx):
         """
         Should we run model with sparsity prior or not?
         """
         if self.dense:
             return self.forward_dense(X, 
-                batch_idx,
-                y)
+                batch_idx)
         else:
             return self.forward_mgp(X, 
-                batch_idx,
-                y)
+                batch_idx)
     
     def forward_mgp(self, X, batch_idx):
         l = 0
         
-        if torch.is_tensor(X):
-            m, p = X.shape # Working with minibatches of size m
-        elif isinstance(X, TensorDataset): # working with full dataset directly
-            # print("is tensordataset")
-            m = len(X)
-            p = X[0][0].shape[0]
+        # if torch.is_tensor(X):
+        #     m, p = X.shape # Working with minibatches of size m
+        # elif isinstance(X, TensorDataset): # working with full dataset directly
+        #     # print("is tensordataset")
+        #     m = len(X)
+        #     p = X[0][0].shape[0]
         # self.p = 
         m = len(batch_idx)
         if self.p is None:
-            self.p = X.shape[1]
+            self.p = X[0].shape[1]
         # if self.p_l_list is None:
         #     self.p_l_list = [X_l.shape[1] for X_l in X_list]
         
@@ -94,7 +118,7 @@ class MatrixDecomp(PyroModule):
     
         # rho - local shrinkage
         rho_lambda = pyro.sample(Sites.rho_lambda_l.format(l = l), 
-                            dist.Gamma(self.alpha_joint / 2, self.alpha_joint / 2).expand([self.p, self.k]).to_event(2)).squeeze()
+                            dist.Gamma(self.alpha / 2, self.alpha / 2).expand([self.p, self.k]).to_event(2)).squeeze()
         
         # print('Lambda - tau shape', tau_lambda_k_list.shape)
         # print('Lambda - rho shape', rho_lambda.shape)
@@ -103,7 +127,7 @@ class MatrixDecomp(PyroModule):
         precision = torch.clamp(precision, min=1e-10, max=1e10)
         sigma_lambda_l = precision.pow_(-0.5)     
         Lambda = pyro.sample(Sites.Lambda_l.format(l = l), 
-                                dist.Normal(torch.zeros(self.p, self.k), sigma_lambda_l).to_event(2))
+                                dist.Normal(torch.zeros(self.p, self.k), sigma_lambda_l).to_event(2)).squeeze()
         
         # sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(self.a_sigma, self.b_sigma).expand([self.k]).to_event(1))
         # sigma = torch.sqrt(sigma2)
@@ -120,7 +144,7 @@ class MatrixDecomp(PyroModule):
         ########################
         
         # Idiosyncratic error variance            
-        psi = pyro.sample("psi", dist.InverseGamma(self.a_psi, self.b_psi).expand([p]).to_event(1))
+        psi = pyro.sample("psi", dist.InverseGamma(self.a_psi, self.b_psi).expand([self.p]).to_event(1))
         psi_sqrt = torch.sqrt(psi)
         
         # Local latent variables and observations
@@ -131,8 +155,24 @@ class MatrixDecomp(PyroModule):
             
             # Compute structure
             structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+            # if torch.isnan(structure).any():
+            #         print("NaN values found in X_l_tensor!")
+            # if torch.isinf(structure).any():
+            #     print("Inf values found in X_l_tensor!")
+                
+            # print("finite structure?") 
+            # print(torch.isfinite(structure).all())
+            # print("finite sd?")
+            # print(torch.isfinite(psi_sqrt).all())
+            # print("geq 0 sd?") 
+            # print((psi_sqrt > 0).all())
+            # print("X finite:", torch.isfinite(X).all())
+            # print("NaNs:", torch.isnan(X).sum())
+            # print("Infs:", torch.isinf(X).sum())
+
             
-            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X)
+            
+            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
         
         
 
@@ -182,17 +222,25 @@ class MatrixDecomp(PyroModule):
             # Compute structure
             structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
             
-            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X)
+            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
             
             
     def guide(self, X, batch_idx):
         l = 0
-        if torch.is_tensor(X):
-            m, p = X.shape # Working with minibatches of size m
-        elif isinstance(X, TensorDataset): # working with full dataset directly
-            # print("is tensordataset")
-            m = len(X)
-            p = X[0][0].shape[0]
+        # if torch.is_tensor(X):
+        #     m, p = X.shape # Working with minibatches of size m
+        # elif isinstance(X, TensorDataset): # working with full dataset directly
+        #     # print("is tensordataset")
+        #     m = len(X)
+        #     p = X[0][0].shape[0]
+        m = len(batch_idx)
+        if self.p is None:
+            self.p = X[0].shape[1]
+            
+        # print(X)
+        # print(len(X))
+        # print(X[0].shape)
+        # print(X[1])
             
         ######
         # Loadings
@@ -200,7 +248,7 @@ class MatrixDecomp(PyroModule):
         ######
         for m in range(self.k):
             a_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l = l, m = m), 
-                                            torch.tensor(self.a1_sigma_joint),
+                                            torch.tensor(self.a1_sigma),
                                             constraint = dist.constraints.positive)
             b_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l = l, m = m), 
                                             torch.tensor(1.0),
@@ -209,19 +257,31 @@ class MatrixDecomp(PyroModule):
                         dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
 
         a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l = l), 
-                                        torch.tensor(self.alpha_joint / 2),
+                                        torch.tensor(self.alpha / 2),
                                         constraint = dist.constraints.positive)
         b_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l = l), 
-                                        torch.tensor(self.alpha_joint / 2),
+                                        torch.tensor(self.alpha / 2),
                                         constraint = dist.constraints.positive)
         pyro.sample(Sites.rho_lambda_l.format(l = l), 
-                    dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
+                    dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([self.p, self.k]).to_event(2)).squeeze()
         
-        loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
-        scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l = l), torch.ones(p_l, self.k),
+        loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(self.p, self.k))
+        scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l = l), torch.ones(self.p, self.k),
                                     constraint = dist.constraints.positive)
         Lambda = pyro.sample(Sites.Lambda_l.format(l = l), 
                                 dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
+        
+        
+        # Penalty to encourage loadings toward certain matrix
+        orthogonality_weight = 100.
+        if self.loading_target is not None:
+            matrix_diff = Lambda - self.loading_target
+            
+            total_penalty = torch.sum(matrix_diff ** 2)
+                
+            pyro.factor("target_penalty", 
+                        orthogonality_weight * total_penalty,
+                        has_rsample = True)
         
         # # Sigma2: Variational parameters a, b
         # a_sigma_q = pyro.param("a_sigma_q", 
@@ -245,10 +305,10 @@ class MatrixDecomp(PyroModule):
         ########################
         # Psi: Variational params a, b
         a_psi_q = pyro.param("a_psi_q",
-                             lambda: torch.ones((p)),
+                             lambda: torch.ones((self.p)),
                              constraint = dist.constraints.positive)     
         b_psi_q = pyro.param("b_psi_q",
-                             lambda: torch.ones((p)),
+                             lambda: torch.ones((self.p)),
                              constraint = dist.constraints.positive)  
         psi = pyro.sample("psi", dist.InverseGamma(a_psi_q, b_psi_q).to_event(1))
         # psi_sqrt = torch.sqrt(psi)
