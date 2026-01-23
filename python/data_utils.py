@@ -362,3 +362,37 @@ def eval_performance(sim_joint_data_struct,
         sep = '.',
         suffix = '.+')
     return eval_metric_table
+
+
+def varimax(Phi, gamma = 1, q = 20, tol = 1e-6):
+    # Source - https://stackoverflow.com/a
+    # Posted by bmcmenamin
+    # Retrieved 2025-12-15, License - CC BY-SA 3.0
+    from numpy import eye, asarray, dot, sum, diag
+    from numpy.linalg import svd
+    p,k = Phi.shape
+    R = eye(k)
+    d=0
+    for i in range(q):
+        d_old = d
+        Lambda = dot(Phi, R)
+        u,s,vh = svd(dot(Phi.T,asarray(Lambda)**3 - (gamma/p) * dot(Lambda, diag(diag(dot(Lambda.T,Lambda))))))
+        R = dot(u,vh)
+        d = sum(s)
+        if d/d_old < tol: break
+    return dot(Phi, R)
+
+
+def align_tensor_shapes(target, input = None, additional = None):
+    '''
+    ensures that the target tensor shape is the same as the input
+    applied to loading matrices, the target might have fewer cols than the input because
+        of the shrinkage process prior. so pad the target
+    '''
+    if additional == None:
+        num_to_pad = input.shape[1] - target.shape[1]
+    elif input == None and additional is not None:
+        num_to_pad = additional
+    assert num_to_pad >= 0, "input has fewer cols than target. adjust k_max"
+
+    return torch.nn.functional.pad(target, (0, num_to_pad))
