@@ -3,10 +3,6 @@ jupyter: python3
 ---
 
 ```{python}
-
-```
-
-```{python}
 import os
 import sys
 ```
@@ -35,7 +31,7 @@ from torch.utils.data import TensorDataset
 from torchvision import transforms
 import pyro
 import pyro.distributions as dist
-from pyro.optim import Adam, ClippedAdam
+from pyro.optim import Adam, ClippedAdam, AdagradRMSProp
 from pyro.infer import SVI, Trace_ELBO, RBFSteinKernel
 
 import importlib
@@ -55,12 +51,12 @@ sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
 ```{python}
 #| label: Load data utils
-# importlib.reload(sys.modules["data_utils"])
+importlib.reload(sys.modules["data_utils"])
 
 # from data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition, normalize_tensor_by_col, extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, eval_rse, eval_mse, summarise_post_samples, summarise_structure_list, eval_post_coverage, eval_credible_interval, obtain_posterior_pred_samples, calc_all_structures_with_rescaling, eval_performance, zero_variance_col_filter
 from data_utils import r_to_torch, normalize_tensor_by_col, \
     zero_variance_col_filter, obtain_posterior_pred_samples, \
-        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance
+        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance, varimax
 ```
 
 ```{python}
@@ -170,7 +166,8 @@ train_subset = TensorDataset(torch.arange(train_X_l_list[0].shape[0]),
 With train/test split
 
 ```{python}
-TRAINING_SPLIT = True
+TRAINING_SPLIT = False
+
 TRAINING_SIZE = 0.8
 RANDOM_SEED = 123
 # Perform train/test split if necessary
@@ -229,6 +226,16 @@ test_subset = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
                                          test_y_clean)
 ```
 
+
+DEBUG. Check: is orthogonality preserved after splitting into train/test sets?
+
+```{python}
+[torch.norm(Phi[train_idx, :].T @ sim_data_multiview_torch['Z'][train_idx, :]) for Phi in sim_data_multiview_torch['Phi_perp']]
+```
+
+```{python}
+[torch.norm(Phi.T @ sim_data_multiview_torch['Z']) for Phi in sim_data_multiview_torch['Phi_perp']]
+```
 
 Single tensor data
 
@@ -316,15 +323,23 @@ With custom guide.
 During training, the model and guide are used. During prediction, save the ParamStore global latent variables and include as prior values in the prediction model and prediction guide. The guide only includes `pyro.param` statements over the local latent variables and only updates these. Run SVI for a certain number of epochs until convergence. Then use 
 
 ```{python}
+train_subset.__len__()
+```
+
+```{python}
 
 pyro.clear_param_store()
 
 MINIBATCH_SIZE = 32
-NUM_EPOCHS = 1000
-initial_lr = 0.005 
-gamma = 0.1  # final learning rate will be gamma * initial_lr
+NUM_EPOCHS = 500
+MIN_EPOCHS = 50
+initial_lr = 0.001
+gamma = 0.001  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
-OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
+OPT = Adam({"lr": initial_lr})
+# OPT = AdagradRMSProp({})
+# OPT = Adam({"amsgrad": True}) #"lr": initial_lr)
+# OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd,, "betas": (0.8, 0.95)}) # (0.9, 0.999) (0.95, 0.999
 LOSS = Trace_ELBO(num_particles = 2)
 
 k_upper = int(k) + 10
@@ -334,11 +349,12 @@ k_l_upper = [int(k_l) + 10 for k_l in k_l_list.tolist()]
 factor_model = SupMultiviewDecomp(
     k_upper,
     k_l_upper,
+    ortho_penalty = 0.0,
     include_view_factors = True,
     dense = False
 )
 
-train_handler = ModelHandler("train", factor_model, OPT, LOSS)
+train_handler = ModelHandler("train", factor_model, opt = OPT, loss = LOSS)
 
 t0 = time.time()
 svi = train_handler.do_inference(
@@ -346,7 +362,7 @@ svi = train_handler.do_inference(
     inference = "svi",
     tol = 0.5, # tolerance is epoch loss per datum
     variational_tol = 0.1,
-    min_epochs = 30,
+    min_epochs = MIN_EPOCHS,
     epochs = NUM_EPOCHS,
     minibatch_flag = True,
     minibatch_size = MINIBATCH_SIZE,
@@ -386,19 +402,29 @@ factor_model.predict_forward(train_X_l_list_clean,
 ClippedAdam with learning rate decay.
 Start lr = 0.001. Over 1000 epochs 
 
+With autoguide
 
 ```{python}
 
 pyro.clear_param_store()
 
 # hyperparam = 5.0
+# factor_model = SupMultiviewDecomp(
+#     int(k),
+#     k_l_list.int().tolist(),
+#     int(train_X_l_list_clean[0].shape[0]),
+#     include_view_factors = True,
+#     dense = False
+# )
+
 factor_model = SupMultiviewDecomp(
-    int(k),
-    k_l_list.int().tolist(),
-    int(train_X_l_list_clean[0].shape[0]),
+    k_upper,
+    k_l_upper,
     include_view_factors = True,
     dense = False
 )
+
+factor_model.n = train_subset.__len__()
 
 def subsample_create_plates(X, batch_idx, y = None):
     # m = len(batch_idx)
@@ -411,33 +437,50 @@ guide = pyro.infer.autoguide.AutoNormal(
 
 pyro.clear_param_store()
 
-
 MINIBATCH_SIZE = 32
-NUM_EPOCHS = 1000
-initial_lr = 0.005 
-
+NUM_EPOCHS = 500
+MIN_EPOCHS = 50
+initial_lr = 0.001
 gamma = 0.1  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)}) # (0.9, 0.999)
+LOSS = Trace_ELBO(num_particles = 2)
 
-OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-LOSS = Trace_ELBO(num_particles = 1)
+# t0 = time.time()
+# svi, opt = do_inference(
+#     train_subset,
+#     # X_l_list_clean,
+#     # y_clean,
+#     factor_model,
+#     guide,
+#     opt = OPT,
+#     elbo = LOSS,
+#     inference = "svi",
+#     tol = 0.5, # tolerance is epoch loss per datum
+#     variational_tol = 0.3,
+#     min_epochs = 30,
+#     epochs = NUM_EPOCHS,
+#     minibatch_flag = True,
+#     minibatch_size = MINIBATCH_SIZE,
+#     verbose = True
+#     )
+
+# t1 = time.time()
+
+
+train_handler = ModelHandler("train", factor_model, guide, OPT, LOSS)
 
 t0 = time.time()
-svi, opt = do_inference(
-    train_subset,
-    # X_l_list_clean,
-    # y_clean,
-    factor_model,
-    guide,
-    opt = OPT,
-    elbo = LOSS,
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
     inference = "svi",
     tol = 0.5, # tolerance is epoch loss per datum
-    variational_tol = 0.3,
-    min_epochs = 30,
+    variational_tol = 0.1,
+    min_epochs = MIN_EPOCHS,
     epochs = NUM_EPOCHS,
     minibatch_flag = True,
     minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
     verbose = True
     )
 
@@ -448,26 +491,27 @@ print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epoc
 
 
 ```{python}
-# pyro.set_rng_seed(41)
-pyro.clear_param_store()
-hyperparam = 2.0
-factor_model = SupMultiviewDecomp(
-    int(k),
-    k_l_list.int().tolist(),
-    n,
-    include_view_factors = True,
-    dense = True,
-    a_sigma_joint=hyperparam, # Hyperparams: gamma process prior per factor loadings
-    b_sigma_joint=hyperparam,
-    a_sigma_view=hyperparam, # Hyperparams: gamma process prior per factor loadings
-    b_sigma_view=hyperparam,
-    a_psi=hyperparam, # Hyperparams: per-view error: IG same for all views
-    b_psi=hyperparam
-)
+# # pyro.set_rng_seed(41)
+# pyro.clear_param_store()
+# hyperparam = 2.0
+# factor_model = SupMultiviewDecomp(
+#     int(k),
+#     k_l_list.int().tolist(),
+#     n,
+#     include_view_factors = True,
+#     dense = True,
+#     a_sigma_joint=hyperparam, # Hyperparams: gamma process prior per factor loadings
+#     b_sigma_joint=hyperparam,
+#     a_sigma_view=hyperparam, # Hyperparams: gamma process prior per factor loadings
+#     b_sigma_view=hyperparam,
+#     a_psi=hyperparam, # Hyperparams: per-view error: IG same for all views
+#     b_psi=hyperparam
+# )
 
-predictive_prior = pyro.infer.Predictive(factor_model, num_samples=10)
-samples = predictive_prior(X_l_list_clean, torch.arange(n))
+# predictive_prior = pyro.infer.Predictive(factor_model, num_samples=10)
+# samples = predictive_prior(X_l_list_clean, torch.arange(n))
 ```
+
 
 ```{python}
 sim_data_multiview_torch['Lambda_l']
@@ -559,7 +603,7 @@ all(n < 0.01 for n in param_diff_norm_dict.values())
 params1['AutoNormal.locs.Lambda_l1']
 ```
 
-### Plot loss
+## Plot loss
 ```{python}
 p = sns.relplot(
     data = factor_model.loss_history,
@@ -610,25 +654,40 @@ p.fig.suptitle("Variational parameter convergence per epoch")
 
 
 
-### Evaluating before local training
+## Evaluating before local training
+```{python}
+TRAINING_SPLIT = False
+```
 
 ```{python}
 L = int(sim_data_multiview_torch.get("L"))
-sites = [f'joint_structure_l{l}' for l in range(L)] + [f'view_structure_l{l}' for l in range(L)]
+sites = [Sites.joint_structure_l.format(l = l) for l in range(L)] \
+    + [Sites.view_structure_l.format(l = l) for l in range(L)] \
+    + [Sites.Z] + [Sites.Phi_l.format(l = l) for l in range(L)]
 outcome_sites = ["y"]
 
 post_samples = train_handler.predict(train_X_l_list_clean, 100, sites)
 post_samples_y_train = train_handler.predict(train_X_l_list_clean, 100, outcome_sites)
 post_samples_y = train_handler.predict(test_X_l_list_clean, 100, outcome_sites)
+
+# if TRAINING_SPLIT:
+    
+# else:
+#     post_samples = train_handler.predict(X_l_list_clean, 100, sites)
+#     post_samples_y_train = train_handler.predict(X_l_list_clean, 100, outcome_sites)
+#     post_samples_y = train_handler.predict(X_l_list_clean, 100, outcome_sites)
 ```
+
 
 ```{python}
 SIM_decomp = extract_sim_decomp(sim_data_multiview_torch)
                 
-# Filter corresponding rows of test set structures
+# Filter corresponding rows of test set structures. Note using PERP structures
 train_SIM_decomp = {k: v for k, v in SIM_decomp.items()}
+# if TRAINING_SPLIT:
 train_SIM_decomp['SIM_Z'] = train_SIM_decomp['SIM_Z'][train_idx, :]
-train_SIM_decomp['SIM_Phi_l_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_list']]
+train_SIM_decomp['SIM_Phi_l_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_perp_list']]
+train_SIM_decomp['SIM_Phi_l_perp_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_perp_list']]
 
 eval_structures = calc_all_structures_with_rescaling(L,
                                                     X_l_list_column_filters,
@@ -657,6 +716,23 @@ eval_metric_table = eval_performance(**eval_structures)
 eval_metric_table 
 ```
 
+
+
+```{python}
+# eval_structures.keys()
+# [struct.shape for struct in eval_structures['post_pred_joint_data_struct']]
+[struct.shape for struct in eval_structures['sim_joint_data_struct']]
+```
+```{python}
+[eval_rse(est, sim).detach().item() for est, sim in \
+        zip(eval_structures['post_pred_joint_data_struct'], eval_structures['sim_joint_data_struct'])]
+```
+
+```{python}
+post_samples.keys()
+```
+
+### Check visual fit of outcome predictions
 ```{python}
 p = sns.scatterplot(x = eval_structures['post_pred_outcome'].tolist(), 
                     y = eval_structures['sim_outcome'].squeeze().tolist())
@@ -667,6 +743,10 @@ sns.regplot(x = eval_structures['post_pred_outcome'].tolist(),
             y = eval_structures['sim_outcome'].squeeze().tolist(), scatter = False, ax = p)
 ```
 
+```{python}
+# torch.mean(eval_structures['post_pred_outcome'])
+# torch.std(eval_structures['post_pred_outcome']))
+```
 
 ```{python}
 p = sns.scatterplot(x = eval_structures_train['post_pred_outcome'].tolist(), 
@@ -676,6 +756,35 @@ p.set_title("Predicted vs. actual outcome")
 p.axline((0, 0), slope = 1, color = "black", ls = "--")
 sns.regplot(x = eval_structures_train['post_pred_outcome'].tolist(), 
             y = eval_structures_train['sim_outcome'].squeeze().tolist(), scatter = False, ax = p)
+```
+
+
+### Verify: simulated structures are orthogonal
+
+```{python}
+[torch.norm(Phi.T @ train_SIM_decomp['SIM_Z']) for Phi in train_SIM_decomp['SIM_Phi_l_perp_list']]
+```
+
+### Verify: optimized structures are orthogonal
+
+```{python}
+# Calculate structure posterior means
+joint_means = [torch.mean(post_samples[Sites.joint_structure_l.format(l = l)], dim = 0) for l in range(L)]
+view_means = [torch.mean(post_samples[Sites.view_structure_l.format(l = l)], dim = 0) for l in range(L)]
+Z_means = torch.mean(post_samples[Sites.Z], dim = 0)
+Phi_l_means = [torch.mean(post_samples[Sites.Phi_l.format(l = l)], dim = 0) for l in range(L)]
+```
+
+```{python}
+est_joint_struct_cat = torch.cat(joint_means, dim = 1)
+```
+
+```{python}
+[torch.norm(est_view_struct_l.T @ est_joint_struct_cat) for est_view_struct_l in view_means]
+```
+
+```{python}
+[torch.norm(Phi_est.T @ Z_means) for Phi_est in Phi_l_means]
 ```
 
 Save param store before local training
@@ -814,7 +923,7 @@ SIM_decomp = extract_sim_decomp(sim_data_multiview_torch)
 # Filter corresponding rows of test set structures
 train_SIM_decomp = {k: v for k, v in SIM_decomp.items()}
 train_SIM_decomp['SIM_Z'] = train_SIM_decomp['SIM_Z'][train_idx, :]
-train_SIM_decomp['SIM_Phi_l_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_list']]
+train_SIM_decomp['SIM_Phi_l_perp_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_perp_list']]
 
 local_eval_structures = calc_all_structures_with_rescaling(L,
                                                     X_l_list_column_filters,
@@ -923,6 +1032,7 @@ pd.DataFrame({
 ```
 
 
+## Plot loadings
 ```{python}
 sns.heatmap(
     pyro.param(Params.loc_Lambda_l.format(l = 0)).detach().numpy(),
@@ -943,17 +1053,21 @@ np.sqrt(500) + np.sqrt(100)
 ```
 
 ```{python}
-
-
-```
-
-
-```{python}
 sns.heatmap(
     varimax(est_Lambda0),
 # sim_data_multiview_torch.get('Lambda_l')[0],
 cmap="coolwarm"
 )
+
+```
+
+
+```{python}
+# sns.heatmap(
+#     varimax(est_Lambda0),
+# # sim_data_multiview_torch.get('Lambda_l')[0],
+# cmap="coolwarm"
+# )
 
 ```
 
@@ -1260,6 +1374,16 @@ torch.linalg.matrix_rank(pyro.param('AutoNormal.locs.Lambda_l0').detach())
 
 ```{python}
 sim_data_multiview_torch.get('Lambda_l')[0]
+```
+
+
+# Optimizer hyperparameter tuning
+
+Run the model on the same data with different optimizer parameters. Save the model and evaluation metrics (RSE) from each fit. Compare which parameters yield the best loss and metrics
+
+```{python}
+
+hyperparam_grid = itertools.product()
 ```
 
 # Evaluate

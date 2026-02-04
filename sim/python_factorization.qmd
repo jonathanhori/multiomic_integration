@@ -310,6 +310,40 @@ run_minibatch = t1 - t0
 print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
 ```
 
+#### Run model with HMC
+
+```{python}
+pyro.clear_param_store()
+k_upper = int(k) + 10
+
+factor_model = MatrixDecomp(k_upper)
+factor_model.n = X_clean.shape[0]
+```
+
+```{python}
+from pyro.infer import MCMC, NUTS, Predictive
+```
+```{python}
+nuts_kernel = NUTS(factor_model)
+mcmc = MCMC(nuts_kernel, num_samples=500)
+```
+
+```{python}
+%%time
+
+mcmc.run([X_clean], torch.arange(X_clean.shape[0]))
+```
+
+```{python}
+samples = mcmc.get_samples()
+for k, v in samples.items():
+    print(f"{k}: {tuple(v.shape)}")
+
+predictive = Predictive(model, samples)(X_, None)
+for k, v in predictive.items():
+    print(f"{k}: {tuple(v.shape)}")
+```
+
 ### Ignore_________
 ```{python}
 # OLD VERSION
@@ -976,8 +1010,22 @@ torch.norm(Struct_sim_rescaled - Struct_est) ** 2 / torch.norm(Struct_sim_rescal
 ### Loading interpretation
 
 ```{python}
+Lambda_est = pyro.param(Params.loc_Lambda_l.format(l = 0)) 
+Lambda_sim = sim_data_torch["Lambda_l"][0]
+Lambda_sim_pad = torch.nn.functional.pad(Lambda_sim[col_filter, :], (0, k_upper - Lambda_sim.shape[1]))
+# pad_amount = k_upper - Lambda_sim.shape[1]
+
+matrix_diff = Lambda_est - Lambda_sim_pad
+torch.norm(matrix_diff)
+```
+
+```{python}
+
+```
+
+```{python}
 sns.heatmap(
-    Lambda_est.detach().numpy(),
+    Lambda_est.detach() - Lambda_sim_pad,
     cmap="coolwarm"
 )
 ```

@@ -13,9 +13,11 @@ class ModelHandler:
     def __init__(self,
                  mode,
                  model,
-                #  guide,
+                 guide = None,
                  opt = Adam({"lr": 0.001}),
                  loss = Trace_ELBO(),
+                 inference_class = SVI,
+                 opt_scheduler = None,
                  local = False
                  ):
         assert mode in ("train", "predict"), \
@@ -36,9 +38,22 @@ class ModelHandler:
         elif self.mode == "predict":
             self.forward = self.model.predict_forward
             self.guide = self.model.predict_guide
+        
+        # Overwrite guide if provided
+        if guide is not None:
+            self.guide = guide
         # self.guide = guide
         self.loss = loss
-        self.opt = opt 
+        
+        self.opt_scheduler = opt_scheduler
+        # self.inference_class = inference_class
+        if opt_scheduler is not None:
+            self.opt = opt_scheduler 
+        else:
+            self.opt = opt
+        
+        # self.opt_scheduler = opt_scheduler
+        self.learning_rate_vec = []
         
     def get_param_values(self):
         return
@@ -53,7 +68,7 @@ class ModelHandler:
                     # guide, 
                     # opt = Adam({"lr": 0.001}), #"Adam",
                     # elbo = Trace_ELBO(),
-                    inference = "svi",
+                    # inference = "svi",
                     min_epochs = 10,
                     epochs = 20,
                     max_iter = 20000,
@@ -81,6 +96,7 @@ class ModelHandler:
         # Initialize instances for optimization
         ########################
         
+        # svi = self.inference_class()
         svi = SVI(self.forward, self.guide, self.opt, loss = self.loss)
         
         ########################
@@ -115,6 +131,10 @@ class ModelHandler:
                         loss = svi.step(batch, batch_idx, y_batch)
                     # print(loss)
                     epoch_loss += loss
+                    if self.opt_scheduler is not None:
+                        self.opt_scheduler.step()
+                    # self.opt.param_groups
+                    # self.learning_rate_vec.append()
                 
                 # Update running list of loss and variational param histories
                 param_store_curr = pyro.get_param_store()
@@ -218,7 +238,7 @@ class ModelHandler:
                 X_list,
                 torch.arange(n)
                 )
-        elif self.model.model_type == "SupMultivewDecomp":
+        elif self.model.model_type == "SupMultiviewDecomp":
             n = X_list[0].shape[0]
             predictive = Predictive(self.forward, 
                                     guide = self.guide, 

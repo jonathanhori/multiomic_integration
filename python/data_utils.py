@@ -136,12 +136,14 @@ def extract_sim_decomp(sim_data_dict):
 
     SIM_Gamma_l_list = sim_data_dict["Gamma_l"]
     SIM_Phi_l_list = sim_data_dict["Phi"]
+    SIM_Phi_l_perp_list = sim_data_dict["Phi_perp"]
 
     return {
             "SIM_Lambda_l_list": SIM_Lambda_l_list,
             "SIM_Z": SIM_Z,
             "SIM_Gamma_l_list": SIM_Gamma_l_list,
-            "SIM_Phi_l_list": SIM_Phi_l_list
+            "SIM_Phi_l_list": SIM_Phi_l_list,
+            "SIM_Phi_l_perp_list": SIM_Phi_l_perp_list
         }
     
 def obtain_posterior_pred_samples(#model,
