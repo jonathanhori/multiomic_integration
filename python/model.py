@@ -21,11 +21,12 @@ class SupMultiviewDecomp(PyroModule):
     def __init__(self, 
                  k, 
                  k_l_list,
-                 ortho_penalty = 0,
+                 ortho_penalty = 0.0,
                 #  n,
                  include_view_factors = False,
                  dense = True,
                  outcome = "gaussian",
+                 penalty_obj = None,
                  a_sigma_joint=2.0, # Hyperparams: gamma process prior per factor loadings
                  b_sigma_joint=2.0,
                  a_sigma_view=2.0, # Hyperparams: gamma process prior per factor loadings
@@ -55,6 +56,7 @@ class SupMultiviewDecomp(PyroModule):
         self.p_l_list = None
         
         self.ortho_penalty = ortho_penalty
+        self.penalty_obj = penalty_obj
         
         self.dense = dense
         self.outcome = outcome
@@ -884,6 +886,7 @@ class SupMultiviewDecomp(PyroModule):
             scale_Z_batch = scale_Z[batch_idx]
             Z = pyro.sample(Sites.Z, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
             
+            loc_Phi_l_list = []
             Phi_l_list = []
             for l, k_l in enumerate(self.k_l_list):
                 # loc_Z
@@ -892,6 +895,7 @@ class SupMultiviewDecomp(PyroModule):
                 Phi_l = pyro.sample(Sites.Phi_l.format(l = l), 
                                     dist.Normal(loc_Phi, scale_Phi).to_event(1))
                 Phi_l_list.append(Phi_l)
+                loc_Phi_l_list.append(loc_Phi)
                 
             
             # Compute structures
@@ -911,16 +915,22 @@ class SupMultiviewDecomp(PyroModule):
             joint_structure_full = torch.cat(joint_structure_list, 1)
                 
             # Calculate penalty terms
-            if self.ortho_penalty != 0:
+            if (self.ortho_penalty != 0 and self.penalty_obj is None) or \
+                (self.penalty_obj is not None and self.penalty_obj.weight != 0):
                 total_penalty = torch.tensor(0.0)
                 for l in range(len(X_list)):
-                    cross_prod = view_structure_list[l].T @ joint_structure_full
-                    # cross_prod = Phi_l_list[l].T @ Z
+                    # cross_prod = view_structure_list[l].T @ joint_structure_full
+                    cross_prod = Phi_l_list[l].T @ Z
+                    # cross_prod = loc_Phi_l_list[l].T @ loc_Z_batch
                     
                     total_penalty += torch.sum(cross_prod ** 2)
-                
-                pyro.factor("orthogonality", 
-                            self.ortho_penalty * total_penalty * (len(batch_idx) / self.n),
+                if self.penalty_obj is None:
+                    pyro.factor("orthogonality", 
+                                self.ortho_penalty * total_penalty * (len(batch_idx) / self.n),
+                                has_rsample = True)
+                else:
+                    pyro.factor("orthogonality", 
+                            self.penalty_obj.weight * total_penalty * (len(batch_idx) / self.n),
                             has_rsample = True)
                 
                 # X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 

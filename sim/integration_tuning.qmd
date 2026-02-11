@@ -261,7 +261,7 @@ print(trace.format_shapes())
 ```
 
 
-With custom guide.
+### With custom guide
 During training, the model and guide are used. During prediction, save the ParamStore global latent variables and include as prior values in the prediction model and prediction guide. The guide only includes `pyro.param` statements over the local latent variables and only updates these. Run SVI for a certain number of epochs until convergence. Then use 
 
 ```{python}
@@ -293,7 +293,7 @@ k_l_upper = [int(k_l) + 10 for k_l in k_l_list.tolist()]
 factor_model = SupMultiviewDecomp(
     k_upper,
     k_l_upper,
-    ortho_penalty = 100.0,
+    # ortho_penalty = 100.0,
     include_view_factors = True,
     dense = False
 )
@@ -335,7 +335,121 @@ print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epoc
 ```
 
 
-With a learning rate scheduler
+### With a learning rate scheduler
+
+```{python}
+
+pyro.clear_param_store()
+
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 500
+MIN_EPOCHS = 50
+initial_lr = 0.1
+# gamma = 1 # 0.01  # final learning rate will be gamma * initial_lr
+# lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+# OPT = Adam({"lr": initial_lr})
+# OPT = AdagradRMSProp({})
+# OPT = Adam({"amsgrad": True}) #"lr": initial_lr)
+opt_args = {"lr": initial_lr, "betas": (0.9, 0.999)} #, "lrd": lrd, "betas": (0.9, 0.999)}
+# OPT = ClippedAdam(opt_args) # (0.9, 0.999) (0.95, 0.999
+# OPT = Adam(opt_args)
+LOSS = Trace_ELBO(num_particles = 1)
+
+k_upper = int(k) + 10
+k_l_upper = [int(k_l) + 10 for k_l in k_l_list.tolist()]
+
+# hyperparam = 5.0
+factor_model = SupMultiviewDecomp(
+    k_upper,
+    k_l_upper,
+    # ortho_penalty = 100.0,
+    include_view_factors = True,
+    dense = False
+)
+
+scheduler_args = {
+    'optimizer': torch.optim.Adam, 
+    'optim_args': opt_args,
+    'step_size': 20,
+    'gamma': 0.5,
+    'verbose': True
+}
+scheduler = pyro.optim.StepLR(scheduler_args)
+
+train_handler = ModelHandler(
+    "train", 
+    factor_model,
+    # opt = OPT, 
+    loss = LOSS,
+    orthogonal_projection = True,
+    inference_class = SVI,
+    opt_scheduler = scheduler
+    )
+
+t0 = time.time()
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
+    # inference = "svi",
+    tol = 0.5, # tolerance is epoch loss per datum
+    variational_tol = 0.1,
+    min_epochs = MIN_EPOCHS,
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
+    verbose = True
+    )
+
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
+```
+
+
+### With a learning rate scheduler and dynamic penalty
+
+```{python}
+class PenaltyWeight:
+    def __init__(self, start = 0, end = 0, interval = 10):
+        self.start = start
+        self.end = end
+        self.interval = interval
+        self.weight = start
+        self.step = (end - start) // interval
+
+
+    def update(self):
+        if self.weight != self.end:
+            self.weight += self.step
+
+
+class TestClass:
+    def __init__(self, weight_instance):
+        self.weight_instance = weight_instance
+```
+
+
+```{python}
+pw = PenaltyWeight(0, 100)
+```
+
+```{python}
+test = TestClass(pw)
+```
+
+```{python}
+pw.update()
+```
+
+```{python}
+pw.weight
+```
+```{python}
+test.weight_instance.update()
+```
+```{python}
+test.weight_instance.weight
+```
 
 ```{python}
 
@@ -358,20 +472,22 @@ LOSS = Trace_ELBO(num_particles = 2)
 k_upper = int(k) + 10
 k_l_upper = [int(k_l) + 10 for k_l in k_l_list.tolist()]
 
+pw = PenaltyWeight(100, 0, 50)
 # hyperparam = 5.0
 factor_model = SupMultiviewDecomp(
     k_upper,
     k_l_upper,
-    ortho_penalty = 0.0,
+    ortho_penalty = 100.0,
     include_view_factors = True,
-    dense = False
+    dense = False,
+    penalty_obj = pw
 )
 
 scheduler_args = {
     'optimizer': torch.optim.Adam, 
     'optim_args': opt_args,
     'step_size': 20,
-    'gamma': 0.1,
+    'gamma': 0.5,
     'verbose': True
 }
 scheduler = pyro.optim.StepLR(scheduler_args)
@@ -648,6 +764,10 @@ est_joint_struct_cat = torch.cat(joint_means, dim = 1)
 [torch.norm(Phi_est.T @ Z_means) for Phi_est in Phi_l_means]
 ```
 
+```{python}
+[torch.norm(pyro.param(f'loc_Phi_l{l}').T @ pyro.param('loc_Z')) for l in range(3)]
+```
+
 Save param store before local training
 
 ```{python}
@@ -881,6 +1001,15 @@ torch.equal(pyro.param('loc_Lambda_l0'),
             # train_param_store
 ```
 
+```{python}
+test_var = pyro.sample("test", 
+pyro.distributions.Normal(torch.tensor(0.0), torch.tensor(1.0)),
+requires_grad = True)
+```
+
+```{python}
+test_var.backward()
+```
 
 Compare training set predictions before and after local training. Did they change when we performed local training? Do the training set predictions for indices 
 
@@ -894,6 +1023,10 @@ pd.DataFrame({
 
 
 ## Plot loadings
+
+```{python}
+sim_Lambda0 = sim_data_multiview_torch['Lambda_l'][0]
+```
 ```{python}
 sns.heatmap(
     pyro.param(Params.loc_Lambda_l.format(l = 0)).detach().numpy(),
@@ -914,6 +1047,9 @@ np.sqrt(500) + np.sqrt(100)
 ```
 
 ```{python}
+est_Lambda0_varimax = varimax(est_Lambda0)
+```
+```{python}
 sns.heatmap(
     varimax(est_Lambda0),
 # sim_data_multiview_torch.get('Lambda_l')[0],
@@ -932,6 +1068,12 @@ cmap="coolwarm"
 
 ```
 
+```{python}
+sns.heatmap(
+    pyro.param(Params.loc_Gamma_l.format(l = 0)).detach().numpy(),
+    cmap="coolwarm"
+)   
+```
 
 ```{python}
 np.linalg.svd(varimax(est_Lambda0)).S
@@ -966,7 +1108,133 @@ cmap="coolwarm"
 )
 ```
 
+```{python}
+working_Lambda = est_Lambda0 # est_Lambda0_varimax
 
+Lambda_colsums = np.sum(working_Lambda ** 2, axis = 0)
+# Lambda_colsums = np.sum(Lambda_est.detach().numpy() ** 2, axis = 0)
+Lambda_totalsum = np.sum(Lambda_colsums)
+sns.relplot(
+    Lambda_colsums / Lambda_totalsum,
+    # np.sum(Lambda_est_rotated ** 2, axis = 0),
+    kind="line"
+    )
+```
+
+```{python}
+sns.relplot(
+    np.sum(est_Lambda0_varimax ** 2, axis = 0),
+    # np.sum(Lambda_est_rotated ** 2, axis = 0),
+    kind="line"
+    )
+```
+
+```{python}
+torch.mean(pyro.param('scale_Lambda_l0'), dim = 0)
+```
+
+```{python}
+sns.relplot(torch.std(pyro.param('scale_Lambda_l0'), dim = 0).detach().numpy(), kind = "scatter")
+```
+
+When does tau become large?
+```{python}
+delta_sites = [Sites.delta_lambda_l_k.format(l = 0, m = m) for m in range(k_upper)]
+delta_post_samples = train_handler.predict(train_X_l_list_clean, 100, delta_sites)
+```
+
+```{python}
+delta_means = [np.mean(delta_post_samples[site].squeeze().tolist()) for site in delta_sites]
+tau = np.cumprod(delta_means)
+# delta_post_samples.items() #['delta_lambda_l0_k0'].shape
+# sns.relplot(1 / tau, kind = "scatter")
+sns.relplot(tau, kind = "scatter")
+```
+
+```{python}
+(est_Lambda0 @ est_Lambda0.T)
+```
+
+```{python}
+(sim_Lambda0 @ sim_Lambda0.T)
+```
+
+```{python}
+torch.norm(torch.tensor(est_Lambda0 @ est_Lambda0.T) - (sim_Lambda0 @ sim_Lambda0.T))
+```
+
+## Try to update param store
+
+```{python}
+def projection_by_qr(tens):
+    Q, _ = torch.linalg.qr(tens)
+    return Q @ Q.T
+def proj_onto_perp(P, tens):
+    return torch.sub(P, torch.mm(P, tens))
+
+```
+```{python}
+store = pyro.get_param_store()
+```
+
+
+```{python}
+locs_Z = store['loc_Z']
+```
+
+```{python}
+locs_Z.shape
+```
+
+```{python}
+locs_Phi_l_list = [store[Params.loc_Phi_l.format(l = l)] \
+                    for l in range(3)]
+```
+
+```{python}
+locs_Phi_l_list
+locs_Phi_l_list[0].shape
+```
+```{python}
+P = projection_by_qr(locs_Z)
+```
+
+```{python}
+P_perp = torch.sub(torch.eye(P.shape[0]), P)
+```
+
+```{python}
+proj_onto_perp(P, locs_Phi_l_list[0])
+```
+
+```{python}
+torch.mm(P_perp, locs_Phi_l_list[0])
+```
+
+```{python}
+torch.all(store['loc_Z'] == pyro.param('loc_Z'))
+```
+
+```{python}
+# store['loc_Z']
+new_Z = torch.tensor(3.0)
+```
+
+```{python}
+with torch.no_grad():
+    store['loc_Z'].copy_(new_Z)
+```
+
+```{python}
+pyro.param('loc_Z')
+```
+
+
+
+```{python}
+# torch.mm(torch.randn(2, 3), torch.randn(3, 2))
+torch.sub(torch.tensor((1., 1.)), torch.mm(torch.randn(2, 3), torch.randn(3, 2)))
+```
 ```{python}
 local_post_samples.keys()
 ```

@@ -9,6 +9,8 @@ from pyro.infer import SVI, Trace_ELBO, Predictive, TraceGraph_ELBO
 
 from torch.utils.data import DataLoader
 
+from constants import Sites, Params
+
 class ModelHandler:
     def __init__(self,
                  mode,
@@ -16,6 +18,7 @@ class ModelHandler:
                  guide = None,
                  opt = Adam({"lr": 0.001}),
                  loss = Trace_ELBO(),
+                 orthogonal_projection = True,
                  inference_class = SVI,
                  opt_scheduler = None,
                  local = False
@@ -52,6 +55,7 @@ class ModelHandler:
         else:
             self.opt = opt
         
+        self.orthogonal_projection = orthogonal_projection
         # self.opt_scheduler = opt_scheduler
         self.learning_rate_vec = []
         
@@ -99,6 +103,14 @@ class ModelHandler:
         # svi = self.inference_class()
         svi = SVI(self.forward, self.guide, self.opt, loss = self.loss)
         
+        ###
+        # Projection matrix
+        def projection_by_qr(tens):
+            Q, _ = torch.linalg.qr(tens)
+            return Q @ Q.T
+        # def proj_onto_perp(P, tens):
+        #     return torch.sub(P, torch.mm(P, tens))
+        
         ########################
         # Train
         # If minibatching: pass batch from loader
@@ -131,8 +143,29 @@ class ModelHandler:
                         loss = svi.step(batch, batch_idx, y_batch)
                     # print(loss)
                     epoch_loss += loss
-                    if self.opt_scheduler is not None:
-                        self.opt_scheduler.step()
+                
+                ########
+                # Project variational parameters for orthogonality constraint
+                if self.orthogonal_projection:
+                    store = pyro.get_param_store()
+                    loc_Z = store[Params.loc_Z]
+                    locs_Phi_l_list = [store[Params.loc_Phi_l.format(l = l)] \
+                        for l in range(len(self.model.k_l_list))]
+                    
+                    P_Z = projection_by_qr(loc_Z)
+                    P_Z_perp = torch.sub(torch.eye(P_Z.shape[0]), P_Z)
+                    proj_locs_Phi_l_list = [torch.mm(P_Z_perp, Phi_l) \
+                        for Phi_l in locs_Phi_l_list]
+                    with torch.no_grad():
+                        for l, loc in enumerate(proj_locs_Phi_l_list):
+                            store[Params.loc_Phi_l.format(l = l)].copy_(loc)
+                
+                
+                
+                if self.opt_scheduler is not None:
+                    self.opt_scheduler.step()
+                if self.model.penalty_obj is not None:
+                    self.model.penalty_obj.update()
                     # self.opt.param_groups
                     # self.learning_rate_vec.append()
                 
@@ -196,7 +229,7 @@ class ModelHandler:
                 # Convergence logic
                 past_min_epochs = epoch > min_epochs
                 loss_converged = epoch - epoch_at_min_loss > math.sqrt(epoch)
-                params_converged = epoch - epoch_at_min_diff > math.sqrt(epoch)
+                params_converged = True #epoch - epoch_at_min_diff > math.sqrt(epoch)
                 # params_converged = variational_diff < variational_tol
                 # params_converged = all(n < variational_tol for n in param_diff_norm_dict.values()) 
                 
@@ -208,6 +241,10 @@ class ModelHandler:
                         print(f"Number of epochs since minimum loss: {epoch - epoch_at_min_loss}")
                         print(f"Loss converged? {str(loss_converged)}")
                         print(f"Params converged? {str(params_converged)}")
+                        if self.model.penalty_obj is not None:
+                            print(f"Ortho penalty: {self.model.penalty_obj.weight}")
+                        else:
+                            print(f"Ortho penalty: {self.model.ortho_penalty}")
                 
                 # Converged?
                 if past_min_epochs and loss_converged and params_converged \
