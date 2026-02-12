@@ -689,41 +689,41 @@ class SupMultiviewDecomp(PyroModule):
         Gamma_l_list = []
         for l, (p_l, k_l) in enumerate(zip(self.p_l_list, self.k_l_list)):
             for m in range(k_l):
-                # a_delta_gamma_l_k = pyro.param(Params.a_delta_gamma_l_k.format(l = l, m = m), 
-                #                                torch.tensor(self.a1_sigma_view),
-                #                             #    torch.tensor(1.5),
-                #                                constraint = dist.constraints.positive)
-                # b_delta_gamma_l_k = pyro.param(Params.b_delta_gamma_l_k.format(l = l, m = m), 
-                #                                torch.tensor(1.0),
-                #                                constraint = dist.constraints.positive)
-                # pyro.sample(Sites.delta_gamma_l_k.format(l = l, m = m), 
-                #             dist.Gamma(a_delta_gamma_l_k, b_delta_gamma_l_k))
-                loc_delta_gamma_l_k = pyro.param(Params.a_delta_gamma_l_k.format(l = l, m = m), 
-                                               torch.tensor(0.0))
-                scale_delta_gamma_l_k = pyro.param(Params.b_delta_gamma_l_k.format(l = l, m = m), 
+                a_delta_gamma_l_k = pyro.param(Params.a_delta_gamma_l_k.format(l = l, m = m), 
+                                               torch.tensor(self.a1_sigma_view),
+                                            #    torch.tensor(1.5),
+                                               constraint = dist.constraints.positive)
+                b_delta_gamma_l_k = pyro.param(Params.b_delta_gamma_l_k.format(l = l, m = m), 
                                                torch.tensor(1.0),
                                                constraint = dist.constraints.positive)
                 pyro.sample(Sites.delta_gamma_l_k.format(l = l, m = m), 
-                            dist.LogNormal(loc_delta_gamma_l_k, scale_delta_gamma_l_k))
+                            dist.Gamma(a_delta_gamma_l_k, b_delta_gamma_l_k))
+                # loc_delta_gamma_l_k = pyro.param(Params.a_delta_gamma_l_k.format(l = l, m = m), 
+                #                                torch.tensor(0.0))
+                # scale_delta_gamma_l_k = pyro.param(Params.b_delta_gamma_l_k.format(l = l, m = m), 
+                #                                torch.tensor(1.0),
+                #                                constraint = dist.constraints.positive)
+                # pyro.sample(Sites.delta_gamma_l_k.format(l = l, m = m), 
+                #             dist.LogNormal(loc_delta_gamma_l_k, scale_delta_gamma_l_k))
                 
                 
-            # a_rho_gamma_l = pyro.param(Params.a_rho_gamma_l.format(l = l), 
-            #                                 torch.tensor(self.alpha_individual / 2),
-            #                                 # torch.tensor(1.5),
-            #                                 constraint = dist.constraints.positive)
-            # b_rho_gamma_l = pyro.param(Params.b_rho_gamma_l.format(l = l), 
-            #                                 torch.tensor(self.alpha_individual / 2),
-            #                                 # torch.tensor(1.0),
-            #                                 constraint = dist.constraints.positive)
-            # pyro.sample(Sites.rho_gamma_l.format(l = l),
-            #             dist.Gamma(a_rho_gamma_l, b_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
-            loc_rho_gamma_l = pyro.param(Params.a_rho_gamma_l.format(l = l), 
-                                            torch.tensor(0.0))
-            scale_rho_gamma_l = pyro.param(Params.b_rho_gamma_l.format(l = l), 
-                                            torch.tensor(1.0),
+            a_rho_gamma_l = pyro.param(Params.a_rho_gamma_l.format(l = l), 
+                                            torch.tensor(self.alpha_individual / 2),
+                                            # torch.tensor(1.5),
+                                            constraint = dist.constraints.positive)
+            b_rho_gamma_l = pyro.param(Params.b_rho_gamma_l.format(l = l), 
+                                            torch.tensor(self.alpha_individual / 2),
+                                            # torch.tensor(1.0),
                                             constraint = dist.constraints.positive)
             pyro.sample(Sites.rho_gamma_l.format(l = l),
-                        dist.LogNormal(loc_rho_gamma_l, scale_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
+                        dist.Gamma(a_rho_gamma_l, b_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
+            # loc_rho_gamma_l = pyro.param(Params.a_rho_gamma_l.format(l = l), 
+            #                                 torch.tensor(0.0))
+            # scale_rho_gamma_l = pyro.param(Params.b_rho_gamma_l.format(l = l), 
+            #                                 torch.tensor(1.0),
+            #                                 constraint = dist.constraints.positive)
+            # pyro.sample(Sites.rho_gamma_l.format(l = l),
+            #             dist.LogNormal(loc_rho_gamma_l, scale_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
 
             loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), torch.zeros(p_l, k_l))
             scale_Gamma_l = pyro.param(Params.scale_Gamma_l.format(l = l), 
@@ -739,41 +739,41 @@ class SupMultiviewDecomp(PyroModule):
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             for m in range(self.k):
-                # a_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l = l, m = m), 
-                #                                 torch.tensor(self.a1_sigma_joint),
-                #                                 # torch.tensor(1.5),
-                #                                 constraint = dist.constraints.positive)
-                # b_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l = l, m = m), 
-                #                                 torch.tensor(1.0),
-                #                                 constraint = dist.constraints.positive)
-                # pyro.sample(Sites.delta_lambda_l_k.format(l = l, m = m), 
-                #             dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
-                loc_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l = l, m = m), 
-                                                torch.tensor(0.0))
-                scale_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l = l, m = m), 
+                a_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l = l, m = m), 
+                                                torch.tensor(self.a1_sigma_joint),
+                                                # torch.tensor(1.5),
+                                                constraint = dist.constraints.positive)
+                b_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l = l, m = m), 
                                                 torch.tensor(1.0),
                                                 constraint = dist.constraints.positive)
                 pyro.sample(Sites.delta_lambda_l_k.format(l = l, m = m), 
-                            dist.LogNormal(loc_delta_lambda_l_k, scale_delta_lambda_l_k))
+                            dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
+                # loc_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l = l, m = m), 
+                #                                 torch.tensor(0.0))
+                # scale_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l = l, m = m), 
+                #                                 torch.tensor(1.0),
+                #                                 constraint = dist.constraints.positive)
+                # pyro.sample(Sites.delta_lambda_l_k.format(l = l, m = m), 
+                #             dist.LogNormal(loc_delta_lambda_l_k, scale_delta_lambda_l_k))
 
-            # a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l = l), 
-            #                                 torch.tensor(self.alpha_joint / 2),
-            #                                 # torch.tensor(1.5),
-            #                                 constraint = dist.constraints.positive)
-            # b_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l = l), 
-            #                                 torch.tensor(self.alpha_joint / 2),
-            #                                 # torch.tensor(1.0),
-            #                                 constraint = dist.constraints.positive)
-            # pyro.sample(Sites.rho_lambda_l.format(l = l), 
-            #             dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
-            loc_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l = l), 
-                                            torch.tensor(0.0))
-            scale_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l = l), 
-                                            torch.tensor(1.0),
+            a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l = l), 
+                                            torch.tensor(self.alpha_joint / 2),
+                                            # torch.tensor(1.5),
+                                            constraint = dist.constraints.positive)
+            b_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l = l), 
+                                            torch.tensor(self.alpha_joint / 2),
                                             # torch.tensor(1.0),
                                             constraint = dist.constraints.positive)
             pyro.sample(Sites.rho_lambda_l.format(l = l), 
-                        dist.LogNormal(loc_rho_lambda_l, scale_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
+                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
+            # loc_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l = l), 
+            #                                 torch.tensor(0.0))
+            # scale_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l = l), 
+            #                                 torch.tensor(1.0),
+            #                                 # torch.tensor(1.0),
+            #                                 constraint = dist.constraints.positive)
+            # pyro.sample(Sites.rho_lambda_l.format(l = l), 
+            #             dist.LogNormal(loc_rho_lambda_l, scale_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
             
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l = l), 
