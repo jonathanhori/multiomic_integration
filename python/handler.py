@@ -16,7 +16,7 @@ class ModelHandler:
                  mode,
                  model,
                  guide = None,
-                 opt = Adam({"lr": 0.001}),
+                 opt = Adam({"lr": 0.001}), # Opt is not needed if opt_scheduler is provided
                  loss = Trace_ELBO(),
                  orthogonal_projection = True,
                  inference_class = SVI,
@@ -146,19 +146,35 @@ class ModelHandler:
                 
                 ########
                 # Project variational parameters for orthogonality constraint
+                # Means = P @ M
+                # Vars = P^.2 @ M
                 if self.orthogonal_projection:
+                    if isinstance(self.guide, pyro.infer.autoguide.guides.AutoNormal):
+                        loc_Z_name = 'AutoNormal.locs.Z'
+                        loc_Phi_l_name = 'AutoNormal.locs.Phi_l{l}'
+                        scale_Phi_l_name = 'AutoNormal.scales.Phi_l{l}'
+                    else:
+                        loc_Z_name = Params.loc_Z
+                        loc_Phi_l_name = Params.loc_Phi_l
+                        scale_Phi_l_name = Params.scale_Phi_l
+                        
                     store = pyro.get_param_store()
-                    loc_Z = store[Params.loc_Z]
-                    locs_Phi_l_list = [store[Params.loc_Phi_l.format(l = l)] \
+                    loc_Z = store[loc_Z_name]
+                    locs_Phi_l_list = [store[loc_Phi_l_name.format(l = l)] \
+                        for l in range(len(self.model.k_l_list))]
+                    scales_Phi_l_list = [store[scale_Phi_l_name.format(l = l)] \
                         for l in range(len(self.model.k_l_list))]
                     
                     P_Z = projection_by_qr(loc_Z)
                     P_Z_perp = torch.sub(torch.eye(P_Z.shape[0]), P_Z)
                     proj_locs_Phi_l_list = [torch.mm(P_Z_perp, Phi_l) \
                         for Phi_l in locs_Phi_l_list]
+                    proj_scales_Phi_l_list = [torch.mm(torch.square(P_Z_perp), vars) \
+                        for vars in scales_Phi_l_list]
                     with torch.no_grad():
-                        for l, loc in enumerate(proj_locs_Phi_l_list):
-                            store[Params.loc_Phi_l.format(l = l)].copy_(loc)
+                        for l in range(len(self.model.k_l_list)):
+                            store[loc_Phi_l_name.format(l = l)].copy_(proj_locs_Phi_l_list[l])
+                            store[scale_Phi_l_name.format(l = l)].copy_(proj_scales_Phi_l_list[l])
                 
                 
                 
@@ -233,7 +249,7 @@ class ModelHandler:
                 # params_converged = variational_diff < variational_tol
                 # params_converged = all(n < variational_tol for n in param_diff_norm_dict.values()) 
                 
-                if verbose:
+                if verbose and epoch % 10 == 0:
                         print("--------------------")
                         print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / self.model.n:.4f}")
                         print(f"Loss at epoch {epoch+1}: {loss / self.model.n}")
