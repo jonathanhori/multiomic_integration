@@ -1,40 +1,25 @@
 import os
 import sys
 
-import rpy2.robjects as robjects
-from rpy2.robjects import r, vectors
-from rpy2 import rinterface
 
-# import pandas as pd
-# import seaborn as sns
 import itertools
 
-# from rpy2.robjects import pandas2ri, default_converter, conversion
-import numpy as np
-
-import torch
-from torch.utils.data import TensorDataset, random_split
+# import torch
 import pyro
-from pyro.optim import Adam, ClippedAdam
-from pyro.infer import Trace_ELBO
-
-from sklearn.model_selection import train_test_split
-
-# import importlib
-
-# from torchvision import transforms
+# from pyro.optim import Adam, ClippedAdam
+# from pyro.infer import Trace_ELBO
 
 from pathlib import Path
-import time
+# import time
 
-sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+from python.run_methods import evaluate_fitted_model, load_data, process_data, train_model, train_model_locally
 
-from data_utils import load_and_process_rds_data_for_condition, normalize_tensor_by_col, \
-    zero_variance_col_filter, obtain_posterior_pred_samples, \
-        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance
-from model import SupMultiviewDecomp
-from handler import ModelHandler
-from constants import Sites, Params
+# sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+
+from data_utils import load_and_process_rds_data_for_condition
+# from model import SupMultiviewDecomp
+# from handler import ModelHandler
+# from constants import Sites, Params
 
 
 train_sim_data_path = "~/multiomic_integration/sim/data/train/"
@@ -48,10 +33,21 @@ test_dirs = [os.path.join(test_sim_data_path, dir) \
     for dir in os.listdir(os.path.expanduser(test_sim_data_path)) \
         if os.path.isdir(os.path.expanduser(os.path.join(test_sim_data_path, dir)))]
 
-# dirs[0:5]
-
 filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in dirs}
 test_filename_dict = {os.path.basename(name): os.listdir(os.path.expanduser(name)) for name in test_dirs}
+
+file_dir_base = "n{}p{}_snr{}.{}_sparse{}" #/sim_data_ywithview_rep{}.rds"
+file_name_base = "sim_data_ywithview_rep{}"
+
+model_out_path = os.path.expanduser("~/multiomic_integration/sim/results/integration/models")
+model_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_deltak{}_rep{}"
+
+metric_out_path = os.path.expanduser("~/multiomic_integration/sim/results/integration/metrics")
+metric_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_deltak{}_rep{}"
+
+# Create output paths if don't exist
+Path(model_out_path).mkdir(parents=True, exist_ok=True)
+Path(metric_out_path).mkdir(parents=True, exist_ok=True)
 
 RANDOM_SEED = 123
 TRAINING_SPLIT = False
@@ -77,31 +73,29 @@ sim_grid = itertools.product(
 )
 
 N_POSTERIOR_SAMPLES = 500
-TOL = 1
-VARIATIONAL_TOL = 0.3
-MINIBATCH_SIZE = 32
-MINIBATCH_SIZE_LOW = 16
-MIN_EPOCHS = 100
-MIN_EPOCHS_HIGH = 500
-MIN_EPOCHS_LOCAL = 100
-NUM_EPOCHS = 1000
-initial_lr = 0.005
+# TOL = 1
+# VARIATIONAL_TOL = 0.3
+# MINIBATCH_SIZE = 32
+# MINIBATCH_SIZE_LOW = 16
+# MIN_EPOCHS = 100
+# MIN_EPOCHS_HIGH = 500
+# MIN_EPOCHS_LOCAL = 100
+# NUM_EPOCHS = 1000
+# initial_lr = 0.005
 
-gamma = 0.1  # final learning rate will be gamma * initial_lr
-lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+# gamma = 0.1  # final learning rate will be gamma * initial_lr
+# lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
 
-file_dir_base = "n{}p{}_snr{}.{}_sparse{}" #/sim_data_ywithview_rep{}.rds"
-file_name_base = "sim_data_ywithview_rep{}"
-
-model_out_path = os.path.expanduser("~/multiomic_integration/sim/results/integration/models")
-model_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_deltak{}_rep{}"
-
-metric_out_path = os.path.expanduser("~/multiomic_integration/sim/results/integration/metrics")
-metric_out_filename_base = "run_autonormalguide_n{}p{}_snr{}.{}_sparse{}_deltak{}_rep{}"
-
-# Create output paths if don't exist
-Path(model_out_path).mkdir(parents=True, exist_ok=True)
-Path(metric_out_path).mkdir(parents=True, exist_ok=True)
+train_config = {
+    'initial_lr': 0.1,
+    'betas': (0.0, 0.999),
+    'num_particles': 1,
+    'lr_step_size': 20,
+    'lr_decay_factor': 0.5,
+    'minibatch_size': 32,
+    'min_epochs': 20,
+    'max_epochs': 500
+}
 
 metric_list = []
 
@@ -140,6 +134,16 @@ if __name__ == "__main__":
         for rep in range(reps):
             rep += 1 # sim reps are created indexed by 1
             
+            rep_config = {
+                'n': n,
+                'p_l': p,
+                'snr_x': snr_x,
+                'snr_y': snr_y,
+                'sparsity': sparsity,
+                'k_delta': k_delta,
+                'rep': rep
+            }
+            
             # Determine if model is already saved - skip training
             model_out_filename = os.path.join(
                 model_out_path, 
@@ -151,81 +155,46 @@ if __name__ == "__main__":
             ##################
             # Setup replicate data
             
-            data_inputs = load_data(file_name_base)
-            train_subset, test_subset = process_data(data_inputs,
-                                                     TRAINING_SPLIT,
-                                                     TRAINING_SIZE,
-                                                     RANDOM_SEED)
+            sim_data, sim_data_test = load_data(file_name_base)
+            train_subset, test_subset, data_package = process_data(sim_data, 
+                                                                   sim_data_test,
+                                                                TRAINING_SPLIT,
+                                                                TRAINING_SIZE,
+                                                                RANDOM_SEED)
             
                 
             ##################
             # Perform model inference
             model_config = {
-                'k': data_inputs['k']
-                'k_l_list': data_inputs['k_l_list'],
-                'include_view_factors': True
+                'k': data_package['k'] + k_delta,
+                'k_l_list': [k_l + k_delta for k_l in data_package['k_l_list']],
+                'include_view_factors': True,
                 'dense_model': False
             }
-            train_config = {
-                'initial_lr':
-                'betas':
-                'num_particles':
-                'lr_step_size':
-                'lr_decay_factor':
-                'minibatch_size':
-                'min_epochs':
-                'max_epochs':
-            }
-            factor_model = train_model(model_config,
-                                       train_config)
-            try:
-                # if TRAINING_SPLIT:
-                #     print()
-                # else:
-                #     print()
-                
-                
-                #################
-                # Inference for predictive model
-                print('local training')
-                LOCAL_OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-                LOCAL_LOSS = Trace_ELBO(num_particles = 1)
-                
-                test_handler = ModelHandler("predict",
-                                            factor_model,
-                                            LOCAL_OPT, 
-                                            LOCAL_LOSS)
-                
-                t0 = time.time()
-                svi = test_handler.do_inference(
-                    test_subset,
-                    variational_tol = VARIATIONAL_TOL,
-                    min_epochs = MIN_EPOCHS_LOCAL,
-                    epochs = NUM_EPOCHS,
-                    minibatch_flag = True,
-                    minibatch_size = MINIBATCH_SIZE,
-                    verbose = False
+            local_config = train_config
+            
+            factor_model, train_handler, global_train_state = train_model(model_config,
+                                                     train_config,
+                                                     train_subset,
+                                                     model_out_filename)
+            
+            factor_model, test_handler, local_train_state = train_model_locally(factor_model,
+                                                            local_config,
+                                                            test_subset)
+            
+            try:             
+                metric_out_filename = os.path.join(
+                    metric_out_path, 
+                    metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, rep)
                     )
-                t1 = time.time()
-                test_run_minibatch = t1 - t0
-                
-                torch.save({
-                    "inference_time": run_minibatch,
-                    "epochs": factor_model.local_epochs,
-                    # "model_param_store": pyro.get_param_store(),
-                    "model_state_dict": pyro.get_param_store().get_state(),
-                    "optimizer_state": test_handler.opt.get_state(),
-                    "loss_history": factor_model.local_loss_history,
-                    "param_convergence_history": factor_model.local_var_param_convergence_history                
-                }, model_out_filename + "_local.pth")
-
-                pyro.get_param_store().save(model_out_filename + "_local_paramstore.pth")
-                    
-                    
-                    
-                #######
-                
-                eval_metric_table = evaluate_fitted_model(factor_model)
+                eval_metric_table = evaluate_fitted_model(rep_config,
+                                                          data_package,
+                                                          train_handler,
+                                                          test_handler,
+                                                          global_train_state,
+                                                          local_train_state,
+                                                          N_POSTERIOR_SAMPLES,
+                                                          metric_out_filename)
                 
                 metric_list.append(eval_metric_table)
             except Exception as e:
