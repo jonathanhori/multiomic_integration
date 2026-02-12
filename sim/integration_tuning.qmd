@@ -73,6 +73,12 @@ from handler import ModelHandler
 from constants import Params, Sites
 ```
 
+
+```{python}
+importlib.reload(sys.modules["run_methods"])
+from run_methods import evaluate_fitted_model, load_data, process_data, train_model, train_model_locally
+```
+
 # Load data
 
 ## Load multiview data
@@ -148,7 +154,7 @@ train_subset = TensorDataset(torch.arange(train_X_l_list[0].shape[0]),
 With train/test split
 
 ```{python}
-TRAINING_SPLIT = False
+TRAINING_SPLIT = True
 
 TRAINING_SIZE = 0.8
 RANDOM_SEED = 123
@@ -406,6 +412,18 @@ print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epoc
 ```
 
 
+```{python}
+train_handler = ModelHandler(
+    "train", 
+    factor_model,
+    # opt = OPT, 
+    loss = LOSS,
+    orthogonal_projection = True,
+    inference_class = SVI,
+    opt_scheduler = scheduler
+    )
+```
+
 ### With a learning rate scheduler and dynamic penalty
 
 ```{python}
@@ -546,20 +564,11 @@ factor_model.predict_forward(train_X_l_list_clean,
 ClippedAdam with learning rate decay.
 Start lr = 0.001. Over 1000 epochs 
 
-With autoguide
+### With autoguide and scheduler
 
 ```{python}
 
 pyro.clear_param_store()
-
-# hyperparam = 5.0
-# factor_model = SupMultiviewDecomp(
-#     int(k),
-#     k_l_list.int().tolist(),
-#     int(train_X_l_list_clean[0].shape[0]),
-#     include_view_factors = True,
-#     dense = False
-# )
 
 factor_model = SupMultiviewDecomp(
     k_upper,
@@ -584,40 +593,37 @@ pyro.clear_param_store()
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 500
 MIN_EPOCHS = 50
-initial_lr = 0.001
+initial_lr = 0.1
 gamma = 0.1  # final learning rate will be gamma * initial_lr
 lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
-OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)}) # (0.9, 0.999)
+opt_args = {"lr": initial_lr, "betas": (0.9, 0.999)}
+# OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)}) # (0.9, 0.999)
 LOSS = Trace_ELBO(num_particles = 2)
 
-# t0 = time.time()
-# svi, opt = do_inference(
-#     train_subset,
-#     # X_l_list_clean,
-#     # y_clean,
-#     factor_model,
-#     guide,
-#     opt = OPT,
-#     elbo = LOSS,
-#     inference = "svi",
-#     tol = 0.5, # tolerance is epoch loss per datum
-#     variational_tol = 0.3,
-#     min_epochs = 30,
-#     epochs = NUM_EPOCHS,
-#     minibatch_flag = True,
-#     minibatch_size = MINIBATCH_SIZE,
-#     verbose = True
-#     )
+scheduler_args = {
+    'optimizer': torch.optim.Adam, 
+    'optim_args': opt_args,
+    'step_size': 20,
+    'gamma': 0.5,
+    'verbose': True
+}
+scheduler = pyro.optim.StepLR(scheduler_args)
 
-# t1 = time.time()
-
-
-train_handler = ModelHandler("train", factor_model, guide, OPT, LOSS)
+train_handler = ModelHandler(
+    "train", 
+    factor_model, 
+    guide = guide, 
+    opt = OPT, 
+    loss = LOSS,
+    orthogonal_projection = True,
+    inference_class = SVI,
+    opt_scheduler = scheduler
+    )
 
 t0 = time.time()
 svi = train_handler.do_inference(
     train_dataset = train_subset,
-    inference = "svi",
+    # inference = "svi",
     tol = 0.5, # tolerance is epoch loss per datum
     variational_tol = 0.1,
     min_epochs = MIN_EPOCHS,
@@ -633,7 +639,18 @@ run_minibatch = t1 - t0
 print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
 ```
 
-
+```{python}
+train_handler = ModelHandler(
+    "train", 
+    factor_model, 
+    guide = guide, 
+    opt = OPT, 
+    loss = LOSS,
+    orthogonal_projection = True,
+    inference_class = SVI,
+    opt_scheduler = scheduler
+    )
+```
 
 ## Plot loss
 ```{python}
@@ -707,7 +724,7 @@ eval_structures_train = calc_all_structures_with_rescaling(L,
 ```
 
 ```{python}
-eval_metric_table = eval_performance(**eval_structures)
+eval_metric_table = eval_performance(**eval_structures_train)
 # eval_metric_table = eval_performance(**eval_structures_train)
 eval_metric_table 
 ```
@@ -834,10 +851,10 @@ factor_model = copy.deepcopy(factor_model_copy)
 ```
 
 ```{python}
-param_store = pyro.get_param_store()
-pred_param = [x for x in param_store.keys() if "_pred" in x]
-for name in pred_param:
-    del param_store[name]
+# param_store = pyro.get_param_store()
+# pred_param = [x for x in param_store.keys() if "_pred" in x]
+# for name in pred_param:
+#     del param_store[name]
 ```
 
 ```{python}
@@ -845,13 +862,34 @@ param_store.keys()
 ```
 
 ```{python}
-LOCAL_OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
+# LOCAL_OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
 LOCAL_LOSS = Trace_ELBO(num_particles = 1)
 
-test_handler = ModelHandler("predict",
-                            factor_model,
-                            LOCAL_OPT, 
-                            LOCAL_LOSS)
+# test_handler = ModelHandler("predict",
+#                             factor_model,
+#                             LOCAL_OPT, 
+#                             LOCAL_LOSS)
+
+### With learning rate scheduler
+local_opt_args = {"lr": 0.01, "betas": (0.9, 0.999)}
+scheduler_args = {
+    'optimizer': torch.optim.Adam, 
+    'optim_args': opt_args,
+    'step_size': 20,
+    'gamma': 0.5,
+    'verbose': True
+}
+scheduler = pyro.optim.StepLR(scheduler_args)
+
+test_handler = ModelHandler(
+    "predict", 
+    factor_model,
+    # opt = OPT, 
+    loss = LOCAL_LOSS,
+    orthogonal_projection = True,
+    inference_class = SVI,
+    opt_scheduler = scheduler
+    )
 
 t0 = time.time()
 svi = test_handler.do_inference(
@@ -904,6 +942,7 @@ SIM_decomp = extract_sim_decomp(sim_data_multiview_torch)
 # Filter corresponding rows of test set structures
 train_SIM_decomp = {k: v for k, v in SIM_decomp.items()}
 train_SIM_decomp['SIM_Z'] = train_SIM_decomp['SIM_Z'][train_idx, :]
+train_SIM_decomp['SIM_Phi_l_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_perp_list']]
 train_SIM_decomp['SIM_Phi_l_perp_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_perp_list']]
 
 local_eval_structures = calc_all_structures_with_rescaling(L,
@@ -925,6 +964,12 @@ local_eval_structures_train = calc_all_structures_with_rescaling(L,
                                                     train_SIM_decomp,
                                                     # train_y_clean.squeeze()) 
                                                     train_y_clean.squeeze())
+```
+
+
+```{python}
+local_eval_structures['sim_individual_data_struct'][0].shape
+# local_eval_structures['post_pred_joint_data_struct'][0].shape
 ```
 
 ```{python}
@@ -1253,4 +1298,166 @@ A0 = local_post_samples[Sites.view_structure_l.format(l = 0)].mean(dim = 0)
 ```{python}
 J = [local_post_samples[Sites.joint_structure_l.format(l = l)].mean(dim = 0) for l in range(L)]
 A = [local_post_samples[Sites.view_structure_l.format(l = l)].mean(dim = 0) for l in range(L)]
+```
+
+
+
+
+# ___________________
+# Run using modular functions
+
+```{python}
+train_subset, test_subset, data_package = process_data(sim_data_multiview_torch, 
+                                                        sim_data_multiview_torch,
+                                                    True,
+                                                    0.8,
+                                                    123)
+```
+
+
+
+```{python}
+##################
+# Perform model inference
+# n_array = [500] #, 1000)
+# p_array = [100]
+# snr_x_array = [2] #(2, 1, 0.5)
+# snr_y_array = [2] #(2, 1, 0.5)
+# reps = 1
+# loading_sparsity = [0.25]
+# k_deltas = [10]
+
+# # n_array = (50, 100, 500) #, 1000)
+# # p_array = (50, 100, 1000)
+# # snr_x_array = [2] #(2, 1, 0.5)
+# # snr_y_array = [2] #(2, 1, 0.5)
+# # reps = 10
+# # loading_sparsity = [0, 0.25, 0.5]
+# # k_deltas = [0, 10]
+
+# sim_grid = itertools.product(
+#     n_array,
+#     p_array,
+#     snr_x_array,
+#     snr_y_array,
+#     # range(reps),
+#     loading_sparsity,
+#     k_deltas
+#     # [loading_sparsity]
+# )
+
+k_delta = 10
+train_config = {
+    'initial_lr': 0.1,
+    'betas': (0.9, 0.999),
+    'num_particles': 1,
+    'lr_step_size': 20,
+    'lr_decay_factor': 0.5,
+    'minibatch_size': 32,
+    'min_epochs': 20,
+    'max_epochs': 50
+}
+
+
+model_config = {
+    'k': data_package['k'] + k_delta,
+    'k_l_list': [k_l + k_delta for k_l in data_package['k_l_list']],
+    'include_view_factors': True,
+    'dense_model': False
+}
+local_config = train_config
+```
+
+```{python}
+rep_config = {
+                'n': 500,
+                'p_l': 100,
+                'snr_x': 2,
+                'snr_y': 2,
+                'sparsity': 0.25,
+                'k_delta': 10,
+                'rep': 1
+            }
+```
+
+
+```{python}
+factor_model, train_handler, global_train_state = train_model(model_config,
+                                            train_config,
+                                            train_subset,
+                                            "test_mod")
+```
+
+
+
+```{python}
+checking_sample = test_subset[0]
+```
+
+```{python}
+loader = torch.utils.data.DataLoader(test_subset, batch_size = 32, shuffle = True, drop_last=True)
+# idx = checking_sample.pop(0)
+```
+
+
+```{python}
+one_batch = next(iter(loader))
+```
+
+```{python}
+one_batch
+batch_idx = one_batch.pop(0)
+
+```
+
+```{python}
+one_batch
+```
+
+```{python}
+batch_label = one_batch.pop(-1).squeeze()
+```
+
+```{python}
+batch_label
+```
+
+```{python}
+batch_idx
+```
+
+```{python}
+factor_model, test_handler, local_train_state = train_model_locally(factor_model,
+                                                local_config,
+                                                test_subset,
+                                                "test_mod2")
+```
+
+
+
+```{python}
+eval_metric_table = evaluate_fitted_model(rep_config,
+                                            data_package,
+                                            train_handler,
+                                            test_handler,
+                                            global_train_state,
+                                            local_train_state,
+                                            100,
+                                            "test_out")
+```
+
+
+```{python}
+
+eval_metric_table.\
+    assign(
+        initial_lr = train_config['initial_lr'],
+        betas = str(train_config['betas']),
+        num_particles = train_config['num_particles'],
+        lr_step_size = train_config['lr_step_size'],
+        lr_decay_factor = train_config['lr_decay_factor'],
+        minibatch_size = train_config['minibatch_size'],
+        min_epochs = train_config['min_epochs'],
+        max_epochs = train_config['max_epochs']
+    )
 ```

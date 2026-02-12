@@ -1,6 +1,5 @@
 import time
 import numpy as np
-import os
 
 from sklearn.model_selection import train_test_split
 import torch
@@ -8,11 +7,12 @@ from torch.utils.data import TensorDataset
 import pyro
 from pyro.infer import Trace_ELBO
 
-from python.constants import Sites
-from python.data_utils import calc_all_structures_with_rescaling, eval_performance, \
+from constants import Sites
+from data_utils import calc_all_structures_with_rescaling, eval_performance, \
     extract_sim_decomp, normalize_tensor_by_col, zero_variance_col_filter
-from python.handler import ModelHandler
-from python.model import SupMultiviewDecomp
+from handler import ModelHandler
+from model import SupMultiviewDecomp
+
 
 def load_data(file_name_base,
               rep,
@@ -29,7 +29,10 @@ def load_data(file_name_base,
     # Extract desired replicate
     print(file_name_base.format(rep))
     sim_data = files_for_condition.get(file_name_base.format(rep))
-    sim_data_test = test_files_for_condition.get(file_name_base.format(rep))
+    if test_files_for_condition is not None:
+        sim_data_test = test_files_for_condition.get(file_name_base.format(rep))
+    else:
+        sim_data_test = None
     
     # L = int(sim_data.get("L"))
     
@@ -76,25 +79,12 @@ def process_data(sim_data,
     X_l_list = sim_data.get("X_l")
     y = sim_data.get("y")
     
-    X_l_list_test = sim_data_test.get("X_l")
-    y_test = sim_data_test.get("y")
-    
     k = int(sim_data.get("K"))
     k_l_list = sim_data.get("K_l").int().tolist() #[int(k_l + k_delta) for k_l in sim_data.get("K_l").int().tolist()]
     
     n = X_l_list[0].shape[0]
-    n_test = X_l_list_test[0].shape[0]
     
     p_l = int(sim_data.get("p_l")[0])
-    
-    # X_l_list = data_inputs['X_l_list']
-    # y = data_inputs['y']
-    
-    # X_l_list_test = data_inputs['X_l_list_test']
-    # y_test = data_inputs['y_test']
-    
-    # n = data_inputs['n']
-    # n_test = data_inputs['n_test']
 
     # Perform train/test split if necessary
     if training_split:
@@ -110,6 +100,10 @@ def process_data(sim_data,
         train_y = y[train_idx]
         test_y = y[test_idx]
     else:
+        X_l_list_test = sim_data_test.get("X_l")
+        y_test = sim_data_test.get("y")
+        n_test = X_l_list_test[0].shape[0]
+    
         train_idx = torch.arange(n)
         test_idx = torch.arange(n_test)
         
@@ -258,7 +252,8 @@ def train_model(model_config,
             "model_state_dict": pyro.get_param_store().get_state(),
             "optimizer_state": train_handler.opt.get_state(),
             "loss_history": factor_model.loss_history,
-            "param_convergence_history": factor_model.var_param_convergence_history                
+            "param_convergence_history": factor_model.var_param_convergence_history,
+            "config": train_config              
         }
 
         torch.save(model_state_dict, model_out_filename + ".pth")
@@ -305,7 +300,7 @@ def train_model_locally(factor_model,
     
     test_handler = ModelHandler("predict",
                                 factor_model,
-                                LOCAL_LOSS,
+                                loss = LOCAL_LOSS,
                                 orthogonal_projection = True,
                                 opt_scheduler = scheduler)  
     
@@ -328,7 +323,8 @@ def train_model_locally(factor_model,
         "model_state_dict": pyro.get_param_store().get_state(),
         "optimizer_state": test_handler.opt.get_state(),
         "loss_history": factor_model.local_loss_history,
-        "param_convergence_history": factor_model.local_var_param_convergence_history                
+        "param_convergence_history": factor_model.local_var_param_convergence_history,
+        "config": train_config                
     }
     
     torch.save(model_state_dict, model_out_filename + "_local.pth")
@@ -415,8 +411,8 @@ def evaluate_fitted_model(rep_config,
 
     # Save evaluation
     
-    print("Exporting metrics:")
-    print(metric_out_filename)
+    # print("Exporting metrics:")
+    # print(metric_out_filename)
 
-    eval_metric_table.to_csv(metric_out_filename + ".csv")
+    # eval_metric_table.to_csv(metric_out_filename + ".csv")
     return eval_metric_table
