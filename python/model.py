@@ -12,6 +12,7 @@ from pyro.nn import PyroModule
 from pyro.poutine import mask
 
 from constants import Sites, Params
+from data_utils import align_tensor_shapes
 
 pyro.enable_validation(True)
 pyro.set_rng_seed(0)
@@ -37,12 +38,16 @@ class SupMultiviewDecomp(PyroModule):
                  a2_sigma_view=3.1,
                  alpha_joint = 3.0,
                  alpha_individual = 3.0,
-                 a_psi=2.0, # Hyperparams: per-view error: IG same for all views
-                 b_psi=2.0,
-                 a_sigma_y = 2.0, # Hyperparams: outcome error: IG
-                 b_sigma_y = 2.0,
+                 a_psi=3.0, # Hyperparams: per-view error: IG same for all views
+                 b_psi=1.0,
+                 a_sigma_y = 3.0, # Hyperparams: outcome error: IG
+                 b_sigma_y = 1.0,
                  a_sigma_beta = 2.0, # Hyperparams: outcome coefficients: IG
-                 b_sigma_beta = 2.0
+                 b_sigma_beta = 2.0,
+                 joint_scores_init = None,
+                 joint_loadings_list_init = None,
+                 view_scores_list_init = None,
+                 view_loadings_list_init = None
                  ):
         super().__init__()
         
@@ -82,6 +87,12 @@ class SupMultiviewDecomp(PyroModule):
         self.a_sigma_beta = a_sigma_beta
         self.b_sigma_beta = b_sigma_beta
         
+        # For testing: Can initialize location params of scores and loadings with given values
+        self.joint_scores_init = joint_scores_init
+        self.joint_loadings_list_init = joint_loadings_list_init
+        self.view_scores_list_init = view_scores_list_init
+        self.view_loadings_list_init = view_loadings_list_init
+        
         # Should view-specific factors be included in the outcome model?
         self.include_view_factors = include_view_factors
         self.num_outcome_factors = k if not include_view_factors else sum((k, *k_l_list))
@@ -97,6 +108,10 @@ class SupMultiviewDecomp(PyroModule):
         self.local_var_param_convergence_history = []
         
         self.params = None
+        
+        self.inv_gamma_init_param = 2.1
+        self.init_param = 0.1
+    
         
     def forward(self, 
                 X_list, 
@@ -234,7 +249,7 @@ class SupMultiviewDecomp(PyroModule):
             raise NotImplementedError
         
         # orthogonality_weight = pyro.sample("ortho_weight", dist.InverseGamma(1, 1))
-        orthogonality_weight = 100.
+        # orthogonality_weight = 100.
         
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx):
@@ -677,6 +692,10 @@ class SupMultiviewDecomp(PyroModule):
         if self.dense:
             raise NotImplementedError
         
+        def projection_by_qr(tens):
+            Q, _ = torch.linalg.qr(tens)
+            return Q @ Q.T
+        
         m = len(batch_idx)
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
@@ -690,11 +709,11 @@ class SupMultiviewDecomp(PyroModule):
         for l, (p_l, k_l) in enumerate(zip(self.p_l_list, self.k_l_list)):
             for m in range(k_l):
                 a_delta_gamma_l_k = pyro.param(Params.a_delta_gamma_l_k.format(l = l, m = m), 
-                                               torch.tensor(self.a1_sigma_view),
-                                            #    torch.tensor(1.5),
+                                            #    torch.tensor(self.a1_sigma_view),
+                                               torch.tensor(self.init_param),
                                                constraint = dist.constraints.positive)
                 b_delta_gamma_l_k = pyro.param(Params.b_delta_gamma_l_k.format(l = l, m = m), 
-                                               torch.tensor(1.0),
+                                               torch.tensor(self.init_param),
                                                constraint = dist.constraints.positive)
                 pyro.sample(Sites.delta_gamma_l_k.format(l = l, m = m), 
                             dist.Gamma(a_delta_gamma_l_k, b_delta_gamma_l_k))
@@ -708,12 +727,12 @@ class SupMultiviewDecomp(PyroModule):
                 
                 
             a_rho_gamma_l = pyro.param(Params.a_rho_gamma_l.format(l = l), 
-                                            torch.tensor(self.alpha_individual / 2),
-                                            # torch.tensor(1.5),
+                                            # torch.tensor(self.alpha_individual / 2),
+                                            torch.tensor(self.init_param),
                                             constraint = dist.constraints.positive)
             b_rho_gamma_l = pyro.param(Params.b_rho_gamma_l.format(l = l), 
-                                            torch.tensor(self.alpha_individual / 2),
-                                            # torch.tensor(1.0),
+                                            # torch.tensor(self.alpha_individual / 2),
+                                            torch.tensor(self.init_param),
                                             constraint = dist.constraints.positive)
             pyro.sample(Sites.rho_gamma_l.format(l = l),
                         dist.Gamma(a_rho_gamma_l, b_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
@@ -725,10 +744,16 @@ class SupMultiviewDecomp(PyroModule):
             # pyro.sample(Sites.rho_gamma_l.format(l = l),
             #             dist.LogNormal(loc_rho_gamma_l, scale_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
 
-            loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), torch.zeros(p_l, k_l))
+            if self.view_loadings_list_init:
+                loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), 
+                                         align_tensor_shapes(self.view_loadings_list_init[l], 
+                                                             additional = k_l - self.view_loadings_list_init[l].shape[1])
+                                         )
+            else:
+                loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), torch.zeros(p_l, k_l))
             scale_Gamma_l = pyro.param(Params.scale_Gamma_l.format(l = l), 
-                                       torch.ones(p_l, k_l),
-                                    #    torch.tensor(0.1).expand([p_l, k_l]),
+                                    #    torch.ones(p_l, k_l),
+                                       torch.tensor(self.init_param).expand([p_l, k_l]),
                                        constraint = dist.constraints.positive)
             Gamma_l = pyro.sample(Sites.Gamma_l.format(l = l), 
                                   dist.Normal(loc_Gamma_l, scale_Gamma_l).to_event(2))
@@ -740,11 +765,11 @@ class SupMultiviewDecomp(PyroModule):
         for l, p_l in enumerate(self.p_l_list):
             for m in range(self.k):
                 a_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l = l, m = m), 
-                                                torch.tensor(self.a1_sigma_joint),
-                                                # torch.tensor(1.5),
+                                                # torch.tensor(self.a1_sigma_joint),
+                                                torch.tensor(self.init_param),
                                                 constraint = dist.constraints.positive)
                 b_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l = l, m = m), 
-                                                torch.tensor(1.0),
+                                                torch.tensor(self.init_param),
                                                 constraint = dist.constraints.positive)
                 pyro.sample(Sites.delta_lambda_l_k.format(l = l, m = m), 
                             dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
@@ -757,12 +782,12 @@ class SupMultiviewDecomp(PyroModule):
                 #             dist.LogNormal(loc_delta_lambda_l_k, scale_delta_lambda_l_k))
 
             a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l = l), 
-                                            torch.tensor(self.alpha_joint / 2),
-                                            # torch.tensor(1.5),
+                                            # torch.tensor(self.alpha_joint / 2),
+                                            torch.tensor(self.init_param),
                                             constraint = dist.constraints.positive)
             b_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l = l), 
-                                            torch.tensor(self.alpha_joint / 2),
-                                            # torch.tensor(1.0),
+                                            # torch.tensor(self.alpha_joint / 2),
+                                            torch.tensor(self.init_param),
                                             constraint = dist.constraints.positive)
             pyro.sample(Sites.rho_lambda_l.format(l = l), 
                         dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
@@ -775,10 +800,16 @@ class SupMultiviewDecomp(PyroModule):
             # pyro.sample(Sites.rho_lambda_l.format(l = l), 
             #             dist.LogNormal(loc_rho_lambda_l, scale_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
             
-            loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
+            if self.joint_loadings_list_init:
+                loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), 
+                                          align_tensor_shapes(self.joint_loadings_list_init[l], 
+                                                             additional = self.k - self.joint_loadings_list_init[l].shape[1])
+                                         )
+            else:
+                loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l = l), 
-                                        torch.ones(p_l, self.k),
-                                        # torch.tensor(0.1).expand([p_l, k_l]),
+                                        # torch.ones(p_l, self.k),
+                                        torch.tensor(self.init_param).expand([p_l, self.k]),
                                         constraint = dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l = l), 
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -795,12 +826,12 @@ class SupMultiviewDecomp(PyroModule):
         psi_sqrt_l_list = []           
         for l, p_l in enumerate(self.p_l_list):
             a_psi_l = pyro.param(Params.a_psi_l.format(l = l), 
-                                 torch.tensor(self.a_psi),
-                                #  torch.tensor(2.5),
+                                #  torch.tensor(self.a_psi),
+                                 torch.tensor(self.inv_gamma_init_param),
                                  constraint = dist.constraints.positive)
             b_psi_l = pyro.param(Params.b_psi_l.format(l = l), 
-                                 torch.tensor(self.b_psi),
-                                # torch.tensor(1.0),
+                                #  torch.tensor(self.b_psi),
+                                torch.tensor(self.init_param),
                                  constraint = dist.constraints.positive)
             psi_l = pyro.sample(Sites.psi_l.format(l = l), 
                                 # dist.Gamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
@@ -812,21 +843,21 @@ class SupMultiviewDecomp(PyroModule):
         # Outcome model coefficients
         a_sigma_beta = pyro.param(Params.a_sigma_beta, 
                                 #   torch.tensor(2.1),
-                                #   torch.tensor(2.5),
-                                  torch.tensor(self.a_sigma_beta),
+                                  torch.tensor(self.inv_gamma_init_param),
+                                #   torch.tensor(self.a_sigma_beta),
                                   constraint = dist.constraints.positive)
         b_sigma_beta = pyro.param(Params.b_sigma_beta, 
-                                  torch.tensor(self.b_sigma_beta),
+                                #   torch.tensor(self.b_sigma_beta),
                                 #   torch.tensor(0.1),
-                                #   torch.tensor(1.0),
+                                  torch.tensor(self.init_param),
                                   constraint = dist.constraints.positive)
         sigma2_beta = pyro.sample(Sites.sigma2_beta,
                                   dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.num_outcome_factors]).to_event(1))
         
         loc_beta = pyro.param(Params.loc_beta, torch.zeros(self.num_outcome_factors))
         scale_beta = pyro.param(Params.scale_beta, 
-                                torch.ones(self.num_outcome_factors),
-                                # torch.tensor(0.1).expand([self.num_outcome_factors]),
+                                # torch.ones(self.num_outcome_factors),
+                                torch.tensor(self.init_param).expand([self.num_outcome_factors]),
                                 constraint = dist.constraints.positive)
         beta = pyro.sample(Sites.beta,
                            dist.Normal(loc_beta, scale_beta).to_event(1)).\
@@ -836,14 +867,15 @@ class SupMultiviewDecomp(PyroModule):
         # Continuous: Normal variances
         if self.outcome == "gaussian":
             a_sigma_y = pyro.param(Params.a_sigma_y, 
-                                   torch.tensor(self.a_sigma_y),
+                                #    torch.tensor(self.a_sigma_y),
+                                   torch.tensor(self.inv_gamma_init_param),
                                 #    torch.tensor(2.1),
                                 #    torch.tensor(2.5),
                                    constraint = dist.constraints.positive)
             b_sigma_y = pyro.param(Params.b_sigma_y, 
-                                   torch.tensor(self.b_sigma_y),
+                                #    torch.tensor(self.b_sigma_y),
                                 #    torch.tensor(0.1),
-                                #    torch.tensor(1.0),
+                                   torch.tensor(self.init_param),
                                    constraint = dist.constraints.positive)
             sigma2_y = pyro.sample(Sites.sigma2_y,
                                 dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
@@ -854,22 +886,61 @@ class SupMultiviewDecomp(PyroModule):
             raise NotImplementedError
         
         # Local latent variables and observations
-        loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
+        if self.joint_scores_init:
+            loc_Z = pyro.param(Params.loc_Z, 
+                               align_tensor_shapes(self.joint_scores_init,
+                                                   additional = self.k - self.joint_scores_init)
+            )
+        else:
+            loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
         # scale_Z = pyro.param(Params.scale_Z, torch.ones(self.n, self.k),
         #                         constraint = dist.constraints.positive)
         scale_Z = pyro.param(Params.scale_Z, 
-                             torch.tensor(0.1).expand([self.n, self.k]),
+                             torch.tensor(self.init_param).expand([self.n, self.k]),
                              constraint = dist.constraints.positive)
         loc_Phi_list = []
         scale_Phi_list = []
         for l, k_l in enumerate(self.k_l_list):
-            loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
+            if self.view_scores_list_init:
+                loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), 
+                                       align_tensor_shapes(self.view_scores_list_init[l],
+                                                           additional = k_l - self.view_scores_list_init[l])
+                                       )
+            else:
+                loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
             scale_Phi_l = pyro.param(Params.scale_Phi_l.format(l = l), 
-                                     torch.ones(self.n, k_l),
-                                    #  torch.tensor(0.1).expand([self.n, k_l]),
-                                     constraint = dist.constraints.positive)
+                                    #  torch.ones(self.n, k_l),
+                                     torch.tensor(self.init_param).expand([self.n, k_l]),
+                                     constraint = dist.constraints.greater_than_eq(0.0)) #dist.constraints.positive
             loc_Phi_list.append(loc_Phi_l)
             scale_Phi_list.append(scale_Phi_l)
+        
+        # PROJECTION OF VIEW-SPECIFIC STRUCTURE THROUGH SCORES
+        # print('loc_z at beginning')
+        # print(loc_Z)
+         #@ torch.cat([Lambda.T for Lambda in Lambda_l_list],
+                                        #   dim = 1)
+        # with torch.no_grad():
+        #     A = loc_Z
+        #     P_A = projection_by_qr(A) # TODO make below faster
+        #     P_A_perp = torch.sub(torch.eye(P_A.shape[0]), P_A)
+        
+        # # print(P_A_perp)
+        # # Means
+        # proj_locs_Phi_l_list = [torch.mm(P_A_perp, Phi_l) \
+        #     for Phi_l in loc_Phi_list]
+        # # Variances
+        # proj_scales_Phi_l_list = []
+        # for vars in scale_Phi_list:
+        #     proj_scales = torch.stack(
+        #         [torch.diag(P_A_perp * vars[:, k] @ P_A_perp.T) \
+        #             for k in range(vars.shape[1])],
+        #         dim = 1
+        #     ) + 1e-3
+        #     proj_scales_Phi_l_list.append(proj_scales)
+            
+            
+            
             
         # ortho_a = pyro.param("ortho_a",
         #                         torch.tensor(1.),
@@ -884,7 +955,16 @@ class SupMultiviewDecomp(PyroModule):
         with pyro.plate("obs", self.n, subsample = batch_idx):
             loc_Z_batch = loc_Z[batch_idx]
             scale_Z_batch = scale_Z[batch_idx]
+            
+            # print('loc_Z')
+            # print(loc_Z_batch)
+            # print('scale_Z')
+            # print(scale_Z_batch)
             Z = pyro.sample(Sites.Z, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
+            
+            # print('sampled_Z')
+            # print(Z)
+            # print(Z)
             
             loc_Phi_l_list = []
             Phi_l_list = []
@@ -892,8 +972,18 @@ class SupMultiviewDecomp(PyroModule):
                 # loc_Z
                 loc_Phi = loc_Phi_list[l][batch_idx]
                 scale_Phi = scale_Phi_list[l][batch_idx]
+                
+                # loc_Phi = proj_locs_Phi_l_list[l][batch_idx]
+                # scale_Phi = proj_scales_Phi_l_list[l][batch_idx]
+                
+                # print('loc_Phi')
+                # print(loc_Phi)
+                # print(scale_Phi)
+                
                 Phi_l = pyro.sample(Sites.Phi_l.format(l = l), 
                                     dist.Normal(loc_Phi, scale_Phi).to_event(1))
+                # print('sampled_Phi')
+                # print(Phi_l)
                 Phi_l_list.append(Phi_l)
                 loc_Phi_l_list.append(loc_Phi)
                 
@@ -915,23 +1005,23 @@ class SupMultiviewDecomp(PyroModule):
             joint_structure_full = torch.cat(joint_structure_list, 1)
                 
             # Calculate penalty terms
-            if (self.ortho_penalty != 0 and self.penalty_obj is None) or \
-                (self.penalty_obj is not None and self.penalty_obj.weight != 0):
-                total_penalty = torch.tensor(0.0)
-                for l in range(len(X_list)):
-                    # cross_prod = view_structure_list[l].T @ joint_structure_full
-                    cross_prod = Phi_l_list[l].T @ Z
-                    # cross_prod = loc_Phi_l_list[l].T @ loc_Z_batch
+            # if (self.ortho_penalty != 0 and self.penalty_obj is None) or \
+            #     (self.penalty_obj is not None and self.penalty_obj.weight != 0):
+            #     total_penalty = torch.tensor(0.0)
+            #     for l in range(len(X_list)):
+            #         # cross_prod = view_structure_list[l].T @ joint_structure_full
+            #         cross_prod = Phi_l_list[l].T @ Z
+            #         # cross_prod = loc_Phi_l_list[l].T @ loc_Z_batch
                     
-                    total_penalty += torch.sum(cross_prod ** 2)
-                if self.penalty_obj is None:
-                    pyro.factor("orthogonality", 
-                                self.ortho_penalty * total_penalty * (len(batch_idx) / self.n),
-                                has_rsample = True)
-                else:
-                    pyro.factor("orthogonality", 
-                            self.penalty_obj.weight * total_penalty * (len(batch_idx) / self.n),
-                            has_rsample = True)
+            #         total_penalty += torch.sum(cross_prod ** 2)
+            #     if self.penalty_obj is None:
+            #         pyro.factor("orthogonality", 
+            #                     self.ortho_penalty * total_penalty * (len(batch_idx) / self.n),
+            #                     has_rsample = True)
+            #     else:
+            #         pyro.factor("orthogonality", 
+            #                 self.penalty_obj.weight * total_penalty * (len(batch_idx) / self.n),
+            #                 has_rsample = True)
                 
                 # X_l = pyro.sample(f"X_l{l}", dist.Normal(total_structure_l, 
                 #                                    psi_sqrt_l_list[l]).to_event(1), 
