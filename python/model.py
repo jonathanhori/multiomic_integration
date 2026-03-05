@@ -744,10 +744,11 @@ class SupMultiviewDecomp(PyroModule):
             # pyro.sample(Sites.rho_gamma_l.format(l = l),
             #             dist.LogNormal(loc_rho_gamma_l, scale_rho_gamma_l).expand([p_l, k_l]).to_event(2)).squeeze()
 
-            if self.view_loadings_list_init:
+            if self.view_loadings_list_init is None:
+                loc_Gamma_l = align_tensor_shapes(self.view_loadings_list_init[l], 
+                                                additional = k_l - self.view_loadings_list_init[l].shape[1])
                 loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), 
-                                         align_tensor_shapes(self.view_loadings_list_init[l], 
-                                                             additional = k_l - self.view_loadings_list_init[l].shape[1])
+                                         loc_Gamma_l
                                          )
             else:
                 loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), torch.zeros(p_l, k_l))
@@ -800,10 +801,11 @@ class SupMultiviewDecomp(PyroModule):
             # pyro.sample(Sites.rho_lambda_l.format(l = l), 
             #             dist.LogNormal(loc_rho_lambda_l, scale_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
             
-            if self.joint_loadings_list_init:
+            if self.joint_loadings_list_init is None:
+                loc_Lambda_l = align_tensor_shapes(self.joint_loadings_list_init[l], 
+                                                additional = self.k - self.joint_loadings_list_init[l].shape[1])
                 loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), 
-                                          align_tensor_shapes(self.joint_loadings_list_init[l], 
-                                                             additional = self.k - self.joint_loadings_list_init[l].shape[1])
+                                          loc_Lambda_l
                                          )
             else:
                 loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
@@ -886,10 +888,11 @@ class SupMultiviewDecomp(PyroModule):
             raise NotImplementedError
         
         # Local latent variables and observations
-        if self.joint_scores_init:
+        if self.joint_scores_init is None:
+            loc_Z = align_tensor_shapes(self.joint_scores_init,
+                                        additional = self.k - self.joint_scores_init)
             loc_Z = pyro.param(Params.loc_Z, 
-                               align_tensor_shapes(self.joint_scores_init,
-                                                   additional = self.k - self.joint_scores_init)
+                               loc_Z
             )
         else:
             loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
@@ -901,10 +904,11 @@ class SupMultiviewDecomp(PyroModule):
         loc_Phi_list = []
         scale_Phi_list = []
         for l, k_l in enumerate(self.k_l_list):
-            if self.view_scores_list_init:
+            if self.view_scores_list_init is None:
+                loc_Phi_l =  align_tensor_shapes(self.view_scores_list_init[l],
+                                                additional = k_l - self.view_scores_list_init[l])
                 loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), 
-                                       align_tensor_shapes(self.view_scores_list_init[l],
-                                                           additional = k_l - self.view_scores_list_init[l])
+                                      loc_Phi_l
                                        )
             else:
                 loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
