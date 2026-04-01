@@ -252,60 +252,61 @@ class ModelHandler:
                             print(f"Ortho penalty: {self.model.penalty_obj.weight}")
                         else:
                             print(f"Ortho penalty: {self.model.ortho_penalty}")
-                    break
+                    
                 
-                ########
-                # Project variational parameters for orthogonality constraint
-                # Do not project at last iteration
-                # Means = P @ M
-                # Vars = P @ diag(S) @ P.T
-                if self.orthogonal_projection:
-                    if isinstance(self.guide, pyro.infer.autoguide.guides.AutoNormal):
-                        loc_Z_name = 'AutoNormal.locs.Z'
-                        loc_Lambda_l_name = 'AutoNormal.locs.Lambda_l{l}'
-                        loc_Phi_l_name = 'AutoNormal.locs.Phi_l{l}'
-                        scale_Phi_l_name = 'AutoNormal.scales.Phi_l{l}'
-                    else:
-                        loc_Z_name = Params.loc_Z
-                        loc_Lambda_l_name = Params.loc_Lambda_l
-                        loc_Phi_l_name = Params.loc_Phi_l
-                        scale_Phi_l_name = Params.scale_Phi_l
-                        
-                    store = pyro.get_param_store()
-                    loc_Z = store[loc_Z_name]
-                    locs_Lambda_l_list = [store[loc_Lambda_l_name.format(l = l)] \
-                        for l in range(len(self.model.k_l_list))]
-                    locs_Phi_l_list = [store[loc_Phi_l_name.format(l = l)] \
-                        for l in range(len(self.model.k_l_list))]
-                    scales_Phi_l_list = [store[scale_Phi_l_name.format(l = l)] \
-                        for l in range(len(self.model.k_l_list))]
-                    
-                    A = loc_Z @ torch.cat([Lambda.T for Lambda in locs_Lambda_l_list],
-                                          dim = 1)
-                    
-                    P_Z = projection_by_qr(A) # TODO make below faster
-                    P_Z_perp = torch.sub(torch.eye(P_Z.shape[0]), P_Z)
-                    # Means
-                    proj_locs_Phi_l_list = [torch.mm(P_Z_perp, Phi_l) \
-                        for Phi_l in locs_Phi_l_list]
-                    # Variances
-                    proj_scales_Phi_l_list = []
-                    for vars in scales_Phi_l_list:
-                        proj_scales = torch.stack(
-                            [torch.diag(P_Z_perp * vars[:, k] @ P_Z_perp.T) \
-                                for k in range(vars.shape[1])],
-                            dim = 1
-                        )
-                        proj_scales_Phi_l_list.append(proj_scales)
-                    # proj_scales_Phi_l_list = [torch.mm(torch.square(P_Z_perp), vars) \
-                    #     for vars in scales_Phi_l_list]
-                    
-                    # Overwrite param store
-                    with torch.no_grad():
-                        for l in range(len(self.model.k_l_list)):
-                            store[loc_Phi_l_name.format(l = l)].copy_(proj_locs_Phi_l_list[l])
-                            store[scale_Phi_l_name.format(l = l)].copy_(proj_scales_Phi_l_list[l])
+                    ########
+                    # Project variational parameters for orthogonality constraint
+                    # Do not project at last iteration
+                    # Means = P @ M
+                    # Vars = P @ diag(S) @ P.T
+                    if self.orthogonal_projection:
+                        if isinstance(self.guide, pyro.infer.autoguide.guides.AutoNormal):
+                            loc_Z_name = 'AutoNormal.locs.Z'
+                            loc_Lambda_l_name = 'AutoNormal.locs.Lambda_l{l}'
+                            loc_Phi_l_name = 'AutoNormal.locs.Phi_l{l}'
+                            scale_Phi_l_name = 'AutoNormal.scales.Phi_l{l}'
+                        else:
+                            loc_Z_name = Params.loc_Z
+                            loc_Lambda_l_name = Params.loc_Lambda_l
+                            loc_Phi_l_name = Params.loc_Phi_l
+                            scale_Phi_l_name = Params.scale_Phi_l
                             
+                        store = pyro.get_param_store()
+                        loc_Z = store[loc_Z_name]
+                        locs_Lambda_l_list = [store[loc_Lambda_l_name.format(l = l)] \
+                            for l in range(len(self.model.k_l_list))]
+                        locs_Phi_l_list = [store[loc_Phi_l_name.format(l = l)] \
+                            for l in range(len(self.model.k_l_list))]
+                        scales_Phi_l_list = [store[scale_Phi_l_name.format(l = l)] \
+                            for l in range(len(self.model.k_l_list))]
+                        
+                        A = loc_Z @ torch.cat([Lambda.T for Lambda in locs_Lambda_l_list],
+                                            dim = 1)
+                        
+                        P_Z = projection_by_qr(A) # TODO make below faster
+                        P_Z_perp = torch.sub(torch.eye(P_Z.shape[0]), P_Z)
+                        # Means
+                        proj_locs_Phi_l_list = [torch.mm(P_Z_perp, Phi_l) \
+                            for Phi_l in locs_Phi_l_list]
+                        # Variances
+                        proj_scales_Phi_l_list = []
+                        for vars in scales_Phi_l_list:
+                            proj_scales = torch.stack(
+                                [torch.diag(P_Z_perp * vars[:, k] @ P_Z_perp.T) \
+                                    for k in range(vars.shape[1])],
+                                dim = 1
+                            )
+                            proj_scales_Phi_l_list.append(proj_scales)
+                        # proj_scales_Phi_l_list = [torch.mm(torch.square(P_Z_perp), vars) \
+                        #     for vars in scales_Phi_l_list]
+                        
+                        # Overwrite param store
+                        with torch.no_grad():
+                            for l in range(len(self.model.k_l_list)):
+                                store[loc_Phi_l_name.format(l = l)].copy_(proj_locs_Phi_l_list[l])
+                                store[scale_Phi_l_name.format(l = l)].copy_(proj_scales_Phi_l_list[l])
+                            
+                    break
                 params_epoch_last = params_epoch_curr
         else:
             raise NotImplementedError    
