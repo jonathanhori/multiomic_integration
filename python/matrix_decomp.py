@@ -9,9 +9,6 @@ import pyro
 import pyro.distributions as dist
 
 from pyro.nn import PyroModule
-from pyro.optim import Adam, ClippedAdam
-from pyro.infer import SVI, Trace_ELBO, Predictive, TraceGraph_ELBO
-from pyro.infer.autoguide import AutoContinuous, AutoNormal #AutoMultivariateNormal
 
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -24,8 +21,10 @@ pyro.set_rng_seed(0)
 
 class MatrixDecomp(PyroModule):
     def __init__(self, k,
+                 supervised = False,
                  loading_target = None,
                  dense = False,
+                 penalty_obj = None,
                  a_sigma=2.0, # Hyperparams: Conjugate prior per factor: IG
                  b_sigma=2.0,
                  a1_sigma=2.1, # Hyperparams: Conjugate prior per factor: IG
@@ -41,6 +40,10 @@ class MatrixDecomp(PyroModule):
         self.n = None
         self.p = None
         
+        self.ortho_penalty = None
+        self.penalty_obj = penalty_obj
+        self.supervised_model = supervised
+        
         # Should the loading matrix be penalized toward a target?
         if loading_target is not None:
             self.loading_target = align_tensor_shapes(loading_target, 
@@ -51,6 +54,7 @@ class MatrixDecomp(PyroModule):
         # Hyperparams
         # self.a_sigma = a_sigma
         # self.b_sigma = b_sigma
+        
         self.a_psi = a_psi
         self.b_psi = b_psi
         
@@ -73,18 +77,37 @@ class MatrixDecomp(PyroModule):
         
     def forward(self, 
                 X, 
-                batch_idx):
+                batch_idx,
+                y = None):
         """
         Should we run model with sparsity prior or not?
         """
         if self.dense:
             return self.forward_dense(X, 
-                batch_idx)
+                batch_idx,
+                y)
         else:
             return self.forward_mgp(X, 
-                batch_idx)
+                batch_idx,
+                y)
+            
+    def guide(self, 
+            X, 
+            batch_idx,
+            y = None):
+        """
+        Should we run model with sparsity prior or not?
+        """
+        if self.dense:
+            return self.guide_dense(X, 
+                batch_idx,
+                y)
+        else:
+            return self.guide_mgp(X, 
+                batch_idx,
+                y)
     
-    def forward_mgp(self, X, batch_idx):
+    def forward_mgp(self, X, batch_idx, y = None):
         l = 0
         
         # if torch.is_tensor(X):
@@ -108,6 +131,7 @@ class MatrixDecomp(PyroModule):
         #   ==> Lambda_jk ~ N(0, N(0, (rho^l_{jk})^-1 * (tau^l_k)^-12))
         ########################
         # tau - global shrinkage
+        
         delta_lambda = []
         for m in range(self.k):
             shape = self.a1_sigma if m == 0 else self.a2_sigma
@@ -115,11 +139,13 @@ class MatrixDecomp(PyroModule):
                                     dist.Gamma(shape, 1.0))
             delta_lambda.append(delta_l_m)
         tau_lambda_k_list = torch.cumprod(torch.stack(delta_lambda), dim = 0).squeeze()
-    
+        # print(tau_lambda_k_list.shape)
+
         # rho - local shrinkage
         rho_lambda = pyro.sample(Sites.rho_lambda_l.format(l = l), 
                             dist.Gamma(self.alpha / 2, self.alpha / 2).expand([self.p, self.k]).to_event(2)).squeeze()
         
+        # print(rho_lambda.shape)
         # print('Lambda - tau shape', tau_lambda_k_list.shape)
         # print('Lambda - rho shape', rho_lambda.shape)
         # sigma_lambda_l = (rho_lambda * tau_lambda_k_list).pow_(-0.5)   
@@ -127,13 +153,13 @@ class MatrixDecomp(PyroModule):
         precision = torch.clamp(precision, min=1e-10, max=1e10)
         sigma_lambda_l = precision.pow_(-0.5)     
         Lambda = pyro.sample(Sites.Lambda_l.format(l = l), 
-                                dist.Normal(torch.zeros(self.p, self.k), sigma_lambda_l).to_event(2)).squeeze()
+                            dist.Normal(torch.zeros(self.p, self.k), sigma_lambda_l).to_event(2)).squeeze()
         
         # sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(self.a_sigma, self.b_sigma).expand([self.k]).to_event(1))
-        # sigma = torch.sqrt(sigma2)
+        # sigma = torch.sqrt(sigma2).unsqueeze(-2).expand(self.p, self.k)
         
         # # sigma is broadcast across rows of Lambda
-        # Lambda = pyro.sample("Lambda", dist.Normal(torch.zeros(p, self.k), sigma).to_event(2))
+        # Lambda = pyro.sample("Lambda", dist.Normal(torch.zeros(self.p, self.k), sigma).to_event(2))
         
         ########################
         # ---- Observations --------
@@ -169,15 +195,13 @@ class MatrixDecomp(PyroModule):
             # print("X finite:", torch.isfinite(X).all())
             # print("NaNs:", torch.isnan(X).sum())
             # print("Infs:", torch.isinf(X).sum())
-
-            
             
             pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
         
         
 
     
-    def forward_dense(self, X, batch_idx):
+    def forward_dense(self, X, batch_idx, y = None):
         if torch.is_tensor(X):
             m, p = X.shape # Working with minibatches of size m
         elif isinstance(X, TensorDataset): # working with full dataset directly
@@ -225,7 +249,68 @@ class MatrixDecomp(PyroModule):
             pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
             
             
-    def guide(self, X, batch_idx):
+    def guide_dense(self, X, batch_idx, y = None):
+        l = 0
+        # if torch.is_tensor(X):
+        #     m, p = X.shape # Working with minibatches of size m
+        # elif isinstance(X, TensorDataset): # working with full dataset directly
+        #     # print("is tensordataset")
+        #     m = len(X)
+        #     p = X[0][0].shape[0]
+        m = len(batch_idx)
+        if self.p is None:
+            self.p = X[0].shape[1]
+            
+        # print(X)
+        # print(len(X))
+        # print(X[0].shape)
+        # print(X[1])
+            
+        ######
+        # Loadings
+        ######
+        
+        # Sigma2: Variational parameters a, b
+        a_sigma_lambda = pyro.param("a_sigma_lambda", 
+                               lambda: torch.ones((self.k)),
+                               constraint = dist.constraints.positive)
+        b_sigma_lambda = pyro.param("b_sigma_lambda", 
+                               lambda: torch.ones((self.k)),
+                               constraint = dist.constraints.positive)
+        sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).to_event(1))
+
+        loc_Lambda = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(self.p, self.k))
+        scale_Lambda = pyro.param(Params.scale_Lambda_l.format(l = l), torch.ones(self.p, self.k),
+                                    constraint = dist.constraints.positive)
+        Lambda = pyro.sample(Sites.Lambda_l.format(l = l), 
+                                dist.Normal(loc_Lambda, scale_Lambda).to_event(2))
+        
+        ########################
+        # Scores
+        ########################
+        # Psi: Variational params a, b
+        a_psi = pyro.param("a_psi",
+                             lambda: torch.ones((self.p)),
+                             constraint = dist.constraints.positive)     
+        b_psi = pyro.param("b_psi",
+                             lambda: torch.ones((self.p)),
+                             constraint = dist.constraints.positive)  
+        psi = pyro.sample("psi", dist.InverseGamma(a_psi, b_psi).to_event(1))
+        # psi_sqrt = torch.sqrt(psi)
+        
+        # Local latent variables Z: Variational params loc, scale
+        Z_loc = pyro.param("Z_loc", lambda: torch.zeros(self.n, self.k))
+        Z_scale = pyro.param("Z_scale", lambda: torch.ones(self.n, self.k),
+                                constraint = dist.constraints.positive)
+        with pyro.plate("obs", self.n, subsample = batch_idx):
+            Z_loc_batch = Z_loc[batch_idx]
+            Z_scale_batch = Z_scale[batch_idx]
+            Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
+            
+            pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+            
+            
+    def guide_mgp(self, X, batch_idx, y = None):
         l = 0
         # if torch.is_tensor(X):
         #     m, p = X.shape # Working with minibatches of size m
@@ -272,34 +357,6 @@ class MatrixDecomp(PyroModule):
                                 dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
         
         
-        # Penalty to encourage loadings toward certain matrix
-        orthogonality_weight = 100.
-        if self.loading_target is not None:
-            matrix_diff = Lambda - self.loading_target
-            
-            total_penalty = torch.sum(matrix_diff ** 2)
-                
-            pyro.factor("target_penalty", 
-                        orthogonality_weight * total_penalty,
-                        has_rsample = True)
-        
-        # # Sigma2: Variational parameters a, b
-        # a_sigma_q = pyro.param("a_sigma_q", 
-        #                        lambda: torch.ones((self.k)),
-        #                        constraint = dist.constraints.positive)
-        # b_sigma_q = pyro.param("b_sigma_q", 
-        #                        lambda: torch.ones((self.k)),
-        #                        constraint = dist.constraints.positive)
-        
-        # sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_q, b_sigma_q).to_event(1))
-        # # sigma = torch.sqrt(sigma2)
-        
-        # # Lambda: Variational parameters loc, scale
-        # Lambda_loc = pyro.param("Lambda_loc", lambda: torch.zeros(p, self.k))
-        # Lambda_scale = pyro.param("Lambda_scale", lambda: torch.ones(p, self.k),
-        #                           constraint = dist.constraints.positive)
-        # Lambda = pyro.sample("Lambda", dist.Normal(Lambda_loc, Lambda_scale).to_event(2))
-        
         ########################
         # Scores
         ########################
@@ -323,106 +380,4 @@ class MatrixDecomp(PyroModule):
             Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
             
             pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
-            
-    
-##############
-# def do_inference(X, model, guide, opt = "Adam",
-#                     epochs = 20,
-#                     max_iter = 20000,
-#                     minibatch_flag = False,
-#                     minibatch_size = 32,
-#                     tol = 1e-4,
-#                     opt_args = {"lr": 0.001},
-#                     device = "cpu"):
-    
-#     # if minibatch_flag == False, then do not minibatch, data loader not necessary
-#     if not minibatch_flag:
-#         minibatch_size = model.n
         
-#     ########################
-#     # Handle minibatching of dataset
-#     ########################
-#     X_mod = TensorDataset(torch.arange(X.shape[0]), X)
-#     loader = DataLoader(X_mod, batch_size = minibatch_size, shuffle = True, drop_last=True)
-    
-#     ########################
-#     # Initialize instances for optimization
-#     ########################
-#     # guide = self.guide
-#     if opt == "Adam":
-#         opt = Adam(opt_args)
-#     elif opt == "ClippedAdam":
-#         opt = ClippedAdam(opt_args)
-#     elbo = Trace_ELBO(num_particles = 10)
-#     # elbo = TraceGraph_ELBO()
-#     svi = SVI(model, guide, opt, loss = elbo)
-    
-#     ########################
-#     # Train
-#     # If minibatching: pass batch from loader
-#     # If not minibatching: pass original data as tensor
-#     ########################
-#     if minibatch_flag:
-#         prev_loss = None
-#         for epoch in range(epochs):
-#             epoch_loss = 0.
-#             for batch_idx, batch, in loader:
-#                 # print(batch.shape)
-#                 loss = svi.step(batch, batch_idx)
-#                 # print(loss)
-#                 epoch_loss += loss
-#             print(f"Epoch {epoch+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss / model.n:.4f}")
-#             print(f"Loss at epoch {epoch+1}: {loss / model.n}")
-            
-#             model.loss_history.append(epoch_loss)
-            
-#             if prev_loss is not None and abs(epoch_loss - prev_loss) / model.n < tol:
-#                 break
-                
-#             # print(f"delta: {epoch_loss / n - (prev_loss / n if prev_loss is not None else epoch_loss / n):+.6f}")
-            
-#             # for name in pyro.get_param_store().get_all_param_names():
-#             #     p = pyro.param(name)
-#             #     print(name, p.shape, getattr(p, "grad", None) is not None)
-            
-#             prev_loss = loss
-#     else:
-#         # total_loss = 0.
-#         prev_loss = None
-#         for iter in range(max_iter):
-#             # total_loss = 0.
-#             loss = svi.step(X, torch.arange(X.shape[0])) #batch[0])
-#             # print(loss)
-#             # total_loss += loss
-#             # for batch in loader:
-#             #     loss = svi.step(batch[0])
-#             #     epoch_loss += loss
-#             if iter % 100 == 0:
-#                 print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
-#                 model.loss_history.append(loss)
-#                 # print(f"Epoch {iter+1}/{epochs}  avg neg-ELBO per datum: {epoch_loss:.4f}")
-                
-#             # if prev_loss is not None and abs((loss- prev_loss) / prev_loss) < tol:
-#             if prev_loss is not None and abs((loss- prev_loss)) < tol:
-#                 # print(f"Stopping: {abs((loss- prev_loss) / prev_loss)} < {tol}")
-#                 print(f"Iteration {iter-1}  loss: {prev_loss / model.n:.4f}")
-#                 print(f"Iteration {iter}  loss: {loss / model.n:.4f}")
-#                 break
-#             prev_loss = loss
-            
-        
-#     return svi, opt
-        
-
-    
-# def predict_factor_model(model,
-#                          guide,
-#                          num_samples,
-#                          data):
-    
-#     num_samples = 1000
-#     predictive = Predictive(model, guide=guide, num_samples=num_samples)
-#     return predictive(**data)
-#     # svi_samples = {k: v.reshape(num_samples).detach().cpu().numpy()
-#     #             for k, v in predictive(data).items()
-#     #             if k != "obs"}

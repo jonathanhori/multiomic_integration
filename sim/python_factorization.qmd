@@ -60,18 +60,18 @@ sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
 ```{python}
 #| label: Load data utils
-# importlib.reload(sys.modules["data_utils"])
+importlib.reload(sys.modules["data_utils"])
 
 # from data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition, normalize_tensor_by_col, extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, eval_rse, eval_mse, summarise_post_samples, summarise_structure_list, eval_post_coverage, eval_credible_interval, obtain_posterior_pred_samples, calc_all_structures_with_rescaling, eval_performance
 from data_utils import r_to_torch, normalize_tensor_by_col, \
     zero_variance_col_filter, obtain_posterior_pred_samples, \
-        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance, varimax, align_tensor_shapes
+        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance, varimax, align_tensor_shapes, calc_cov, scale_sim_cov
 ```
 
 ```{python}
 #| label: Load model objects
-# importlib.reload(sys.modules["matrix_decomp"])
-# importlib.reload(sys.modules["handler"])
+importlib.reload(sys.modules["matrix_decomp"])
+importlib.reload(sys.modules["handler"])
 
 from matrix_decomp import MatrixDecomp
 from handler import ModelHandler
@@ -91,7 +91,8 @@ conversion._converter = None
 conversion.set_conversion(default_converter)
 readRDS = robjects.r['readRDS']
 
-sim_data = readRDS('~/multiomic_integration/sim/data/single_view/factor_data_n500p1000_snr2.2_sparse0.25.rds')
+# sim_data = readRDS('~/multiomic_integration/sim/data/single_view/factor_data_n500p1000_snr2.2_sparse0.25.rds')
+sim_data = readRDS('~/multiomic_integration/sim/data/single_view_withoutcome/k.5/factor_data_n500p100_snr2.2_sparse0.25.rds')
 # sim_data = readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/simple_data/factor_data_n2000p10000_snr2.2.rds')
         
 ```
@@ -122,12 +123,21 @@ sns.heatmap(
 
 ### Extract single view data
 ```{python}
+###
 X = sim_data_torch["X_l"][0]
 col_filter = zero_variance_col_filter(X)
 
 X_summaries = normalize_tensor_by_col(X[:, col_filter])
 
 X_clean = X_summaries['data_clean']
+
+###
+y = sim_data_torch.get("y")
+y
+
+y_mean = torch.mean(y)
+y_std = torch.std(y)
+y_clean = (y - y_mean) / y_std
 
 k = int(sim_data_torch["K"].item())
 n = X.shape[0]
@@ -148,10 +158,17 @@ print(k)
 print(n)
 ```
 
-
+Without outcome
 ```{python}
 train_subset = TensorDataset(torch.arange(X_clean.shape[0]), 
                                          X_clean)
+```
+
+With outcome
+```{python}
+train_subset = TensorDataset(torch.arange(X_clean.shape[0]), 
+                                         X_clean,
+                                         y_clean)
 ```
 
 
@@ -184,7 +201,8 @@ factor_model.n = X_clean.shape[0]
 pyro.render_model(
     factor_model, #bayesian_factor_model, 
     model_args = (X_clean,
-                  torch.arange(X_clean.shape[0])
+                  torch.arange(X_clean.shape[0]),
+                  y_clean
     ),
     render_distributions=True, 
     render_params=True,
@@ -231,6 +249,60 @@ print(trace.format_shapes())
 factor_model.n
 ```
 
+
+WITH LEARNING RATE SCHEDULER
+```{python}
+pyro.clear_param_store()
+
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 1000
+opt_args = {"lr": initial_lr, "betas": (0.9, 0.999)}
+# initial_lr = 0.005 
+# gamma = 0.1  # final learning rate will be gamma * initial_lr
+# lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+# OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
+LOSS = Trace_ELBO(num_particles = 2)
+
+k_upper = int(k) + 10
+
+scheduler_args = {
+    'optimizer': torch.optim.Adam, 
+    'optim_args': opt_args,
+    'step_size': 20,
+    'gamma': 0.9,
+    'verbose': True
+}
+scheduler = pyro.optim.StepLR(scheduler_args)
+
+factor_model = MatrixDecomp(k_upper)
+train_handler = ModelHandler(
+    "train", 
+    factor_model, 
+    # OPT, 
+    loss = LOSS,
+    opt_scheduler = scheduler,
+    orthogonal_projection = False)
+
+t0 = time.time()
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
+    inference_type = "svi",
+    tol = 0.5, # tolerance is epoch loss per datum
+    variational_tol = 0.2,
+    min_epochs = 100,
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
+    verbose = True
+    )
+
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
+```
+
+OLD
 ```{python}
 pyro.clear_param_store()
 
@@ -342,6 +414,85 @@ for k, v in samples.items():
 predictive = Predictive(model, samples)(X_, None)
 for k, v in predictive.items():
     print(f"{k}: {tuple(v.shape)}")
+```
+
+## Using SVGD
+
+```{python}
+# factor_model = SupMultiviewDecomp(
+#     int(k),
+#     k_l_list.int().tolist(),
+#     n,
+#     include_view_factors = True,
+#     dense = False
+# )
+
+pyro.clear_param_store()
+
+
+# MINIBATCH_SIZE = 32
+# NUM_EPOCHS = 1000
+# initial_lr = 0.005 
+
+# gamma = 0.1  # final learning rate will be gamma * initial_lr
+# lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+
+# OPT = Adam({"lr": initial_lr})
+# # OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
+# kernel = RBFSteinKernel()
+
+# t0 = time.time()
+# svi, opt = do_inference(
+#     X_l_list_clean,
+#     y_clean,
+#     factor_model,
+#     kernel,
+#     opt = OPT,
+#     # elbo = LOSS,
+#     inference = "svgd",
+#     tol = 0.5, # tolerance is epoch loss per datum
+#     variational_tol = 0.3,
+#     min_epochs = 10,
+#     epochs = NUM_EPOCHS,
+#     minibatch_flag = True,
+#     minibatch_size = MINIBATCH_SIZE,
+#     verbose = True
+#     )
+
+
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 1000
+initial_lr = 0.005 
+gamma = 0.1  # final learning rate will be gamma * initial_lr
+lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
+OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
+LOSS = Trace_ELBO(num_particles = 2)
+
+k_upper = int(k) + 10
+
+OPT = Adam({"lr": initial_lr})
+kernel = RBFSteinKernel()
+
+factor_model = MatrixDecomp(k_upper, dense = True)
+train_handler = ModelHandler("train", factor_model, guide = kernel, opt = OPT)
+
+t0 = time.time()
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
+    inference_type = "svgd",
+    tol = 0.5, # tolerance is epoch loss per datum
+    variational_tol = 0.2,
+    min_epochs = 30,
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
+    verbose = True
+    )
+
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
 ```
 
 ### Ignore_________
@@ -918,6 +1069,42 @@ evaluate_matrix_decomp(sim_Z = sim_data_torch["Z"],
                     col_filter = col_filter              
     )
 ```
+
+
+
+```{python}
+sim_cov = calc_cov(sim_data_torch["Lambda_l"][0])
+est_cov = calc_cov(pyro.param(Params.loc_Lambda_l.format(l = 0)))
+```
+
+```{python}
+sim_cov_scaled = scale_sim_cov(sim_cov, X_summaries['sds'], X_summaries['sds'])
+```
+
+```{python}
+
+torch.norm(sim_cov_scaled - est_cov) / (est_cov.shape[0] * est_cov.shape[1])
+```
+
+```{python}
+sim_cov_scaled
+est_cov
+```
+
+
+Outcome
+
+```{python}
+pyro.param("beta")
+```
+
+```{python}
+y_est = pyro.param("Z_loc")
+
+torch.nn.functional.mse_loss(y_clean)
+```
+
+
 With AutoNormal guide
 ```{python}
 Lambda_est = pyro.param("AutoNormal.locs.Lambda")
@@ -1025,13 +1212,17 @@ torch.norm(matrix_diff)
 
 ```{python}
 sns.heatmap(
-    Lambda_est.detach() - Lambda_sim_pad,
+    Lambda_est.detach(),
     cmap="coolwarm"
 )
 ```
 
 ```{python}
 Lambda_est_rotated = varimax(Lambda_est.detach().numpy())
+```
+
+```{python}
+
 ```
 
 ```{python}
