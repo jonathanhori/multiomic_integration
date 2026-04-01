@@ -4,9 +4,11 @@ class Sites:
     """For sparse model only"""
     delta_gamma_l_k = "delta_gamma_l{l}_k{m}"
     rho_gamma_l = "rho_gamma_l{l}"
+    sigma2_gamma_l = "sigma2_gamma_l{l}" # for dense model
     Gamma_l = "Gamma_l{l}"
     delta_lambda_l_k = "delta_lambda_l{l}_k{m}"
     rho_lambda_l = 'rho_lambda_l{l}'
+    sigma2_lambda_l = "sigma2_lambda_l{l}" # for dense model
     Lambda_l = "Lambda_l{l}"
     psi_l = "psi_l{l}"
     sigma2_beta = "sigma2_beta"
@@ -35,12 +37,16 @@ class Params:
     b_delta_gamma_l_k = "b_delta_gamma_l{l}_k{m}"
     a_rho_gamma_l = "a_rho_gamma_l{l}"
     b_rho_gamma_l = "b_rho_gamma_l{l}"
+    a_sigma_gamma_l = "a_sigma_gamma_l{l}" # for dense guide
+    b_sigma_gamma_l = "b_sigma_gamma_l{l}" # for dense guide
     loc_Gamma_l = "loc_Gamma_l{l}"
     scale_Gamma_l = "scale_Gamma_l{l}"
     a_delta_lambda_l_k = "a_delta_lambda_l{l}_k{m}"
     b_delta_lambda_l_k = "b_delta_lambda_l{l}_k{m}"
     a_rho_lambda_l = "a_rho_lambda_l{l}"
     b_rho_lambda_l = "b_rho_lambda_l{l}"
+    a_sigma_lambda_l = "a_sigma_lambda_l{l}" # for dense guide
+    b_sigma_lambda_l = "b_sigma_lambda_l{l}" # for dense guide
     loc_Lambda_l = "loc_Lambda_l{l}"
     scale_Lambda_l = "scale_Lambda_l{l}"
     a_psi_l = "a_psi_l{l}"
