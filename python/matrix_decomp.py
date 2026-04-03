@@ -66,7 +66,18 @@ class MatrixDecomp(PyroModule):
             self.a2_sigma = a2_sigma
             self.alpha = alpha
         
-        self.dense = False
+        # With outcome model
+        self.outcome = "gaussian"
+        self.a_sigma_y = 3.0
+        self.b_sigma_y = 1.0
+        self.a_sigma_beta = 2.0
+        self.b_sigma_beta = 2.0
+        
+        self.inv_gamma_init_param = 2.1
+        self.init_param = 0.1
+        self.init_scale_param = 1.0
+        
+        self.dense = dense
         # self.loss_history = []
         
         self.total_epochs = 0
@@ -202,13 +213,17 @@ class MatrixDecomp(PyroModule):
 
     
     def forward_dense(self, X, batch_idx, y = None):
-        if torch.is_tensor(X):
-            m, p = X.shape # Working with minibatches of size m
-        elif isinstance(X, TensorDataset): # working with full dataset directly
-            # print("is tensordataset")
-            m = len(X)
-            p = X[0][0].shape[0]
+        l = 0
+        # if torch.is_tensor(X):
+        #     m, p = X.shape # Working with minibatches of size m
+        # elif isinstance(X, TensorDataset): # working with full dataset directly
+        #     # print("is tensordataset")
+        #     m = len(X)
+        #     p = X[0][0].shape[0]
         # self.p = 
+        m = len(batch_idx)
+        if self.p is None:
+            self.p = X[0].shape[1]
         
         ########################
         # ---- Loadings --------
@@ -223,7 +238,8 @@ class MatrixDecomp(PyroModule):
         sigma = torch.sqrt(sigma2)
         
         # sigma is broadcast across rows of Lambda
-        Lambda = pyro.sample("Lambda", dist.Normal(torch.zeros(p, self.k), sigma).to_event(2))
+        Lambda = pyro.sample(Sites.Lambda_l.format(l = l), 
+                             dist.Normal(torch.zeros(self.p, self.k), sigma).to_event(2))
         
         ########################
         # ---- Observations --------
@@ -234,8 +250,21 @@ class MatrixDecomp(PyroModule):
         ########################
         
         # Idiosyncratic error variance            
-        psi = pyro.sample("psi", dist.InverseGamma(self.a_psi, self.b_psi).expand([p]).to_event(1))
+        psi = pyro.sample("psi", dist.InverseGamma(self.a_psi, self.b_psi).expand([self.p]).to_event(1))
         psi_sqrt = torch.sqrt(psi)
+        
+        if self.supervised_model:
+            # Outcome model coefficients
+            sigma2_beta = pyro.sample(Sites.sigma2_beta,
+                                    dist.InverseGamma(self.a_sigma_beta, self.b_sigma_beta).expand([self.k]).to_event(1))
+            beta = pyro.sample(Sites.beta,
+                            dist.Normal(torch.zeros(self.k), sigma2_beta).to_event(1)).\
+                                squeeze(0)
+            
+            # Outcome variances
+            sigma2_y = pyro.sample(Sites.sigma2_y,
+                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
+            sigma_y = torch.sqrt(sigma2_y)
         
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx): # X is a minibatch, can pass directly into subsample
@@ -244,9 +273,21 @@ class MatrixDecomp(PyroModule):
             Z_batch = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
             
             # Compute structure
-            structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+            structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.squeeze(0).T))
             
             pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
+            
+            if self.supervised_model:
+                # Outcome model
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                        torch.matmul(Z_batch, beta.squeeze(0)))
+                if self.outcome == "gaussian":
+                    pyro.sample("y", dist.Normal(outcome_structure, 
+                                                sigma_y), #.to_event(1),
+                                obs = y)
+                else:
+                    raise NotImplementedError
+            
             
             
     def guide_dense(self, X, batch_idx, y = None):
@@ -277,7 +318,7 @@ class MatrixDecomp(PyroModule):
         b_sigma_lambda = pyro.param("b_sigma_lambda", 
                                lambda: torch.ones((self.k)),
                                constraint = dist.constraints.positive)
-        sigma2 = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).to_event(1))
+        sigma2_lambda = pyro.sample("sigma2_lambda", dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).to_event(1))
 
         loc_Lambda = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(self.p, self.k))
         scale_Lambda = pyro.param(Params.scale_Lambda_l.format(l = l), torch.ones(self.p, self.k),
@@ -298,16 +339,67 @@ class MatrixDecomp(PyroModule):
         psi = pyro.sample("psi", dist.InverseGamma(a_psi, b_psi).to_event(1))
         # psi_sqrt = torch.sqrt(psi)
         
+        if self.supervised_model:
+            # Outcome model coefficients
+            a_sigma_beta = pyro.param(Params.a_sigma_beta, 
+                                  torch.tensor(self.inv_gamma_init_param),
+                                  constraint = dist.constraints.positive)
+            b_sigma_beta = pyro.param(Params.b_sigma_beta, 
+                                    torch.tensor(self.init_param),
+                                    constraint = dist.constraints.positive)
+            sigma2_beta = pyro.sample(Sites.sigma2_beta,
+                                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+        
+            loc_beta = pyro.param(Params.loc_beta, 
+                                #   lambda: torch.randn(self.k))
+                                  torch.zeros(self.k))
+            scale_beta = pyro.param(Params.scale_beta, 
+                                    # torch.ones(self.num_outcome_factors),
+                                    torch.tensor(self.init_scale_param).expand([self.k]),
+                                    constraint = dist.constraints.positive)
+            beta = pyro.sample(Sites.beta,
+                            dist.Normal(loc_beta, scale_beta).to_event(1)).\
+                                squeeze(0)
+                                
+                            
+            # Outcome variances
+            if self.outcome == "gaussian":
+                a_sigma_y = pyro.param(Params.a_sigma_y, 
+                                    torch.tensor(self.a_sigma_y),
+                                    constraint = dist.constraints.positive)
+                b_sigma_y = pyro.param(Params.b_sigma_y, 
+                                    torch.tensor(self.b_sigma_y),
+                                    constraint = dist.constraints.positive)
+                sigma2_y = pyro.sample(Sites.sigma2_y,
+                                    dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+        
         # Local latent variables Z: Variational params loc, scale
         Z_loc = pyro.param("Z_loc", lambda: torch.zeros(self.n, self.k))
         Z_scale = pyro.param("Z_scale", lambda: torch.ones(self.n, self.k),
                                 constraint = dist.constraints.positive)
+        
+        # y_loc = pyro.param("y_loc", lambda: torch.zeros(self.n))
+        # y_scale = pyro.param("y_scale", lambda: torch.ones(self.n),
+        #                         constraint = dist.constraints.positive)
         with pyro.plate("obs", self.n, subsample = batch_idx):
             Z_loc_batch = Z_loc[batch_idx]
             Z_scale_batch = Z_scale[batch_idx]
             Z_batch = pyro.sample("Z", dist.Normal(Z_loc_batch, Z_scale_batch).to_event(1))
             
             pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
+            
+            if self.supervised_model:
+                # Outcome model
+                outcome_structure = pyro.deterministic("outcome_structure",
+                                                        torch.matmul(Z_batch, beta))
+                # if self.outcome == "gaussian":
+                #     loc_y_batch = y_loc[batch_idx]
+                #     scale_y_batch = y_scale[batch_idx]
+                #     pyro.sample("y", 
+                #                 dist.Normal(loc_y_batch, scale_y_batch), #.to_event(1),
+                #                 obs = y)
+                # else:
+                #     raise NotImplementedError
             
             
     def guide_mgp(self, X, batch_idx, y = None):
