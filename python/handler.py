@@ -144,7 +144,8 @@ class ModelHandler:
                     # print(batch_idx.shape)
                     # print(batch.shape)
                     if self.model.model_type == "MatrixDecomp":
-                        loss = inference.step(batch, batch_idx)
+                        y_batch = batch.pop(-1).squeeze()
+                        loss = inference.step(batch, batch_idx, y_batch)
                     elif self.model.model_type == "SupMultiviewDecomp":
                         y_batch = batch.pop(-1).squeeze()
                         loss = inference.step(batch, batch_idx, y_batch)
