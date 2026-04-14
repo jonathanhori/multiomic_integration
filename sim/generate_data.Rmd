@@ -7,8 +7,13 @@ output: html_document
 library(mvtnorm)
 library(tidyverse)
 
-source("./R/sim_methods.R")
+source("../R/sim_methods.R")
 # getwd()
+```
+
+
+```{r}
+getwd()
 ```
 
 Specify number of views, subjects, data dimensions, latent factor dimensions, and SNRs.
@@ -16,14 +21,14 @@ Specify number of views, subjects, data dimensions, latent factor dimensions, an
 
 
 L = 3
-N = 1000
-p_l = rep(1000, L)
+N = 500
+p_l = 1000 #rep(1000, L)
 K = 5
-K_l = rep(5, L)
+K_l = 5 #rep(5, L)
 snr_x = 2
 snr_y = 2
 
-loading_sparsity = 0
+loading_sparsity = 0.25
 
 ```
 
@@ -35,7 +40,7 @@ sim_data_spec <- lapply(1:L,
                                          # K = K,
                                          K_l = K_l,
                                          snr_x = snr_x,
-                                         sparsity = 0) #,
+                                         sparsity = loading_sparsity) #,
                                          # snr_y = snr_y)
 )
 ```
@@ -54,6 +59,16 @@ sim_loadings.shared <- lapply(sim_data_spec,
                        }
 )
 
+# sparsity_mask.shared <- lapply(sim_data_spec,
+#                        function(spec) {
+#                          generate_factor_loadings(spec, 
+#                                                   sparsity_prob = 1 - spec$sparsity, 
+#                                                   K)
+#                        }
+# )
+
+sim_factors.shared <- generate_factor_scores(sim_data_spec[[1]], K)
+
 sim_loadings.view_specific <- lapply(sim_data_spec,
                        function(spec) {
                          generate_factor_loadings(spec, 
@@ -61,22 +76,282 @@ sim_loadings.view_specific <- lapply(sim_data_spec,
                        }
 )
 
-sim_factors.shared <- generate_factor_scores(sim_data_spec[[1]], K)
-
 
 sim_factors.view_specific <- lapply(sim_data_spec,
                        function(spec) {
                          generate_factor_scores(spec)
                        }
 )
+
+
+P = projection_by_qr(sim_factors.shared)
+P_perp = diag(N) - P
+
+ortho_factors.view_specific <- lapply(sim_factors.view_specific,
+                                      function(scores) {
+                                        ortho_scores <- P_perp %*% scores
+                                        ortho_scores_sd <- sd(ortho_scores)
+                                        ortho_scores / ortho_scores_sd
+                                      }
+)
+
+
+# sparsity_mask <- create_sparsity_mask(sparsity_prob,
+#                                       nrows,
+#                                       ncols)
   
 ```
 
 ```{r}
-set.seed(123)
-sample(LETTERS, 5)
-set.seed(123)
-sample(LETTERS, 5)
+(generate_factor_loadings(sim_data_spec[[1]], 
+                         sparsity_prob = 1 - spec$sparsity, 
+                         K))
+
+lapply(sim_data_spec,
+       function(spec) print(spec))
+```
+
+
+```{r}
+qr(rnorm(n = 5 * 1000) |>  #* 
+      # rbinom(n = data_spec$K * data_spec$p_l, 
+      #        size = 1, 
+      #        prob = sparsity_prob) |> 
+      matrix(nrow = 1000,
+             ncol = 5))$rank
+```
+
+
+```{r}
+joint_structures <- lapply(1:length(sim_data_spec), 
+       function(l) {
+         sim_factors.shared %*% t(sim_loadings.shared[[l]]) 
+         # + 
+         #   sim_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]) +
+         #   noise_x_views[[l]]
+       }
+)
+
+view_structures <- lapply(1:length(sim_data_spec), 
+       function(l) {
+         # sim_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]])
+         ortho_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]])
+         # + 
+         #   sim_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]) +
+         #   noise_x_views[[l]]
+       }
+)
+```
+
+Verify:
+- rank of each joint structure (should be equal to K)
+
+```{r}
+lapply(1:L,
+       function(l) qr(joint_structures[[l]])$rank)
+
+# lapply(1:L,
+#        function(l) qr(sim_loadings.shared[[l]])$rank)
+
+```
+
+- rank of concatenated joint structure (should also be equal to K)
+
+```{r}
+joint_concat <- do.call(cbind, joint_structures)
+# scores_concat <- do.call(cbind, )
+
+dim(joint_concat)
+
+qr(joint_concat)$rank
+```
+
+- column space of structures is equal to scores
+
+```{r}
+# svd(sim_loadings.shared[[1]])
+
+qr(sim_factors.shared)$rank
+
+qr(cbind(joint_concat, sim_factors.shared))$rank
+```
+
+```{r}
+# qr(t(joint_concat) %*% joint_concat)$rank
+```
+
+
+```{r}
+# dim(t(joint_concat) %*% joint_concat)
+```
+
+
+```{r}
+# q = qr.Q(qr(sim_factors.shared))
+# projection_by_qr <- function(X) {
+#   q = qr.Q(qr(X))
+#   P = q %*% t(q)
+# }
+# projection_by_inverse <- function(X) {
+#   X %*% solve(t(X) %*% X) %*% t(X)
+# }
+```
+
+```{r}
+P1 = projection_by_qr(joint_concat)
+P1.5 = projection_by_qr(sim_factors.shared)
+
+P2 = projection_by_inverse(joint_concat)
+
+
+
+P1 = projection_by_qr(sim_factors.shared)
+# P1.5 = projection_by_qr(sim_factors.shared)
+
+P2 = projection_by_inverse(sim_factors.shared)
+```
+
+
+```{r}
+P = projection_by_qr(sim_factors.shared)
+P_perp = diag(N) - P
+```
+
+```{r}
+P_perp %*% 
+```
+
+
+
+```{r}
+all.equal(P1, P2)
+```
+
+```{r}
+qr(P1)$rank
+qr(P1.5)$rank
+```
+
+
+```{r}
+qr(joint_concat)$rank
+```
+
+
+
+
+```{r}
+# dim(P1.5)
+P1 %*% sim_factors.shared
+sim_factors.shared
+
+(P1 %*% joint_concat)[1, 1]
+joint_concat[1, 1]
+
+all.equal(P1 %*% sim_factors.shared, sim_factors.shared)
+all.equal(P1 %*% joint_concat, joint_concat)
+
+all.equal(P1.5 %*% sim_factors.shared, sim_factors.shared)
+all.equal(P1.5 %*% joint_concat, joint_concat)
+# joint_concat
+```
+```{r}
+P1[1, 1]
+```
+
+```{r}
+P1.5[1, 1]
+```
+
+
+```{r}
+all.equal(P1, P1.5)
+```
+
+
+
+
+```{r}
+qr(view_structures[[1]])$rank
+
+P = projection_by_qr(sim_factors.shared)
+P_perp = diag(N) - P
+ortho_view_structure <- P_perp %*% view_structures[[1]]
+
+qr(ortho_view_structure)$rank
+```
+
+- AtJ = 0 (structures are orthogonal after projection)
+```{r}
+# norm(t(ortho_view_structure) %*% joint_structures[[1]])
+lapply(1:L,
+       function(l) norm(t(view_structures[[l]]) %*% joint_structures[[l]]))
+
+t(ortho_view_structure) %*% sim_factors.shared
+```
+```{r}
+lapply(1:L,
+       function(l) norm(t(ortho_factors.view_specific[[l]]) %*% sim_factors.shared))
+```
+
+
+
+- After projection and rescaling, entries in view-specific matrices are normal
+
+```{r}
+mean(ortho_view_structure)
+sd(ortho_view_structure)
+
+sd(ortho_view_structure / sd(ortho_view_structure))
+```
+
+
+
+```{r}
+library(rbenchmark)
+benchmark("qr" = {projection_by_qr(joint_concat)},
+          "inverse" = {projection_by_inverse(joint_concat)})
+
+
+benchmark("qr" = {qr(joint_concat)$rank},
+          "inverse" = {qr(sim_factors.shared)$rank})
+```
+
+
+```{r}
+l = 1
+q = qr.Q(qr(sim_loadings.shared[[l]])) # %*% t(sim_loadings.shared[[l]])
+
+P = q %*% t(q)
+P2 = sim_loadings.shared[[l]] %*% solve(t(sim_loadings.shared[[l]]) %*% sim_loadings.shared[[l]]) %*% t(sim_loadings.shared[[l]])
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+lapply(1:length(sim_data_spec), 
+       function(l) {
+         q = qr.Q(qr(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]])
+         
+         # + 
+         #   sim_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]) +
+         #   noise_x_views[[l]]
+       }
+)
+```
+
+
+
+
+```{r}
+# set.seed(123)
+# sample(LETTERS, 5)
+# set.seed(123)
+# sample(LETTERS, 5)
 ```
 
 
@@ -103,12 +378,12 @@ noise_x_views <- lapply(1:length(sim_data_spec),
 )
 ```
 
-
+Replaced sim_factors.view_specific with ortho_factors.view_specific
 ```{r}
 sim_data.x <- lapply(1:length(sim_data_spec), 
        function(l) {
          sim_factors.shared %*% t(sim_loadings.shared[[l]]) + 
-           sim_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]) +
+           ortho_factors.view_specific[[l]] %*% t(sim_loadings.view_specific[[l]]) +
            noise_x_views[[l]]
        }
 )
@@ -144,7 +419,7 @@ beta_l <- lapply(1:L,
 
 lp_view_specific <- lapply(1:L, 
        function(l) {
-         sim_factors.view_specific[[l]] %*% beta_l[[l]]
+         ortho_factors.view_specific[[l]] %*% beta_l[[l]] # inserted ortho factors here
        }
 )
 
@@ -178,7 +453,8 @@ sim_data <- list(
   Lambda_l = sim_loadings.shared,
   Gamma_l = sim_loadings.view_specific,
   Z = sim_factors.shared,
-  Phi = sim_factors.view_specific
+  Phi = sim_factors.view_specific,
+  Phi_ortho = ortho_factors.view_specific
 )
 
 
@@ -192,22 +468,30 @@ sim_data <- list(
 
 # Save
 ```{r}
-# data_name_base <- "sim_data_n%sp%s_snr%s.%s_ywithview.rds"
+data_name_base <- "sim_data_n%sp%s_snr%s.%s_ywithview.rds"
 # saveRDS(sim_data, sprintf(data_name_base, N, p_l, snr_x, snr_y))
 
 saveRDS(sim_data, 
         file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
                   "data",
-                  sprintf(data_name_base, N, p_l, snr_x, snr_y))
+                  paste0("test_", sprintf(data_name_base, N, p_l, snr_x, snr_y)))
 )
 
 # saveRDS(sim_data.x, "data/sim_data_x.rds")
 # saveRDS(sim_data.y, "data/sim_data_y.rds")
 ```
 
+
+# Debug: check saved data
+
+```{r}
+sim_data_multiview = readRDS('~/multiomic_integration/sim/data_ortho/train/n500p100_snr2.2_sparse0.25/sim_data_ywithview_rep1.rds')
+```
+
 ```{r}
 
 ```
+
 
 #--------------------
 # Multiple reps
@@ -218,36 +502,52 @@ set.seed(123)
 
 reps = 10
 
-n_array <- c(50, 100, 500, 1000) #, 5000)
-p_array <- c(50, 100, 1000) #, 10000)
+n_array <- c(500) #c(50, 100, 500, 1000) #, 5000)
+test_n <- 100
+p_array <- c(100) #c(50, 100, 1000) #, 10000)
 snr_x_array <- c(2) #c(2, 1, 0.5)
 snr_y_array <- c(2) #c(2, 1, 0.5)
 # snr_x_array <- c(0.5)
 # snr_y_array <- c(0.5)
 L = 3
-K = 5
-K_l = 5
-loading_sparsity = .25 # 25% of entries are 0
-getwd()
+K = 9
+K_l = 3
+loading_sparsity_array = c(.25) #c(0, 0.25, 0.5) #.25 # 25% of entries are 0
+# getwd()
 
 sim_grid <- expand.grid(n = n_array,
-            p_l = p_array,
-            snr_x = snr_x_array,
-            snr_y = snr_y_array)
+                        p_l = p_array,
+                        snr_x = snr_x_array,
+                        snr_y = snr_y_array,
+                        loading_sparsity = loading_sparsity_array)
 
 # sim_grid <- sim_grid |> filter(n == 5000, p_l == 1000, snr_x == 1, snr_y == 1)
 
 data_name_base <- "sim_data_ywithview_rep%s.rds"
 data_path_base <- "n%sp%s_snr%s.%s_sparse%s"
 
-mapply(function(n, p_l, snr_x, snr_y) {
+mapply(function(n, p_l, snr_x, snr_y, loading_sparsity) {
   # Create output path
-  out_path <- file.path("/Users/jonathanhori/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim", #dirname(rstudioapi::getSourceEditorContext()$path), 
-                        "data3",
-                        sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity))
+  out_path_train <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data_ortho",
+    "k.9_kl.3",
+    "train",
+    sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+  )
+  out_path_test <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data_ortho",
+    "k.9_kl.3",
+    "test",
+    sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+  )
   # if (dir.exists(out_path)) {NA}
   # else {
-    dir.create(out_path,
+    dir.create(out_path_train,
+               showWarnings = FALSE,
+               recursive = TRUE)
+    dir.create(out_path_test,
                showWarnings = FALSE,
                recursive = TRUE)
     
@@ -256,21 +556,44 @@ mapply(function(n, p_l, snr_x, snr_y) {
       if (n == 5000 & p_l == 10000) {NA} # takes too long
       else {
         # Check if replicate already created
-        if (file.exists(file.path(out_path,
+        if (file.exists(file.path(out_path_test,
                                   sprintf(data_name_base, rep)))) {NA}
         else {
-          sim_data <- generate_factor_data(L = L,
-                                           N = n,
-                                           p_l_vec = c(p_l, p_l, p_l),
-                                           K = K,
-                                           K_l_vec = c(K_l, K_l, K_l),
-                                           snr_x_vec = c(snr_x, snr_x, snr_x),
-                                           sparsity_vec = c(loading_sparsity, loading_sparsity, loading_sparsity),
-                                           snr_y = snr_y,
-                                           outcome = "all")
+          sim_data <- generate_factor_data(
+            L = L,
+            N = n,
+            p_l_vec = c(p_l, p_l, p_l),
+            K = K,
+            K_l_vec = c(K_l, K_l, K_l),
+            snr_x_vec = c(snr_x, snr_x, snr_x),
+            sparsity_vec = c(loading_sparsity, loading_sparsity, loading_sparsity),
+            snr_y = snr_y,
+            # test_n = test_n,
+            outcome = "all"
+          )
+          
+          test_data <- generate_factor_data_testing(
+            L = L,
+            N = test_n,
+            p_l_vec = c(p_l, p_l, p_l),
+            K = K,
+            K_l_vec = c(K_l, K_l, K_l),
+            snr_x_vec = c(snr_x, snr_x, snr_x),
+            sparsity_vec = c(loading_sparsity, loading_sparsity, loading_sparsity),
+            snr_y = snr_y,
+            training_loadings.shared = sim_data$Lambda_l,
+            training_loadings.view_specific = sim_data$Gamma_l,
+            training_beta = sim_data$beta,
+            # test_n = test_n,
+            outcome = "all"
+          )
           
           saveRDS(sim_data, 
-                  file.path(out_path,
+                  file.path(out_path_train,
+                            sprintf(data_name_base, rep))
+          )
+          saveRDS(test_data, 
+                  file.path(out_path_test,
                             sprintf(data_name_base, rep))
           )
         }
@@ -281,9 +604,11 @@ mapply(function(n, p_l, snr_x, snr_y) {
 sim_grid$n,
 sim_grid$p_l,
 sim_grid$snr_x,
-sim_grid$snr_y)
+sim_grid$snr_y,
+sim_grid$loading_sparsity)
 
 ```
+
 
 #--------------------
 # Generate simple factorized matrix
@@ -292,14 +617,14 @@ X = Z %*% Lambda^T + E
 
 ```{r}
 L = 1
-N = 2000
-p_l = rep(10000, L)
+N = 500
+p_l = rep(100, L) # 1000
 K = 5
 K_l = rep(5, L)
 snr_x = 2
 snr_y = 2
 
-loading_sparsity = 0
+loading_sparsity = 0.25
 
 sim_data_spec <- lapply(1:L,
                         function(l) list(N = N,
@@ -307,9 +632,22 @@ sim_data_spec <- lapply(1:L,
                                          # K = K,
                                          K_l = K_l,
                                          snr_x = snr_x,
-                                         sparsity = 0) #,
+                                         sparsity = loading_sparsity) #,
                                          # snr_y = snr_y)
 )
+```
+
+I don't remember why I wanted to calculate Z^(-1/2)
+```{r}
+fnMatSqrtInverse = function(mA) {
+  # https://scicomp.stackexchange.com/questions/10375/efficient-computation-of-the-matrix-square-root-inverse
+  ei = eigen(mA)
+  d = ei$values
+      d = (d+abs(d))/2
+      d2 = 1/sqrt(d)
+      d2[d == 0] = 0
+      return(ei$vectors %*% diag(d2) %*% t(ei$vectors))
+}
 ```
 
 
@@ -327,6 +665,19 @@ sim_loadings.shared <- lapply(sim_data_spec,
 sim_factors.shared <- generate_factor_scores(sim_data_spec[[1]], K)
 
 
+```
+
+
+```{r}
+factors.sqrt_inv = fnMatSqrtInverse(t(sim_factors.shared) %*% sim_factors.shared)
+factors_adjusted = sim_factors.shared %*% factors.sqrt_inv
+
+t(sim_factors.shared) %*% sim_factors.shared / N
+t(factors_adjusted) %*% factors_adjusted #/ N
+```
+
+
+```{r}
 view_vars <- lapply(1:L,
        function(l) {
          diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]))
@@ -346,13 +697,76 @@ noise_x_views <- lapply(1:length(sim_data_spec),
                   }
 )
 
+# sim_data.x <- lapply(1:length(sim_data_spec), 
+#                        function(l) {
+#                          sim_factors.shared %*% t(sim_loadings.shared[[l]]) + 
+#                            noise_x_views[[l]]
+#                        }
+#   )
 sim_data.x <- lapply(1:length(sim_data_spec), 
                        function(l) {
                          sim_factors.shared %*% t(sim_loadings.shared[[l]]) + 
                            noise_x_views[[l]]
+                         # factors_adjusted %*% t(sim_loadings.shared[[l]]) + 
+                           # noise_x_views[[l]]
                        }
   )
 ```
+
+```{r}
+beta_sim <- rnorm(n = K_l)
+    
+outcome_var <- t(beta_sim) %*% beta_sim
+noise_y <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+
+sim_data.y <- sim_factors.shared %*% beta_sim + noise_y
+```
+
+
+
+```{r}
+F = sim_factors.shared %*% (t(sim_factors.shared) %*% sim_factors.shared / (N) + diag(ncol(sim_factors.shared)))
+
+C = chol(t(sim_factors.shared) %*% sim_factors.shared / (N))# + diag(ncol(sim_factors.shared)))
+
+fnMatSqrtInverse = function(mA) {
+  ei = eigen(mA)
+  d = ei$values
+      d = (d+abs(d))/2
+      d2 = 1/sqrt(d)
+      d2[d == 0] = 0
+      return(ei$vectors %*% diag(d2) %*% t(ei$vectors))
+}
+
+
+F.sqrt_inv = fnMatSqrtInverse((t(sim_factors.shared) %*% sim_factors.shared / (N)))# + diag(ncol(sim_factors.shared))))
+
+F = sim_factors.shared %*% F.sqrt_inv
+
+mean(F)
+mean(sim_factors.shared)
+sd(sim_factors.shared)
+
+t(F) %*% F / N
+
+(t(sim_factors.shared) %*% sim_factors.shared / (N) + diag(ncol(sim_factors.shared)))
+C %*% t(C)
+
+t(F) %*% F
+```
+
+
+```{r}
+
+```
+
+```{r}
+factorQ = qr.Q(qr(sim_factors.shared))
+sqrt(N) * factorQ
+
+t(factorQ) %*% factorQ
+```
+
 
 
 ```{r}
@@ -362,8 +776,10 @@ sim_data <- list(
   p_l = lapply(sim_data.x, ncol),
   K = K,
   K_l = c(K_l, K_l, K_l),
+  sparsity = loading_sparsity,
   X_l = sim_data.x,
-  # y = sim_data.y,
+  beta = beta_sim,
+  y = sim_data.y,
   Lambda_l = sim_loadings.shared,
   # Gamma_l = sim_loadings.view_specific,
   Z = sim_factors.shared
@@ -374,13 +790,15 @@ sim_data <- list(
 
 
 ```{r}
-data_name_base <- "factor_data_n%sp%s_snr%s.%s.rds"
+data_name_base <- "factor_data_n%sp%s_snr%s.%s_sparse%s.rds"
 # saveRDS(sim_data, sprintf(data_name_base, N, p_l, snr_x, snr_y))
 # saveRDS()
 saveRDS(sim_data, #sim_data.x, 
         file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                  "simple_data",
-                  sprintf(data_name_base, N, p_l, snr_x, snr_y))
+                  "data",
+                  "single_view_withoutcome",
+                  "k.5",
+                  sprintf(data_name_base, N, p_l, snr_x, snr_y, loading_sparsity))
 )
 ```
 

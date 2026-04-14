@@ -31,6 +31,11 @@ dir.create(output_dir) #, showWarnings = FALSE)
 # getwd()
 ```
 
+```{r}
+getwd()
+```
+
+
 MCMC params
 ```{r}
 tMCMC = 10000
@@ -58,7 +63,7 @@ snr_y_array <- c(2) #c(2, 1, 0.5)
 # snr_x_array <- c(2, 1, 0.5)
 # snr_y_array <- c(2, 1, 0.5)
 reps = 10
-loading_sparsity = c(0, 0.25, 0.5)
+loading_sparsity = c(0.25) #c(0, 0.25, 0.5)
 
 sim_grid <- expand.grid(n = n_array,
             p_l = p_array,
@@ -69,11 +74,11 @@ sim_grid <- expand.grid(n = n_array,
 
 data_name_base <- "sim_data_ywithview_rep%s.rds"
 data_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                      "data",
+                      "data_ortho",
                       "n%sp%s_snr%s.%s_sparse%s")
 
 out_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                           "results/jafar") #,
+                           "results/jafar/sparse_ortho") #,
                            # paste0("jafar/sparse", loading_sparsity))
 out_name_base <- "n%sp%s_snr%s.%s_sparse%s_rep%s.rds"
 
@@ -688,7 +693,7 @@ metrics_agg <- lapply(
         # eval_table.collected <- bind_rows(eval_table.collected,
         #                                   eval_table)
         metric_out_data_path <- file.path(out_path_base,
-                                          "metrics3",
+                                          "metrics",
                                           sprintf(out_name_base, n, p, snr_x, snr_y, loading_sparsity, rep))
         # cov_out_data_path <- file.path(out_path_base,
         #                                "covariances2",
@@ -1170,7 +1175,7 @@ all_model_metrics_combined |>
 # c(0.5, 1, 2)
 
 for (snr in c(2)) {
-  for (struct in c('individual', 'joint', 'outcome')) {
+  for (struct in c('individual', 'joint')) {
   SNR_X_FILTER = snr
   SNR_Y_FILTER = snr
   
@@ -1193,8 +1198,9 @@ for (snr in c(2)) {
                      scales = "fixed",
                      labeller = label_both) +
           labs(
-            title = paste0("Comparison of squared errors in ", struct, " reconstruction"),
-            subtitle = paste0("SNR: ", snr, " -- RSE for structures, MSE for outcome")
+            title = paste0("Comparison of squared errors in ", struct, " reconstruction (SNR ", snr, ")"),
+            y = "RSE",
+            subtitle = TeX("$RSE = \\frac{\\|S - \\hat{S}\\| ^{2}}{\\|S \\|^{2}}$") #paste0("SNR: ", snr, " -- Relative squared error")
           )
   )
   }
@@ -1202,6 +1208,47 @@ for (snr in c(2)) {
   
   
 ```
+
+
+```{r}
+# c(0.5, 1, 2)
+
+for (snr in c(2)) {
+  for (struct in c('outcome')) {
+  SNR_X_FILTER = snr
+  SNR_Y_FILTER = snr
+  
+  print(all_model_metrics_combined |> 
+          filter(snr_x == SNR_X_FILTER, snr_y == SNR_Y_FILTER,
+                 structure == struct) |> 
+                 # structure != "data_reconstruction"
+          filter(metric != "95p_coverage") |> 
+          ggplot() +
+          geom_boxplot(aes(x = n,
+                           y = value,
+                           group = interaction(n, model),
+                           color = model
+                           # group = n,
+                           # color = l
+          )) + 
+          facet_grid(cols = vars(p), 
+                     rows = vars(sparsity), #snr_y ~ snr_x, #rows = vars(quantity),
+                     # cols = vars(p),
+                     scales = "fixed",
+                     labeller = label_both) +
+          labs(
+            title = paste0("Comparison of squared errors in ", struct, " reconstruction (SNR ", snr, ")"),
+            subtitle = paste0("SNR: ", snr, " -- Mean squared error"),
+            y = "MSE"
+          ) + 
+          ylim(0, 2)
+  )
+  }
+}
+  
+  
+```
+
 
 ```{r}
 SNR_X_FILTER = 2
@@ -1227,7 +1274,8 @@ all_model_metrics_combined |>
                scales = "fixed",
                labeller = label_both) +
     labs(
-      title = paste0("95% credible interval coverage probability for outcome")
+      title = paste0("95% credible interval coverage probability for outcome"),
+      y = "Coverage"
     )
 ```
 
@@ -1278,5 +1326,73 @@ tibble(pred = y_pred.means,
   # geom_abline(slope=1, intercept = 0) +
   labs(x = "Simulated outcome",
        y = "Predicted outcome")
+```
+
+## Hyperparameter tuning plots
+
+```{r}
+file_list <- list.files(
+  path = "/Users/jonathanhori/multiomic_integration/sim/results/integration/hyperparam_gridsearch/metrics",
+  pattern = "min_epochs20",
+  full.names = TRUE # Essential for creating correct paths
+)
+
+hyper_metrics <- lapply(file_list,
+                        read_csv) |> 
+  bind_rows()
+
+hyper_metrics <- read_csv("/Users/jonathanhori/multiomic_integration/sim/results/integration/hyperparam_gridsearch/metrics/run_n500p100_snr2.2_sparse0.25_deltak10_rep1_concat.csv")
+```
+
+
+```{r}
+lrs <- hyper_metrics |> distinct(initial_lr) |> pull()
+betas <- hyper_metrics |> distinct(betas) |> pull()
+
+hyper_metrics <- hyper_metrics |> 
+  pivot_longer(cols = c('joint', 'individual', 'outcome'),
+               names_to = 'structure',
+               values_to = 'value') |> 
+  group_by(initial_lr, betas, lr_step_size, lr_decay_factor, minibatch_size) |> 
+  mutate(setting = cur_group_id())
+
+# for (beta in betas) {
+print(hyper_metrics |> 
+        filter(metric == "rse") |> 
+        print() |> 
+        ggplot() +
+        geom_point(aes(x = initial_lr, y = value, shape = structure, size = minibatch_size, color = betas), position = "jitter") + 
+        facet_grid(lr_step_size ~ lr_decay_factor, labeller = label_both) +
+        ylim(0, 1) +
+        scale_x_continuous(breaks = lrs)
+)
+# }
+```
+
+
+```{r}
+hyper_metrics |> 
+  filter(metric == "rse", structure != "outcome") |> 
+  group_by(setting, structure) |> 
+  mutate(mean_metric_by_structure = mean(value),
+         agg_metric_by_structure = case_when(
+           structure == "joint" ~ min(value),
+           structure == "individual" ~ max(value)
+         ),
+         structure_mean = structure) |> 
+  group_by(setting) |> 
+  pivot_wider(names_from = structure_mean, 
+              values_from = agg_metric_by_structure) |> 
+  mutate(joint = max(joint, na.rm = TRUE),
+         individual = max(individual, na.rm = TRUE),
+         average_metric = mean(mean_metric_by_structure),
+         metric_diff = abs(joint - individual)) |> 
+  arrange(average_metric) |> # value
+  filter(metric_diff < .3)
+```
+
+
+```{r}
+hyper_metrics |> filter(setting == 61)
 ```
 
