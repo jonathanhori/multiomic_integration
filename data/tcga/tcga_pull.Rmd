@@ -1,0 +1,407 @@
+---
+title: "TCGA COAD – Method Comparison: MatrixDecomp vs Lasso vs PCA/FA + OLS"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(glmnet)
+library(psych)
+library(factoextra)
+library(knitr)
+library(kableExtra)
+
+opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
+
+PROJECT_ROOT <- "~/multiomic_integration"
+DATA_DIR     <- file.path(PROJECT_ROOT, "data/tcga")
+EXPORT_DIR   <- file.path(DATA_DIR, "processed/kirc")
+MD_RESULT_DIR <- file.path(PROJECT_ROOT, "sim/results/matrixdecomp/tcga")
+
+dir.create(EXPORT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Data Loading
+
+```{r load-data}
+TMB_F1CDX <- readRDS(file.path(DATA_DIR, "TMB_F1CDX_data.rds"))
+subtype_raw  <- TMB_F1CDX$kirc_tcga_pub
+
+y_raw      <- subtype_raw$TMB_NONSYNONYMOUS
+X_raw      <- subtype_raw |> select(-sampleId, -TMB_NONSYNONYMOUS) |> as.matrix()
+sample_ids <- subtype_raw$sampleId
+
+cat(sprintf("n = %d samples,  p = %d gene features\n", nrow(X_raw), ncol(X_raw)))
+```
+
+```{r}
+TMB_F1CDX$kirc_tcga_pub |> filter(TMB_NONSYNONYMOUS > 200)
+```
+
+
+```{r tmb-distribution}
+ggplot(tibble(TMB = y_raw), aes(x = TMB)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  labs(title = "Distribution of TMB_NONSYNONYMOUS (COAD)",
+       x = "TMB (mutations / Mb)", y = "Count") +
+  theme_minimal()
+```
+
+
+## Preprocessing
+
+```{r}
+y_raw <- log(1 + y_raw)
+```
+
+
+```{r tmb-distribution}
+ggplot(tibble(TMB = y_raw), aes(x = TMB)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  labs(title = "Distribution of TMB_NONSYNONYMOUS (COAD)",
+       x = "TMB (mutations / Mb)", y = "Count") +
+  theme_minimal()
+```
+
+
+```{r preprocess}
+set.seed(42)
+n         <- nrow(X_raw)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+test_idx  <- setdiff(seq_len(n), train_idx)
+
+X_train_raw <- X_raw[train_idx, ]
+X_test_raw  <- X_raw[test_idx, ]
+y_train_raw <- y_raw[train_idx]
+y_test_raw  <- y_raw[test_idx]
+
+# Column-wise standardisation using training statistics only
+col_means <- colMeans(X_train_raw)
+col_sds   <- apply(X_train_raw, 2, sd)
+
+nonzero_var <- col_sds > 0
+X_train_raw <- X_train_raw[, nonzero_var]
+X_test_raw  <- X_test_raw[, nonzero_var]
+col_means   <- col_means[nonzero_var]
+col_sds     <- col_sds[nonzero_var]
+
+X_train <- scale(X_train_raw, center = col_means, scale = col_sds)
+X_test  <- scale(X_test_raw,  center = col_means, scale = col_sds)
+
+# Standardise outcome (using training statistics)
+y_mean    <- mean(y_train_raw)
+y_sd      <- sd(y_train_raw)
+y_train_z <- (y_train_raw - y_mean) / y_sd
+y_test_z  <- (y_test_raw  - y_mean) / y_sd
+
+cat(sprintf("Train: %d | Test: %d | Features after filtering: %d\n",
+            length(train_idx), length(test_idx), sum(nonzero_var)))
+```
+
+
+```{r tmb-distribution}
+ggplot(tibble(TMB = y_train_z), aes(x = TMB)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  labs(title = "Distribution of TMB_NONSYNONYMOUS (COAD)",
+       x = "TMB (mutations / Mb)", y = "Count") +
+  theme_minimal()
+```
+
+## Export Data for Python (MatrixDecomp)
+
+These CSVs are read by `python/tcga_matrixdecomp.py`.  Both matrices already have
+zero-mean, unit-SD columns (training statistics applied to test).  The `y` column
+is the standardised outcome.
+
+```{r export}
+train_df <- as.data.frame(X_train); train_df$y <- y_train_z
+test_df  <- as.data.frame(X_test);  test_df$y  <- y_test_z
+
+write.csv(train_df, file.path(EXPORT_DIR, "train.csv"), row.names = FALSE)
+write.csv(test_df,  file.path(EXPORT_DIR, "test.csv"),  row.names = FALSE)
+
+cat("Exported to", EXPORT_DIR, "\n")
+cat("Run `python python/tcga_matrixdecomp.py` to generate MatrixDecomp results.\n")
+```
+
+## Helper Functions
+
+```{r helpers}
+# Returns the five metrics matching eval_performance_single_view() in Python.
+#   structure_rse     – ||X_train - X_hat||²_F / ||X_train||²_F  (NA if no decomposition)
+#   structure_95p_cov – 95% CI coverage of X_train reconstruction (NA if deterministic)
+#   cov_norm_frob     – ||Cov_est - Cov_sample||²_F / p²  (NA if no decomposition)
+#   outcome_mse       – mean squared error on test set
+#   outcome_95p_cov   – 95% PI coverage on test set (NA if no intervals)
+compute_metrics <- function(y_true, y_pred, method_name,
+                            y_pred_lower    = NULL, y_pred_upper = NULL,
+                            structure_rse     = NA_real_,
+                            structure_95p_cov = NA_real_,
+                            cov_norm_frob     = NA_real_) {
+  outcome_mse     <- mean((y_true - y_pred)^2)
+  outcome_95p_cov <- if (!is.null(y_pred_lower) && !is.null(y_pred_upper))
+    mean(y_true >= y_pred_lower & y_true <= y_pred_upper)
+  else
+    NA_real_
+
+  tibble(method            = method_name,
+         structure_rse     = structure_rse,
+         structure_95p_cov = structure_95p_cov,
+         cov_norm_frob     = cov_norm_frob,
+         outcome_mse       = outcome_mse,
+         outcome_95p_cov   = outcome_95p_cov)
+}
+
+sample_cov <- crossprod(X_train) / (nrow(X_train) - 1)  # used by PCA and FA below
+
+# Null model: predict training mean (= 0 on standardised scale).
+metrics_null <- compute_metrics(y_test_z, rep(0, length(y_test_z)), "Null (mean)")
+```
+
+## Method 1: Lasso
+
+```{r lasso, fig.height=4}
+set.seed(42)
+lasso_cv <- cv.glmnet(X_train, y_train_z, alpha = 1, nfolds = 10)
+plot(lasso_cv, main = "Lasso CV")
+
+pred_lasso_min <- as.numeric(predict(lasso_cv, newx = X_test, s = "lambda.min"))
+pred_lasso_1se <- as.numeric(predict(lasso_cv, newx = X_test, s = "lambda.1se"))
+
+n_coef_min <- sum(coef(lasso_cv, s = "lambda.min")[-1] != 0)
+n_coef_1se <- sum(coef(lasso_cv, s = "lambda.1se")[-1] != 0)
+cat(sprintf("Non-zero coefficients: lambda.min = %d | lambda.1se = %d\n",
+            n_coef_min, n_coef_1se))
+
+metrics_lasso <- bind_rows(
+  compute_metrics(y_test_z, pred_lasso_min, sprintf("Lasso λ.min (%d coef)", n_coef_min)),
+  compute_metrics(y_test_z, pred_lasso_1se, sprintf("Lasso λ.1se (%d coef)", n_coef_1se))
+)
+
+print(metrics_lasso)
+```
+
+## Method 2: PCA + OLS
+
+PCA is fit on the (already standardised) training features; test observations are
+projected using the same rotation.
+
+```{r pca-ols}
+pca_fit <- prcomp(X_train, center = FALSE, scale. = FALSE)
+
+# Scree plot: variance explained
+fviz_eig(pca_fit, ncp = 30, col.var = "steelblue",
+         main = "PCA scree plot – COAD gene expression")
+
+k_pca_values <- c(5, 10, 20, 50)
+p <- ncol(X_train)
+
+metrics_pca <- map_dfr(k_pca_values, function(k) {
+  Lambda    <- pca_fit$rotation[, seq_len(k), drop = FALSE]
+  sdev_k    <- pca_fit$sdev[seq_len(k)]
+  Z_train   <- pca_fit$x[, seq_len(k), drop = FALSE]
+  Z_test_df <- as.data.frame(predict(pca_fit, newdata = X_test)[, seq_len(k), drop = FALSE])
+  Z_train_df <- as.data.frame(Z_train)
+
+  # structure_rse: training reconstruction error
+  X_hat         <- Z_train %*% t(Lambda)
+  str_rse       <- sum((X_train - X_hat)^2) / sum(X_train^2)
+
+  # cov_norm_frob: rank-k covariance approximation vs sample covariance
+  cov_est       <- Lambda %*% diag(sdev_k^2, k) %*% t(Lambda)
+  cov_frob      <- sum((cov_est - sample_cov)^2) / p^2
+
+  # outcome: lm with prediction intervals on test set
+  lm_fit    <- lm(y ~ ., data = cbind(y = y_train_z, Z_train_df))
+  pred_int  <- predict(lm_fit, newdata = Z_test_df, interval = "prediction")
+
+  compute_metrics(y_test_z, pred_int[, "fit"], sprintf("PCA+OLS (k=%d)", k),
+                  y_pred_lower    = pred_int[, "lwr"],
+                  y_pred_upper    = pred_int[, "upr"],
+                  structure_rse   = str_rse,
+                  cov_norm_frob   = cov_frob)
+})
+
+metrics_pca
+```
+
+## Method 3: Factor Analysis + OLS
+
+Factor analysis is fit on the standardised training set; factor scores on new data
+are obtained via `fa_fit$weights`.
+
+```{r fa-ols}
+k_fa_values <- c(5, 10, 20)
+
+metrics_fa <- map_dfr(k_fa_values, function(k) {
+  fa_fit     <- psych::fa(X_train, nfactors = k, rotate = "varimax",
+                           scores = "regression", fm = "minres")
+  Lambda     <- unclass(fa_fit$loadings)          # p × k
+  Z_train_df <- as.data.frame(fa_fit$scores)
+  Z_test_df  <- as.data.frame(X_test %*% fa_fit$weights)
+  colnames(Z_test_df) <- colnames(Z_train_df)
+
+  # structure_rse: training reconstruction error
+  X_hat    <- fa_fit$scores %*% t(Lambda)
+  str_rse  <- sum((X_train - X_hat)^2) / sum(X_train^2)
+
+  # cov_norm_frob: Lambda @ Lambda' vs sample covariance (shared-factor part only)
+  cov_est  <- Lambda %*% t(Lambda)
+  cov_frob <- sum((cov_est - sample_cov)^2) / p^2
+
+  # outcome: lm with prediction intervals on test set
+  lm_fit   <- lm(y ~ ., data = cbind(y = y_train_z, Z_train_df))
+  pred_int <- predict(lm_fit, newdata = Z_test_df, interval = "prediction")
+
+  compute_metrics(y_test_z, pred_int[, "fit"], sprintf("FA+OLS (k=%d)", k),
+                  y_pred_lower    = pred_int[, "lwr"],
+                  y_pred_upper    = pred_int[, "upr"],
+                  structure_rse   = str_rse,
+                  cov_norm_frob   = cov_frob)
+})
+
+metrics_fa
+```
+
+## Load MatrixDecomp Results (Python)
+
+MatrixDecomp (Bayesian supervised factor model) is trained in Python via
+`python/tcga_matrixdecomp.py`, which reads the CSVs exported above.
+Results are saved to `sim/results/matrixdecomp/tcga/`.
+
+```{r load-matrixdecomp}
+# Expects predictions written by data/tcga/tcga_matrixdecomp.qmd.
+# structure_rse / structure_95p_cov / cov_norm_frob are not yet computed in the
+# Python notebook and will be NA until added there.
+md_metrics_path_sparse <- file.path(MD_RESULT_DIR, "metrics_20260418-233259.csv")
+md_metrics_path_dense <- file.path(MD_RESULT_DIR, "metrics_20260422-111536.csv")
+md_metrics_path_cv <- file.path(MD_RESULT_DIR, "metrics_20260422-143856.csv")
+
+path_list <- c(md_metrics_path_sparse, md_metrics_path_dense, md_metrics_path_cv)
+path_types <- c("_sparse", "_dense", "_cv")
+
+matrix_decomp_results <- lapply(
+  1:length(path_list),
+  function(i) {
+    md_metrics_path <- path_list[i]
+    if (file.exists(md_metrics_path)) {
+      md_metrics_raw <- read.csv(md_metrics_path)
+      metrics_md <- bind_cols(tibble(
+        method = paste0("MatrixDecomp", path_types[i])),
+        md_metrics_raw)
+      # k_val     <- md_metrics_raw$k[1]
+      # pred_path <- file.path(MD_RESULT_DIR, sprintf("predictions_k%d.csv", k_val))
+      # preds     <- read.csv(pred_path)
+      # metrics_md <- compute_metrics(
+      #   preds$y_true, preds$y_pred_mean,
+      #   sprintf("MatrixDecomp (k=%d)", k_val),
+      #   y_pred_lower = preds$`y_pred_q2.5`,
+      #   y_pred_upper = preds$`y_pred_q97.5`
+      # )
+    } else {
+      message("MatrixDecomp results not found in ", MD_RESULT_DIR,
+              "\nRender data/tcga/tcga_matrixdecomp.qmd first.")
+      metrics_md <- tibble(method = character(), structure_rse = double(),
+                           structure_95p_cov = double(), cov_norm_frob = double(),
+                           outcome_mse = double(), outcome_95p_cov = double())
+    }
+  }
+) |> 
+  bind_rows()
+```
+
+## Comparison
+
+```{r comparison-table}
+all_metrics <- bind_rows(
+  metrics_null,
+  metrics_lasso,
+  metrics_pca,
+  metrics_fa,
+  matrix_decomp_results
+  # metrics_md
+) |>
+  arrange(outcome_mse)
+
+all_metrics |>
+  mutate(across(where(is.double), \(x) round(x, 4))) |>
+  kbl(caption = "Test-set prediction metrics (standardised outcome scale)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) |>
+  row_spec(which.min(all_metrics$outcome_mse), bold = TRUE, background = "#d4edda")
+```
+
+```{r outcome-mse-plot, fig.height=6}
+all_metrics |>
+  mutate(method = fct_reorder(method, outcome_mse)) |>
+  ggplot(aes(x = method, y = outcome_mse,
+             fill = str_extract(method, "^[^\\s(]+"))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "TCGA COAD: TMB prediction – outcome MSE by method",
+       x = NULL, y = "Test outcome MSE (standardised scale)") +
+  theme_minimal(base_size = 12)
+```
+
+```{r outcome-coverage-plot, fig.height=6}
+all_metrics |>
+  filter(!is.na(outcome_95p_cov)) |>
+  mutate(method = fct_reorder(method, outcome_95p_cov)) |>
+  ggplot(aes(x = method, y = outcome_95p_cov,
+             fill = str_extract(method, "^[^\\s(]+"))) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "TCGA COAD: TMB prediction – 95% PI coverage by method",
+       subtitle = "Dashed line = nominal 0.95",
+       x = NULL, y = "95% prediction interval coverage") +
+  theme_minimal(base_size = 12)
+```
+
+```{r structure-rse-plot, fig.height=6}
+all_metrics |>
+  filter(!is.na(structure_rse)) |>
+  mutate(method = fct_reorder(method, structure_rse)) |>
+  ggplot(aes(x = method, y = structure_rse,
+             fill = str_extract(method, "^[^\\s(]+"))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "TCGA COAD: training data reconstruction RSE by method",
+       x = NULL, y = "Structure RSE") +
+  theme_minimal(base_size = 12)
+```
+
+```{r cov-frob-plot, fig.height=6}
+all_metrics |>
+  filter(!is.na(cov_norm_frob)) |>
+  mutate(method = fct_reorder(method, cov_norm_frob)) |>
+  ggplot(aes(x = method, y = cov_norm_frob,
+             fill = str_extract(method, "^[^\\s(]+"))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "TCGA COAD: covariance Frobenius error vs sample covariance",
+       x = NULL, y = "||Cov_est - Cov_sample||²_F / p²") +
+  theme_minimal(base_size = 12)
+```
+
+## Notes on Metrics
+
+| Metric | Definition for real data | Methods |
+|--------|--------------------------|---------|
+| `structure_rse` | \|\|X_train − Ẑ Λ'\|\|²_F / \|\|X_train\|\|²_F | PCA, FA |
+| `structure_95p_cov` | 95% PI coverage of X_train reconstruction | NA (deterministic methods) |
+| `cov_norm_frob` | \|\|Λ Λ' − S_train\|\|²_F / p² where S_train = sample cov | PCA, FA |
+| `outcome_mse` | Mean squared error on test set | All |
+| `outcome_95p_cov` | 95% PI/CI coverage on test set | PCA+OLS, FA+OLS, MatrixDecomp |
+
+Lasso has no explicit factor decomposition so structure and covariance metrics are NA.
+MatrixDecomp structure metrics require additional outputs from `tcga_matrixdecomp.qmd`
+(not yet computed).
+```

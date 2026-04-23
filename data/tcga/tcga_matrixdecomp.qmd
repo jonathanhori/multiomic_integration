@@ -1,0 +1,132 @@
+---
+title: "MatrixDecomp on TCGA COAD"
+format: html
+jupyter: python3
+---
+
+Run this after `tcga_pull.Rmd` has exported `data/tcga/processed/train.csv` and
+`data/tcga/processed/test.csv`.
+
+```{python}
+#| label: config
+import os, sys
+import numpy as np
+import pandas as pd
+import torch
+import pyro
+from torch.utils.data import TensorDataset
+from pathlib import Path
+
+sys.path.insert(0, os.path.expanduser("~/multiomic_integration/python"))
+
+from run_methods import train_model_single_view, train_model_locally_single_view
+from data_utils import summarise_post_samples
+
+PROJECT_ROOT = os.path.expanduser("~/multiomic_integration")
+DATA_DIR     = os.path.join(PROJECT_ROOT, "data/tcga/processed")
+OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "sim/results/matrixdecomp/tcga")
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# --- Parameters (edit here) ---
+K                   = 10
+N_POSTERIOR_SAMPLES = 200
+RANDOM_SEED         = 42
+
+TRAIN_CONFIG = {
+    "initial_lr":      0.01,
+    "betas":           (0.9, 0.999),
+    "lr_step_size":    10,
+    "lr_decay_factor": 0.9,
+    "num_particles":   1,
+    "minibatch_size":  32,
+    "min_epochs":      100,
+    "max_epochs":      500,
+}
+```
+
+## Load data
+
+```{python}
+#| label: load-data
+train_df = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+test_df  = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+
+y_train = torch.tensor(train_df["y"].values,                dtype=torch.float32)
+y_test  = torch.tensor(test_df["y"].values,                 dtype=torch.float32)
+X_train = torch.tensor(train_df.drop(columns=["y"]).values, dtype=torch.float32)
+X_test  = torch.tensor(test_df.drop(columns=["y"]).values,  dtype=torch.float32)
+
+print(f"Train: {X_train.shape}  |  Test: {X_test.shape}")
+
+train_subset = TensorDataset(torch.arange(len(y_train)), X_train, y_train)
+test_subset  = TensorDataset(torch.arange(len(y_test)),  X_test,  y_test)
+```
+
+## Fit MatrixDecomp
+
+```{python}
+#| label: train
+pyro.clear_param_store()
+pyro.set_rng_seed(RANDOM_SEED)
+
+model_config = {"k": K, "dense": False}
+
+factor_model, train_handler, global_runtime = train_model_single_view(
+    model_config, TRAIN_CONFIG, train_subset, verbose=False
+)
+print(f"Global training: {global_runtime:.1f}s, {factor_model.total_epochs} epochs")
+```
+
+```{python}
+#| label: local-inference
+test_handler, local_runtime = train_model_locally_single_view(
+    factor_model, TRAIN_CONFIG, test_subset, verbose=False
+)
+print(f"Local inference: {local_runtime:.1f}s, {factor_model.local_epochs} epochs")
+```
+
+## Evaluate
+
+```{python}
+#| label: evaluate
+post_test      = test_handler.predict([X_test], N_POSTERIOR_SAMPLES, return_sites=["y_pred"])
+y_pred_summary = summarise_post_samples(post_test["y_pred"])
+
+y_pred_mean = y_pred_summary["mean"].numpy()
+y_pred_q025 = y_pred_summary["q2.5"].numpy()
+y_pred_q975 = y_pred_summary["q97.5"].numpy()
+y_true_np   = y_test.numpy()
+
+mse      = float(np.mean((y_pred_mean - y_true_np) ** 2))
+rmse     = float(np.sqrt(mse))
+ss_res   = np.sum((y_pred_mean - y_true_np) ** 2)
+ss_tot   = np.sum((y_true_np - y_true_np.mean()) ** 2)
+r2       = float(1 - ss_res / ss_tot)
+coverage = float(np.mean((y_true_np >= y_pred_q025) & (y_true_np <= y_pred_q975)))
+
+print(f"k={K}  MSE={mse:.4f}  RMSE={rmse:.4f}  R²={r2:.4f}  95% cov={coverage:.3f}")
+```
+
+## Save results
+
+```{python}
+#| label: save
+pred_df = pd.DataFrame({
+    "y_true":       y_true_np,
+    "y_pred_mean":  y_pred_mean,
+    "y_pred_q2.5":  y_pred_q025,
+    "y_pred_q97.5": y_pred_q975,
+})
+pred_df.to_csv(os.path.join(OUTPUT_DIR, f"predictions_k{K}.csv"), index=False)
+
+metrics_df = pd.DataFrame([{
+    "k": K, "outcome_mse": mse, "outcome_rmse": rmse,
+    "outcome_r2": r2, "outcome_95p_cov": coverage,
+    "global_runtime": global_runtime, "local_runtime": local_runtime,
+    "global_epochs": factor_model.total_epochs, "local_epochs": factor_model.local_epochs,
+}])
+metrics_df.to_csv(os.path.join(OUTPUT_DIR, "all_metrics.csv"), index=False)
+
+print(f"Saved to {OUTPUT_DIR}")
+metrics_df
+```
