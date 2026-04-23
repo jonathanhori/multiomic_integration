@@ -16,6 +16,7 @@ generate_factor_loadings <- function(data_spec, sparsity_prob = 1, K = NA) {
       matrix(nrow = data_spec$p_l,
              ncol = data_spec$K_l)
   } else { # shared
+    print(data_spec$K)
     rnorm(n = data_spec$K * data_spec$p_l) * 
       rbinom(n = data_spec$K * data_spec$p_l,
              size = 1,
@@ -69,6 +70,7 @@ generate_factor_data <- function(L,
                           function(l) list(N = N,
                                            test_N = test_n,
                                            p_l = p_l_vec[[l]],
+                                           K = K,
                                            K_l = K_l_vec[[l]],
                                            snr_x = snr_x_vec[[l]],
                                            sparsity = sparsity_vec[[l]])
@@ -127,6 +129,8 @@ generate_factor_data <- function(L,
                             noise_x
                           }
   )
+  print(dim(sim_factors.shared))
+  print(dim(sim_loadings.shared[[1]]))
   
   # Calculate data views based on factor model
   sim_data.x <- lapply(1:length(sim_data_spec), 
@@ -197,6 +201,58 @@ generate_factor_data <- function(L,
     Phi_perp = ortho_factors.view_specific
   )
   )
+}
+
+
+generate_single_view_factor_data <- function(N, p_l, K, snr_x, snr_y, sparsity) {
+  data_spec <- list(N = N, p_l = p_l, K = K, K_l = K, snr_x = snr_x, sparsity = sparsity)
+
+  sim_loadings <- generate_factor_loadings(data_spec, sparsity_prob = 1 - sparsity, K)
+  sim_factors  <- generate_factor_scores(data_spec, K)
+
+  # Per-feature noise variance to achieve desired SNR
+  view_vars <- diag(sim_loadings %*% t(sim_loadings))
+  noise_x <- matrix(
+    rnorm(N * p_l) * rep(sqrt(view_vars / snr_x), each = N),
+    nrow = N, ncol = p_l
+  )
+
+  X <- sim_factors %*% t(sim_loadings) + noise_x
+
+  beta_sim    <- rnorm(n = K)
+  outcome_var <- as.numeric(t(beta_sim) %*% beta_sim)
+  noise_y     <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+  y           <- sim_factors %*% beta_sim + noise_y
+
+  list(N = N, p_l = p_l, K = K, sparsity = sparsity,
+       snr_x = snr_x, snr_y = snr_y,
+       X_l = list(X), y = y, Z = sim_factors, Lambda_l = list(sim_loadings), beta = beta_sim)
+}
+
+
+generate_single_view_factor_data_testing <- function(N, p_l, K, snr_x, snr_y, sparsity,
+                                                     training_loadings, training_beta) {
+  data_spec <- list(N = N, p_l = p_l, K = K, K_l = K, snr_x = snr_x, sparsity = sparsity)
+
+  sim_factors   <- generate_factor_scores(data_spec, K)
+  sim_loadings  <- training_loadings[[1]]
+
+  view_vars <- diag(sim_loadings %*% t(sim_loadings))
+  noise_x <- matrix(
+    rnorm(N * p_l) * rep(sqrt(view_vars / snr_x), each = N),
+    nrow = N, ncol = p_l
+  )
+
+  X <- sim_factors %*% t(sim_loadings) + noise_x
+
+  beta_sim    <- training_beta
+  outcome_var <- as.numeric(t(beta_sim) %*% beta_sim)
+  noise_y     <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+  y           <- sim_factors %*% beta_sim + noise_y
+
+  list(N = N, p_l = p_l, K = K, sparsity = sparsity,
+       snr_x = snr_x, snr_y = snr_y,
+       X_l = list(X), y = y, Z = sim_factors, Lambda_l = list(sim_loadings), beta = beta_sim)
 }
 
 

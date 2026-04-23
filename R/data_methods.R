@@ -301,3 +301,104 @@ eval_post_coverage <- function(data,
                                upper) {
   mean(data > lower & data < upper)
 }
+
+
+eval_performance <- function(mod, run_data) {
+  # n, p, snr_x, snr_y, rep, sparsity) {
+  # X_l <- run_data$X_l
+  # y <- run_data$y
+  # log_message("Standardizing")
+  X_l.clean <- standardize_views(run_data$X_l)
+  
+  # mod <- readRDS(model_out_data_path)
+  
+  # Calculate mean and sd of each feature - for rescaling simulated structures
+  X_l_means <- lapply(run_data$X_l, function(X) {
+    means <- X |> colMeans()
+    t(replicate(nrow(X), means))
+  }
+  )
+  
+  X_l_sds_inv <- lapply(run_data$X_l, function(X) {
+    sds <- X |> colVars() |> sqrt()
+    diag(1 / sds)
+  }
+  )
+  
+  # Calculate posterior summaries for fitted model
+  jafar_posterior_summaries <- summarise_post_samples(mod)
+  
+  # Calculate structures from fitted model and simulated data
+  jafar_posterior_means <- jafar_posterior_summaries$mean
+  est_obj <- calc_all_structures(jafar_posterior_means$shared_scores,
+                                 jafar_posterior_means$view_scores,
+                                 jafar_posterior_means$shared_loadings,
+                                 jafar_posterior_means$view_loadings)
+  sim_obj <- calc_all_structures(run_data$Z,
+                                 run_data$Phi,
+                                 run_data$Lambda_l,
+                                 run_data$Gamma_l,
+                                 data_mean = X_l_means,
+                                 data_sd = X_l_sds_inv)
+  
+  # eval_table <- eval_model(est_obj,
+  #                          sim_obj,
+  #                          "covariance",
+  #                          "difference_norm") |> 
+  #   mutate(n = n,
+  #          p = p,
+  #          snr_x = snr_x,
+  #          snr_y = snr_y,
+  #          rep = rep
+  #   )
+  
+  # Eval outcome metrics
+  y.clean <- standardize_outcome(run_data$y)
+  y_pred <- predict_y(X_l.clean, mod)
+  y_lower = apply(y_pred$mean, 2, quantile, probs = c(0.025))
+  y_upper = apply(y_pred$mean, 2, quantile, probs = c(0.975))
+  
+  outcome_coverage <- eval_post_coverage(y.clean, y_lower, y_upper)
+  
+  y_pred.means <- colMeans(y_pred$mean)
+  y_mse <- mean((y_pred.means - y.clean)^2)
+  
+  # Aggregate metrics
+  eval_table <- bind_rows(
+    eval_model(est_obj,
+               sim_obj,
+               "joint_structure",
+               "rse"),
+    eval_model(est_obj,
+               sim_obj,
+               "view_structure",
+               "rse"),
+    eval_model(est_obj,
+               sim_obj,
+               "data_reconstruction",
+               "rse"),
+    tibble_row(
+      l = 0,
+      quantity = "outcome",
+      metric = "95p_coverage",
+      result = outcome_coverage
+    ),
+    tibble_row(
+      l = 0,
+      quantity = "outcome",
+      metric = "mse",
+      result = y_mse
+    )
+  ) 
+  # |> 
+  #   mutate(n = n,
+  #          p = p,
+  #          snr_x = snr_x,
+  #          snr_y = snr_y,
+  #          rep = rep,
+  #          sparsity = loading_sparsity
+  #          # time = as.numeric(difftime(tok, tik, units = "secs"))
+  #          )
+  
+  return(eval_table)
+}
