@@ -40,7 +40,7 @@ from torch.utils.data import TensorDataset
 from torchvision import transforms
 import pyro
 import pyro.distributions as dist
-from pyro.optim import Adam, ClippedAdam
+from pyro.optim import Adam, ClippedAdam, AdagradRMSProp
 from pyro.infer import SVI, Trace_ELBO, RBFSteinKernel
 
 import importlib
@@ -60,7 +60,7 @@ sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
 ```{python}
 #| label: Load data utils
-importlib.reload(sys.modules["data_utils"])
+# importlib.reload(sys.modules["data_utils"])
 
 # from data_utils import floatmatrix_to_torch, r_to_torch, load_and_process_rds_data_for_condition, normalize_tensor_by_col, extract_est_decomp, extract_sim_decomp, calc_struct, scale_est_struct, scale_sim_struct, eval_rse, eval_mse, summarise_post_samples, summarise_structure_list, eval_post_coverage, eval_credible_interval, obtain_posterior_pred_samples, calc_all_structures_with_rescaling, eval_performance
 from data_utils import r_to_torch, normalize_tensor_by_col, \
@@ -70,8 +70,8 @@ from data_utils import r_to_torch, normalize_tensor_by_col, \
 
 ```{python}
 #| label: Load model objects
-importlib.reload(sys.modules["matrix_decomp"])
-importlib.reload(sys.modules["handler"])
+# importlib.reload(sys.modules["matrix_decomp"])
+# importlib.reload(sys.modules["handler"])
 
 from matrix_decomp import MatrixDecomp
 from handler import ModelHandler
@@ -318,19 +318,14 @@ print(trace.format_shapes())
 ### MatrixDecomp
 
 
-
-
 WITH LEARNING RATE SCHEDULER
 ```{python}
 pyro.clear_param_store()
 
 MINIBATCH_SIZE = 32
 NUM_EPOCHS = 1000
+initial_lr = 0.1
 opt_args = {"lr": initial_lr, "betas": (0.9, 0.999)}
-# initial_lr = 0.005 
-# gamma = 0.1  # final learning rate will be gamma * initial_lr
-# lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
-# OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
 LOSS = Trace_ELBO(num_particles = 2)
 
 k_upper = int(k) + 10
@@ -362,7 +357,7 @@ svi = train_handler.do_inference(
     inference_type = "svi",
     tol = 0.5, # tolerance is epoch loss per datum
     variational_tol = 0.2,
-    min_epochs = 100,
+    min_epochs = 200,
     epochs = NUM_EPOCHS,
     minibatch_flag = True,
     minibatch_size = MINIBATCH_SIZE,
@@ -375,6 +370,69 @@ run_minibatch = t1 - t0
 print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
 ```
 
+
+WITH ADAGRAD
+
+```{python}
+pyro.clear_param_store()
+
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 1000
+# initial_lr = 0.1
+opt_args = {"eta": 1.0, "delta": 1e-16, "t": 0.1}
+OPT = AdagradRMSProp({
+    "eta": opt_args['eta'], 
+    "delta": opt_args['delta'], 
+    "t": opt_args['t']})
+LOSS = Trace_ELBO(num_particles = 2)
+
+k_upper = int(k) + 10
+
+# scheduler_args = {
+#     'optimizer': torch.optim.Adam, 
+#     'optim_args': opt_args,
+#     'step_size': 20,
+#     'gamma': 0.9,
+#     'verbose': True
+# }
+# scheduler = pyro.optim.StepLR(scheduler_args)
+
+factor_model = MatrixDecomp(
+    k_upper,
+    supervised = True, 
+    dense = False)
+train_handler = ModelHandler(
+    "train", 
+    factor_model, 
+    opt = OPT, 
+    loss = LOSS,
+    opt_scheduler = None,
+    orthogonal_projection = False)
+
+t0 = time.time()
+svi = train_handler.do_inference(
+    train_dataset = train_subset,
+    inference_type = "svi",
+    tol = 0.5, # tolerance is epoch loss per datum
+    variational_tol = 0.2,
+    min_epochs = 200,
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
+    verbose = True
+    )
+
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
+
+
+```
+
+```{python}
+pyro.param('loc_beta')
+```
 ### With initial values for Lambda and Z locations set by PCA
 
 ```{python}
@@ -518,165 +576,8 @@ run_minibatch = t1 - t0
 print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
 ```
 
-#### Run model with HMC
 
-```{python}
-pyro.clear_param_store()
-k_upper = int(k) + 10
-
-factor_model = MatrixDecomp(k_upper)
-factor_model.n = X_clean.shape[0]
-```
-
-```{python}
-from pyro.infer import MCMC, NUTS, Predictive
-```
-```{python}
-nuts_kernel = NUTS(factor_model)
-mcmc = MCMC(nuts_kernel, num_samples=500)
-```
-
-```{python}
-%%time
-
-mcmc.run([X_clean], torch.arange(X_clean.shape[0]))
-```
-
-```{python}
-samples = mcmc.get_samples()
-for k, v in samples.items():
-    print(f"{k}: {tuple(v.shape)}")
-
-predictive = Predictive(model, samples)(X_, None)
-for k, v in predictive.items():
-    print(f"{k}: {tuple(v.shape)}")
-```
-
-## Using SVGD
-
-```{python}
-# factor_model = SupMultiviewDecomp(
-#     int(k),
-#     k_l_list.int().tolist(),
-#     n,
-#     include_view_factors = True,
-#     dense = False
-# )
-
-pyro.clear_param_store()
-
-
-# MINIBATCH_SIZE = 32
-# NUM_EPOCHS = 1000
-# initial_lr = 0.005 
-
-# gamma = 0.1  # final learning rate will be gamma * initial_lr
-# lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
-
-# OPT = Adam({"lr": initial_lr})
-# # OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-# kernel = RBFSteinKernel()
-
-# t0 = time.time()
-# svi, opt = do_inference(
-#     X_l_list_clean,
-#     y_clean,
-#     factor_model,
-#     kernel,
-#     opt = OPT,
-#     # elbo = LOSS,
-#     inference = "svgd",
-#     tol = 0.5, # tolerance is epoch loss per datum
-#     variational_tol = 0.3,
-#     min_epochs = 10,
-#     epochs = NUM_EPOCHS,
-#     minibatch_flag = True,
-#     minibatch_size = MINIBATCH_SIZE,
-#     verbose = True
-#     )
-
-
-MINIBATCH_SIZE = 32
-NUM_EPOCHS = 1000
-initial_lr = 0.005 
-gamma = 0.1  # final learning rate will be gamma * initial_lr
-lrd = gamma ** (1 / (NUM_EPOCHS * MINIBATCH_SIZE))
-OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd, "betas": (0.95, 0.999)})
-LOSS = Trace_ELBO(num_particles = 2)
-
-k_upper = int(k) + 10
-
-OPT = Adam({"lr": initial_lr})
-kernel = RBFSteinKernel()
-
-factor_model = MatrixDecomp(k_upper, dense = True)
-train_handler = ModelHandler("train", factor_model, guide = kernel, opt = OPT)
-
-t0 = time.time()
-svi = train_handler.do_inference(
-    train_dataset = train_subset,
-    inference_type = "svgd",
-    tol = 0.5, # tolerance is epoch loss per datum
-    variational_tol = 0.2,
-    min_epochs = 30,
-    epochs = NUM_EPOCHS,
-    minibatch_flag = True,
-    minibatch_size = MINIBATCH_SIZE,
-    variational_diff_func = np.mean,
-    verbose = True
-    )
-
-t1 = time.time()
-run_minibatch = t1 - t0
-print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
-```
-
-### Ignore_________
-```{python}
-# OLD VERSION
-
-factor_model = MatrixDecomp(k)
-
-def subsample_create_plates(X, batch_idx):
-    # m = len(batch_idx)
-    return pyro.plate("obs", factor_model.n, subsample = batch_idx)
-# guide = factor_model.guide
-
-guide = pyro.infer.autoguide.AutoNormal(
-    factor_model, 
-    create_plates = subsample_create_plates)
-
-
-pyro.clear_param_store()
-
-MINIBATCH_SIZE = 32
-
-t0 = time.time()
-svi, opt = do_inference(
-    X_clean, #X,
-    factor_model,
-    guide,
-    opt = "Adam",
-    tol = 1, # tolerance is epoch loss per datum
-    epochs = 1000,
-    minibatch_flag = True,
-    minibatch_size = MINIBATCH_SIZE,
-    opt_args = {"lr":0.001}, #, "weight_decay": 5}
-    verbose = True
-    )
-# opt_minibatch = train_decomp(X, #sim_data_torch["X_l"][0], #X, 
-#                    k, 
-#                    epochs = 500,
-#                    minibatch_flag = True,
-#                    minibatch_size = 500,
-#                    opt_args = {"lr": 0.001})
-t1 = time.time()
-run_minibatch = t1 - t0
-print(f"Minibatch runtime: {run_minibatch / 60} mins")
-```
-
-
-### Plot loss
+# Plot loss
 ```{python}
 p = sns.relplot(
     data = factor_model.loss_history,
@@ -716,97 +617,8 @@ Pass full dataset as Tensor into model training. Tolerance is at scale of differ
 import time
 ```
 
-## Run model: batch updates
-
-### SupMultiviewDecomp
-
-```{python}
-pyro.clear_param_store()
-
-factor_model = FactorModelARD(k, n)
-# guide = factor_model.guide
-guide = pyro.infer.autoguide.AutoNormal(
-    factor_model)
 
 
-t0 = time.time()
-svi, opt = do_inference(
-    X_clean, #X,
-    factor_model,
-    guide,
-    minibatch_flag = False,
-    tol = 1)
-
-# factor_model.do_inference(
-#     X,
-#     minibatch_flag = False,
-#     tol = 1)
-t1 = time.time()
-run = t1 - t0
-print(f"Runtime: {run / 60} mins")
-```
-
-### FactorModelARD
-
-tol = 1 works fine for unscaled data
-tol = 0.5 good for rescaled data
-
-```{python}
-pyro.clear_param_store()
-
-factor_model = FactorModelARD(k, n)
-guide = factor_model.guide
-# guide = pyro.infer.autoguide.AutoNormal(
-#     factor_model)
-
-
-t0 = time.time()
-svi, opt = do_inference(
-    X_clean, #X,
-    factor_model,
-    guide,
-    minibatch_flag = False,
-    tol = 1)
-
-# factor_model.do_inference(
-#     X,
-#     minibatch_flag = False,
-#     tol = 1)
-t1 = time.time()
-run = t1 - t0
-print(f"Runtime: {run / 60} mins")
-```
-
-```{python}
-print(f"Runtime: {run / 60} mins")
-```
-
-```{python}
-# pyro.clear_param_store()
-# t0 = time.time()
-# opt = train_decomp(X,
-#                    k, 
-#                    minibatch_flag = False,
-#                    tol = 1)
-# t1 = time.time()
-# run = t1 - t0
-```
-
-### Plot loss
-```{python}
-p = sns.relplot(
-    data = factor_model.loss_history,
-    kind = "line"
-)
-p.set_axis_labels("100 Iterations", "Negative ELBO")
-p.fig.suptitle("Minibatch loss per epoch")
-# factor_model.loss_history
-```
-
-
-```{python}
-len(factor_model.loss_history)
-```
 ## Save model and optimzer state
 
 ```{python}
@@ -928,20 +740,21 @@ from data_utils import (extract_sim_decomp_single_view,
 
 ```
 
-
+Evaluation before local training for test set
 ```{python}
 # Posterior samples — mirrors the SupMultiviewDecomp predict calls
 N_SAMPLES = 500
 
 post_samples = train_handler.predict(
-    [X_clean], 
+    [train_X_clean], 
     N_SAMPLES,
     return_sites=['structure', Sites.Lambda_l.format(l=0), Sites.y]
 )
-# post_samples_y = test_handler.predict(
-#     [X_test_clean], N_SAMPLES,
-#     return_sites=[Sites.y_pred]
-# )
+post_samples_y = train_handler.predict(
+    [test_X_clean], 
+    N_SAMPLES,
+    return_sites=[Sites.y] #[Sites.y_pred]
+)
 
 ```
 
@@ -954,13 +767,314 @@ SIM_decomp = extract_sim_decomp_single_view(sim_data_torch)
 # Compute all structures and rescale — mirrors calc_all_structures_with_rescaling
 eval_structures = calc_all_structures_with_rescaling_single_view(
     col_filter,
-    X_summaries['means'],
-    X_summaries['sds'],
+    train_X_summaries['means'],
+    train_X_summaries['sds'],
     post_samples,
-    post_samples, #post_samples_y,
+    post_samples, #
+    # post_samples_y,
     SIM_decomp,
-    torch.arange(X_clean.shape[0]),
-    y_clean.squeeze()
+    train_idx,
+    # torch.arange(train_X_clean.shape[0]),
+    train_y_clean.squeeze()
+)
+
+```
+
+
+```{python}
+# eval_structures['sim_struct']
+eval_structures['structure_summary']['mean']
+```
+
+
+```{python}
+eval_mse(train_y_clean.squeeze(), eval_structures['pred_outcome_summary']['mean']) #post_samples['y'].mean(dim = 0))
+```
+
+```{python}
+torch.mean(torch.abs(train_y_clean.squeeze() - post_samples['y'].mean(dim = 0)) ** 2)
+```
+```{python}
+# Evaluate — mirrors eval_performance
+eval_metric_table = eval_performance_single_view(**eval_structures)
+eval_metric_table
+
+```
+
+Plot outcomes
+
+```{python}
+train_y_pred = post_samples['y'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = train_y_pred.detach().tolist(), 
+                    y = train_y_clean.squeeze().tolist())
+p.set(xlabel = "Predicted y", ylabel = "Simulated y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = train_y_pred.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+            y = train_y_clean.squeeze().tolist(), scatter = False, ax = p)
+```
+
+```{python}
+post_samples_y
+```
+
+```{python}
+test_y_pred = post_samples_y['y'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = test_y_pred.detach().tolist(), 
+                    y = test_y_clean.squeeze().tolist())
+p.set(xlabel = "Predicted y", ylabel = "Simulated y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = test_y_pred.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+            y = test_y_clean.squeeze().tolist(), scatter = False, ax = p)
+```
+
+# Plot loadings
+
+Loadings plot
+
+```{python}
+est_Lambda0 = pyro.param(Params.loc_Lambda_l.format(l = 0)).detach().numpy()
+est_Lambda0_varimax, R = varimax(est_Lambda0)
+```
+
+
+```{python}
+R.shape
+```
+
+```{python}
+R @ pyro.param('loc_beta').detach().numpy()
+```
+
+```{python}
+sns.heatmap(
+    est_Lambda0,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+```
+
+
+```{python}
+sns.heatmap(
+    est_Lambda0_varimax,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+
+```
+
+
+```{python}
+Z_rotated = pyro.param("loc_Z").detach().numpy() @ R
+beta_rotated = R.T @ pyro.param("loc_beta").detach().numpy()
+y_est_rotated = Z_rotated @ beta_rotated
+```
+
+```{python}
+indx = [1, 2, 5, 7, 8]
+y_est_rotated_selected = Z_rotated[:, indx] @ beta_rotated[indx]
+```
+
+```{python}
+beta_rotated
+beta_rotated[indx]
+```
+
+```{python}
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = y_est.detach().tolist(), 
+                    y = y_est_rotated.tolist())
+p.set(xlabel = "Predicted y", ylabel = "Y calcualted after rotation")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = y_est.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+            y = y_est_rotated.tolist(), scatter = False, ax = p)
+```
+
+```{python}
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = y_est.detach().tolist(), 
+                    y = y_est_rotated_selected.tolist())
+p.set(xlabel = "Predicted y", ylabel = "Y calcualted after rotation")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = y_est.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+            y = y_est_rotated_selected.tolist(), scatter = False, ax = p)
+```
+
+
+Structure
+
+```{python}
+post_samples['structure'].mean(dim = 0)
+```
+
+```{python}
+train_X_clean
+```
+
+```{python}
+SIM_decomp['SIM_Lambda']#[col_filter].shape
+```
+
+```{python}
+col_filter
+```
+
+```{python}
+eval_structures['sim_struct']
+```
+
+
+```{python}
+eval_rse(post_samples['structure'].mean(dim = 0), train_X_clean)
+```
+
+```{python}
+eval_rse(post_samples['structure'].mean(dim = 0), eval_structures['sim_struct'])
+```
+
+
+# Local training
+
+For test set evaluation
+
+WITH ADAGRAD
+
+```{python}
+# pyro.clear_param_store()
+
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 1000
+# initial_lr = 0.1
+opt_args = {"eta": 1.0, "delta": 1e-16, "t": 0.1}
+OPT = AdagradRMSProp({
+    "eta": opt_args['eta'], 
+    "delta": opt_args['delta'], 
+    "t": opt_args['t']})
+LOSS = Trace_ELBO(num_particles = 2)
+
+k_upper = int(k) + 10
+
+test_handler = ModelHandler(
+    "predict", 
+    factor_model, 
+    opt = OPT, 
+    loss = LOSS,
+    opt_scheduler = None,
+    orthogonal_projection = False)
+
+t0 = time.time()
+svi = test_handler.do_inference(
+    train_dataset = test_subset,
+    inference_type = "svi",
+    tol = 0.5, # tolerance is epoch loss per datum
+    variational_tol = 0.2,
+    min_epochs = 200,
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
+    verbose = True
+    )
+
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
+```
+
+With scheduler
+
+```{python}
+# pyro.clear_param_store()
+
+MINIBATCH_SIZE = 32
+NUM_EPOCHS = 1000
+initial_lr = 0.1
+opt_args = {"lr": initial_lr, "betas": (0.9, 0.999)}
+LOSS = Trace_ELBO(num_particles = 2)
+
+k_upper = int(k) + 10
+
+scheduler_args = {
+    'optimizer': torch.optim.Adam, 
+    'optim_args': opt_args,
+    'step_size': 20,
+    'gamma': 0.9,
+    'verbose': True
+}
+scheduler = pyro.optim.StepLR(scheduler_args)
+
+test_handler = ModelHandler(
+    "predict", 
+    factor_model, 
+    # OPT, 
+    loss = LOSS,
+    opt_scheduler = scheduler,
+    orthogonal_projection = False)
+
+t0 = time.time()
+svi = test_handler.do_inference(
+    train_dataset = test_subset,
+    inference_type = "svi",
+    tol = 0.5, # tolerance is epoch loss per datum
+    variational_tol = 0.2,
+    min_epochs = 200,
+    epochs = NUM_EPOCHS,
+    minibatch_flag = True,
+    minibatch_size = MINIBATCH_SIZE,
+    variational_diff_func = np.mean,
+    verbose = True
+    )
+
+t1 = time.time()
+run_minibatch = t1 - t0
+print(f"Minibatch runtime: {run_minibatch / 60} mins, , {factor_model.total_epochs} epochs")
+```
+
+# Evaluate after local training
+
+```{python}
+# Posterior samples — mirrors the SupMultiviewDecomp predict calls
+N_SAMPLES = 500
+
+post_samples = train_handler.predict(
+    [train_X_clean], 
+    N_SAMPLES,
+    return_sites=['structure', Sites.Lambda_l.format(l=0), Sites.y]
+)
+post_samples_y_test = test_handler.predict(
+    [test_X_clean], 
+    N_SAMPLES,
+    return_sites=[Sites.y_pred] #[Sites.y_pred]
+)
+
+```
+
+
+
+```{python}
+# Ground truth decomposition
+SIM_decomp = extract_sim_decomp_single_view(sim_data_torch)
+
+# Compute all structures and rescale — mirrors calc_all_structures_with_rescaling
+eval_structures = calc_all_structures_with_rescaling_single_view(
+    col_filter,
+    train_X_summaries['means'],
+    train_X_summaries['sds'],
+    post_samples,
+    post_samples_y_test, #post_samples_y,
+    SIM_decomp,
+    train_idx,
+    # torch.arange(train_X_clean.shape[0]),
+    test_y_clean.squeeze()
+    # train_y_clean.squeeze()
 )
 
 ```
@@ -973,6 +1087,33 @@ eval_metric_table
 
 ```
 
+
+```{python}
+train_y_pred = post_samples['y'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = train_y_pred.detach().tolist(), 
+                    y = train_y_clean.squeeze().tolist())
+p.set(xlabel = "Predicted y", ylabel = "Simulated y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = train_y_pred.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+            y = train_y_clean.squeeze().tolist(), scatter = False, ax = p)
+```
+
+
+```{python}
+test_y_pred = post_samples_y_test['y_pred'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = test_y_pred.detach().tolist(), 
+                    y = test_y_clean.squeeze().tolist())
+p.set(xlabel = "Predicted y", ylabel = "Simulated y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = test_y_pred.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+            y = test_y_clean.squeeze().tolist(), scatter = False, ax = p)
+```
 
 ### FactorModel
 
@@ -1247,78 +1388,7 @@ X_pca = torch.pca_lowrank(X_clean, q = 15)
 
 
 
-Loadings plot
 
-```{python}
-est_Lambda0 = pyro.param(Params.loc_Lambda_l.format(l = 0)).detach().numpy()
-est_Lambda0_varimax, R = varimax(est_Lambda0)
-```
-
-
-```{python}
-R.shape
-```
-
-```{python}
-R @ pyro.param('loc_beta').detach().numpy()
-```
-
-```{python}
-sns.heatmap(
-    est_Lambda0,
-# sim_data_multiview_torch.get('Lambda_l')[0],
-cmap="coolwarm"
-)
-```
-
-
-```{python}
-sns.heatmap(
-    est_Lambda0_varimax,
-# sim_data_multiview_torch.get('Lambda_l')[0],
-cmap="coolwarm"
-)
-
-```
-
-
-```{python}
-Z_rotated = pyro.param("loc_Z").detach().numpy() @ R
-beta_rotated = R.T @ pyro.param("loc_beta").detach().numpy()
-y_est_rotated = Z_rotated @ beta_rotated
-```
-
-```{python}
-indx = [1, 2, 5, 7, 8]
-y_est_rotated_selected = Z_rotated[:, indx] @ beta_rotated[indx]
-```
-
-```{python}
-beta_rotated
-beta_rotated[indx]
-```
-
-```{python}
-p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
-                    x = y_est.detach().tolist(), 
-                    y = y_est_rotated.tolist())
-p.set(xlabel = "Predicted y", ylabel = "Y calcualted after rotation")
-p.set_title("Predicted vs. actual outcome")
-p.axline((0, 0), slope = 1, color = "black", ls = "--")
-sns.regplot(x = y_est.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
-            y = y_est_rotated.tolist(), scatter = False, ax = p)
-```
-
-```{python}
-p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
-                    x = y_est.detach().tolist(), 
-                    y = y_est_rotated_selected.tolist())
-p.set(xlabel = "Predicted y", ylabel = "Y calcualted after rotation")
-p.set_title("Predicted vs. actual outcome")
-p.axline((0, 0), slope = 1, color = "black", ls = "--")
-sns.regplot(x = y_est.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
-            y = y_est_rotated_selected.tolist(), scatter = False, ax = p)
-```
 
 
 ```{python}
@@ -2286,7 +2356,7 @@ for n, p, snr_x, snr_y, sparsity in sim_grid:
 ```
 
 
-# *Evaluate replicates
+# Evaluate replicates
 
 ```{python}
 metric_out_path = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs/Projects/multiomic_integration/sim/results/integration/metrics")
@@ -2344,3 +2414,735 @@ full_metric_table['structure'].unique()
 
 
 
+DEBUG
+
+```{python}
+importlib.reload(sys.modules["run_methods"])
+```
+
+```{python}
+"""
+Hyperparameter tuning script for MatrixDecomp (single-view supervised factor model).
+
+Data layout expected:
+    sim/data/single_view_withoutcome/k.<k>/<filename>.rds
+
+Each RDS file contains a single replicate with keys:
+    X_l (list of 1 matrix), y, Z, Lambda_l, K, p_l
+
+Outputs per (data_config, train_config):
+    sim/results/matrixdecomp/metrics/<filename_base>.csv
+"""
+
+import os
+import sys
+import itertools
+
+import pandas as pd
+from pathlib import Path
+
+import pyro
+
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+
+from run_methods import (
+    load_rds,
+    process_data_single_view,
+    train_model_single_view,
+    train_model_locally_single_view,
+    evaluate_fitted_model_single_view,
+)
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+DATA_ROOT   = os.path.expanduser("~/multiomic_integration/sim/data/single_view_withoutcome")
+METRIC_ROOT = os.path.expanduser("~/multiomic_integration/sim/results/matrixdecomp/metrics")
+Path(METRIC_ROOT).mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Data grid
+# ---------------------------------------------------------------------------
+DATA_FILES = [
+    ("k.5", "factor_data_n500p100_snr2.2_sparse0.25")#,
+    # ("k.5", "factor_data_n500p500_snr2.2_sparse0.25"),
+]
+
+# ---------------------------------------------------------------------------
+# Model config grid
+# ---------------------------------------------------------------------------
+dense_array   = [True, False]
+k_delta_array = [0, 5, 10]
+
+# ---------------------------------------------------------------------------
+# Training / optimizer grid
+# ---------------------------------------------------------------------------
+lr_array        = [0.05, 0.01, 0.005]
+betas_array     = [(0.9, 0.999), (0.95, 0.999)]
+lr_step_array   = [10, 20]
+lr_decay_array  = [0.9, 0.5]
+particle_array  = [1, 2]
+minibatch_array = [16, 32]
+min_epoch_array = [100, 200]
+max_epoch_array = [500]
+
+train_grid_names = (
+    "initial_lr", "betas", "lr_step_size", "lr_decay_factor",
+    "num_particles", "minibatch_size", "min_epochs", "max_epochs",
+)
+
+# ---------------------------------------------------------------------------
+# Other settings
+# ---------------------------------------------------------------------------
+TRAINING_SIZE       = 0.8
+RANDOM_SEED         = 123
+N_POSTERIOR_SAMPLES = 300
+
+```
+
+
+```{python}
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+
+train_grid = list(itertools.product(
+    lr_array, betas_array, lr_step_array, lr_decay_array,
+    particle_array, minibatch_array, min_epoch_array, max_epoch_array,
+))
+
+all_metrics = pd.DataFrame()
+```
+
+
+```{python}
+for k_subdir, filename_stem in DATA_FILES:
+    rds_path = os.path.join(DATA_ROOT, k_subdir, filename_stem + ".rds")
+    print(f"\n=== Loading: {rds_path} ===")
+
+    sim_data = load_rds(rds_path)
+    train_subset, test_subset, data_package = process_data_single_view(
+        sim_data, TRAINING_SIZE, RANDOM_SEED
+    )
+    k_true = data_package["k"]
+    break
+```
+
+
+```{python}
+# for dense, k_delta in itertools.product(dense_array, k_delta_array):
+dense = dense_array[0]
+k_delta = k_delta_array[0]
+k_fit      = k_true + k_delta
+model_config = {"k": k_fit, "dense": dense}
+model_tag  = f"dense{dense}_kdelta{k_delta}"
+
+train_params = train_grid[0]
+```
+
+
+```{python}
+# for train_params in train_grid:
+train_config = dict(zip(train_grid_names, train_params))
+train_tag    = ".".join(f"{k}{v}" for k, v in train_config.items())
+
+out_stem = os.path.join(
+    METRIC_ROOT, f"{filename_stem}_{model_tag}_{train_tag}"
+)
+if os.path.isfile(out_stem + ".csv"):
+    print(f"  Already done, skipping: {model_tag} | {train_tag}")
+
+print(f"  {model_tag} | lr={train_config['initial_lr']} "
+        f"bs={train_config['minibatch_size']} "
+        f"step={train_config['lr_step_size']} "
+        f"decay={train_config['lr_decay_factor']}")
+```
+
+
+```{python}
+pyro.clear_param_store()
+
+# try:
+factor_model, train_handler, global_runtime = train_model_single_view(
+    model_config, train_config, train_subset
+)
+```
+
+
+```{python}
+test_handler, local_runtime = train_model_locally_single_view(
+    factor_model, train_config, test_subset
+)
+```
+
+
+```{python}
+metrics = evaluate_fitted_model_single_view(
+    train_handler, test_handler, data_package, N_POSTERIOR_SAMPLES
+)
+```
+
+```{python}
+metrics
+```
+
+
+```{python}
+metrics = metrics.assign(
+    data_file      = filename_stem,
+    k_subdir       = k_subdir,
+    k_true         = k_true,
+    k_fit          = k_fit,
+    k_delta        = k_delta,
+    dense          = dense,
+    global_epochs  = factor_model.total_epochs,
+    local_epochs   = factor_model.local_epochs,
+    global_runtime = global_runtime,
+    local_runtime  = local_runtime#,
+    # **train_config,
+)
+```
+
+```{python}
+train_config['betas'] = str(train_config['betas'])
+metrics.assign(**train_config)
+```
+
+```{python}
+metrics.to_csv(out_stem + ".csv", index=False)
+all_metrics = pd.concat([all_metrics, metrics], ignore_index=True)
+
+# except Exception as e:
+#     print(f"    FAILED: {e}")
+#     continue
+
+```
+
+```{python}
+
+```
+
+```{python}
+concat_path = os.path.join(METRIC_ROOT, "all_metrics_concat.csv")
+all_metrics.to_csv(concat_path, index=False)
+print(f"\nDone. Combined metrics written to {concat_path}")
+
+```
+
+
+```{python}
+
+```
+
+
+
+
+
+# _______________________
+# Real data analysis
+
+```{python}
+# import pandas as pd
+```
+
+```{python}
+cancer_type = "coad"
+```
+```{python}
+raw_data = pd.read_csv(f'../data/tcga/tmb_f1cdx_{cancer_type}.csv')
+```
+
+```{python}
+raw_data = pd.read_csv('../data/tcga/tmb_f1cdx_kirc.csv')
+```
+
+```{python}
+# tmb = raw_data['TMB_NONSYNONYMOUS']
+```
+
+```{python}
+# dropped_cols = raw_data.columns[0:2]
+# genes = coad.drop(dropped_cols, axis = 1)
+```
+
+```{python}
+# genes
+```
+
+
+```{python}
+data_train = pd.read_csv('../data/tcga/processed/kirc/train.csv')
+data_test = pd.read_csv('../data/tcga/processed/kirc/test.csv')
+```
+
+```{python}
+train_idx = (pd.read_csv(f'../data/tcga/processed/{cancer_type}/train_idx.csv').values.squeeze() - 1).tolist()
+```
+
+```{python}
+data_train = raw_data.iloc[train_idx]
+data_test = raw_data.drop(train_idx)
+```
+
+```{python}
+tmb_train = data_train['TMB_NONSYNONYMOUS'] #['y'] #['TMB_NONSYNONYMOUS']
+tmb_test = data_test['TMB_NONSYNONYMOUS'] #['y'] #['TMB_NONSYNONYMOUS']
+
+dropped_cols = ['sampleId', 'TMB_NONSYNONYMOUS'] #
+# dropped_cols = data_train.columns[0:3]
+genes_train = data_train.drop(dropped_cols, axis = 1)
+genes_test = data_test.drop(dropped_cols, axis = 1)
+```
+
+```{python}
+genes_train
+```
+
+```{python}
+tmb_train = torch.log(1 + torch.tensor(tmb_train.values))
+tmb_test = torch.log(1 + torch.tensor(tmb_test.values))
+```
+
+
+```{python}
+# import sys
+# sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+# importlib.reload(sys.modules["run_methods"])
+from run_methods import (
+    load_rds,
+    process_data_single_view,
+    train_model_single_view,
+    train_model_locally_single_view,
+    evaluate_fitted_model_single_view,
+) 
+```
+
+```{python}
+# importlib.reload(sys.modules["data_utils"])
+from data_utils import eval_performance_single_view
+```
+
+
+Filter out outliers in TMB before modeling or splitting
+
+```{python}
+max_tmb = 200
+sample_filter = tmb_train.values < 200
+```
+
+```{python}
+# run_data_train = {'X_l': [torch.tensor(genes_train.values)[sample_filter, :]], 
+#             'y': torch.log(1 + torch.tensor(tmb_train.values))[sample_filter], 
+#             'K': torch.tensor(0.),
+#             'Lambda_l': [None],
+#             'Z': None}
+```
+
+```{python}
+run_data_train = {'X_l': [torch.tensor(genes_train.values)], 
+            'y': torch.tensor(tmb_train), 
+            'K': torch.tensor(0.),
+            'Lambda_l': [None],
+            'Z': None}
+
+run_data_test = {'X_l': [torch.tensor(genes_test.values)], 
+            'y': torch.tensor(tmb_test), 
+            'K': torch.tensor(0.),
+            'Lambda_l': [None],
+            'Z': None}
+
+train_samples, test_samples, tmb_data_package = process_data_single_view(
+                            run_data_train,
+                            training_size=0.8,
+                            seed=123,
+                            training_split=False,
+                            sim_data_test=run_data_test,
+                        )
+```
+
+
+```{python}
+tmb_data_package
+```
+
+
+```{python run-model}
+model_config = {"k": 30, "dense": True}
+# For scheduler
+# train_config = {"initial_lr": 0.1,
+#                 "betas": (0.9, 0.999), 
+#                 "lr_step_size": 10, 
+#                 "lr_decay_factor": 0.9,
+#                 "num_particles": 2, 
+#                 "minibatch_size": 16, 
+#                 "min_epochs": 200, 
+#                 "max_epochs": 500
+#                 }
+
+# For Adagrad
+train_config = {
+    "eta": .5, "delta": 1e-16, "t": 0.1,
+    "num_particles": 2,
+    "minibatch_size": 32,
+    "min_epochs": 200,
+    "max_epochs": 1000,
+}
+
+pyro.clear_param_store()
+factor_model, train_handler, global_runtime = train_model_single_view(
+    model_config, train_config, train_samples, verbose = True
+    )
+```
+
+
+
+
+## Evaluate
+```{python}
+p = sns.relplot(
+    data = factor_model.loss_history[1:],
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Negative ELBO")
+p.fig.suptitle("Minibatch loss per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+p = sns.relplot(
+    data = factor_model.var_param_convergence_history[1:],
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Norm difference")
+p.fig.suptitle("Variational parameter convergence per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+test_handler, local_runtime = train_model_locally_single_view(
+    factor_model, train_config, test_samples, verbose = True
+)
+```
+
+
+```{python}
+post_train = train_handler.predict(
+        [tmb_data_package["X_train"]], 200,
+        return_sites=["structure", Sites.Lambda_l.format(l=0), "y"],
+)
+post_test = test_handler.predict(
+    [tmb_data_package["X_test"]], 200,
+    return_sites=["y_pred"],
+)
+```
+
+
+```{python}
+Lambda_post_mean = post_train['Lambda_l0'].mean(dim=0).squeeze()
+est_cov = calc_cov(Lambda_post_mean)
+
+data_cov_norm = scale_sim_cov(tmb_data_package["X_train"].T @ tmb_data_package["X_train"] / tmb_data_package["X_train"].shape[0], tmb_data_package["X_sd"], tmb_data_package["X_sd"])
+
+pred_outcome_summary = summarise_post_samples(post_test['y_pred'])
+```
+
+```{python}
+# {
+#     'sim_struct': tmb_data_package["X_train"],
+#     'structure_summary': summarise_post_samples(post_train['structure']),
+#     'est_cov': est_cov,
+#     'sim_cov_norm': data_cov_norm,
+#     'sim_outcome': tmb_data_package["y_test"],
+#     'pred_outcome_summary': pred_outcome_summary,
+#     }
+```
+
+
+```{python}
+train_config['betas'] = str(train_config['betas'])
+```
+```{python}
+single_view_metrics = eval_performance_single_view(
+    **{
+    'sim_struct': tmb_data_package["X_train"],
+    'structure_summary': summarise_post_samples(post_train['structure']),
+    'est_cov': est_cov,
+    'sim_cov_norm': data_cov_norm,
+    'sim_outcome': tmb_data_package["y_test"],
+    'pred_outcome_summary': pred_outcome_summary,
+    }
+    # sim_struct,
+    # structure_summary,
+    # est_cov,
+    # sim_cov_norm,
+    # sim_outcome,
+    # pred_outcome_summary
+)
+single_view_metrics.assign(**train_config)
+```
+
+
+```{python}
+single_view_metrics
+```
+
+```{python}
+from datetime import datetime
+```
+```{python}
+dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+single_view_metrics.\
+    assign(**train_config).\
+    to_csv(f"./results/matrixdecomp/tcga/metrics_{dt}.csv")
+```
+
+```{python}
+os.getcwd()
+```
+
+
+Visualize outcome predictions
+
+```{python}
+torch.nn.functional.mse_loss(post_test['y_pred'].mean(dim = 0), tmb_data_package["y_test"].detach())
+```
+
+```{python}
+y_pred = post_test['y_pred'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = y_pred.squeeze().tolist(), 
+                    y = tmb_data_package["y_test"].detach().tolist())
+p.set(xlabel = "Predicted y", ylabel = "True y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = y_pred.squeeze().tolist() ,
+            y = tmb_data_package["y_test"].detach().tolist(), scatter = False, ax = p)
+```
+
+
+```{python}
+y_pred_train = post_train['y'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = y_pred_train.squeeze().tolist(), 
+                    y = tmb_data_package["y_train"].detach().tolist())
+p.set(xlabel = "Predicted y", ylabel = "True y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = y_pred_train.squeeze().tolist(),
+            y = tmb_data_package["y_train"].detach().tolist() , scatter = False, ax = p)
+```
+
+
+Evaluate loadings
+
+```{python}
+lambda_est = summarise_post_samples(post_train['Lambda_l0'])['mean'].squeeze().detach().numpy()
+```
+
+
+```{python}
+sns.heatmap(
+    lambda_est,
+    cmap="coolwarm"
+)
+```
+
+
+```{python}
+lambda_est_rotated, R = varimax(lambda_est)
+
+sns.heatmap(
+    lambda_est_rotated,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+
+```
+
+
+
+```{python}
+metrics = evaluate_fitted_model_single_view(
+    train_handler, test_handler, tmb_data_package, n_posterior_samples = 200
+)
+```
+
+```{python}
+metrics
+```
+
+```{python}
+torch.tensor(tmb.values)
+```
+
+## Cross-validation for hyperparameter selection
+
+```{python}
+importlib.reload(sys.modules["run_methods"])
+from run_methods import make_cv_folds, train_eval_cv_fold, run_cv_grid
+```
+
+```{python}
+# ---------------------------------------------------------------------------
+# Train grid — optimizer hyperparameters to search over
+# Follows the same structure as matrixdecomp_hyperparam_run.py
+# ---------------------------------------------------------------------------
+lr_cv_array        = [0.05, 0.1] #0.1, 0.15]
+betas_cv_array     = [(0.9, 0.999)]#, (0.95, 0.999)]
+lr_step_cv_array   = [10, 20]
+lr_decay_cv_array  = [0.9, 0.5]
+particle_cv_array  = [2]
+minibatch_cv_array = [16, 32]
+min_epoch_cv_array = [200]
+max_epoch_cv_array = [500]
+
+cv_train_grid_names = (
+    "initial_lr", "betas", "lr_step_size", "lr_decay_factor",
+    "num_particles", "minibatch_size", "min_epochs", "max_epochs",
+)
+
+cv_train_grid = list(itertools.product(
+    lr_cv_array, betas_cv_array, lr_step_cv_array, lr_decay_cv_array,
+    particle_cv_array, minibatch_cv_array, min_epoch_cv_array, max_epoch_cv_array,
+))
+print(f"{len(cv_train_grid)} hyperparameter configurations")
+```
+
+```{python}
+# Fixed settings for this CV run
+cv_model_config = {"k": 30, "dense": True}
+
+N_CV_FOLDS             = 5
+CV_SEED                = 42
+N_CV_POSTERIOR_SAMPLES = 100
+```
+
+```{python}
+# make_cv_folds, train_eval_cv_fold, and run_cv_grid live in run_methods.py
+# so they can be used as multiprocessing worker targets (spawn requires the
+# worker to be importable from a module, not defined in a notebook).
+
+
+def select_best_config(cv_results, grid_names, metric="outcome_mse", lower_is_better=True):
+    """Identify best train_config from a CV results DataFrame.
+
+    Betas strings (serialised as str(tuple)) are converted back to tuples.
+
+    Returns
+    -------
+    best_config : dict compatible with train_model_single_view.
+    agg         : Series of per-config mean metric values.
+    """
+    agg      = cv_results.groupby("config_idx")[metric].mean()
+    best_idx = int(agg.idxmin() if lower_is_better else agg.idxmax())
+    best_row = cv_results[cv_results["config_idx"] == best_idx].iloc[0]
+
+    best_config = {}
+    for k in grid_names:
+        v = best_row[k]
+        if k == "betas" and isinstance(v, str):
+            v = eval(v)  # safe: we serialised it as str(tuple)
+        elif isinstance(v, (np.integer,)):
+            v = int(v)
+        elif isinstance(v, (np.floating,)):
+            v = float(v)
+        best_config[k] = v
+    return best_config, agg
+```
+
+```{python}
+# Prepare raw training data for CV.
+# The col_filter is derived from the full training set (not per-fold); applying it
+# before folding is standard practice and does not leak per-fold label information.
+X_full_raw = torch.tensor(genes.values, dtype=torch.float32)
+y_full_raw = torch.log(torch.tensor(tmb.values, dtype=torch.float32))
+
+X_cv_raw = X_full_raw[:, tmb_data_package["col_filter"]] #[tmb_data_package["train_idx"], :]
+y_cv_raw = y_full_raw#[tmb_data_package["train_idx"]]
+
+print(f"CV data: {X_cv_raw.shape[0]} observations x {X_cv_raw.shape[1]} features")
+print(f"Grid size: {len(cv_train_grid)} configs x {N_CV_FOLDS} folds = "
+      f"{len(cv_train_grid) * N_CV_FOLDS} model fits")
+```
+
+```{python}
+# Run cross-validation.
+# n_workers=1  → sequential, one fold at a time (safe everywhere, good for debugging)
+# n_workers=N_CV_FOLDS → one process per fold via torch.multiprocessing spawn
+# Tip: reduce cv_train_grid or N_CV_FOLDS for a quick trial run.
+N_CV_WORKERS = N_CV_FOLDS #1  # change to N_CV_FOLDS to run folds in parallel
+
+cv_results = run_cv_grid(
+    X_cv_raw, y_cv_raw,
+    model_config=cv_model_config,
+    train_grid=cv_train_grid,
+    train_grid_names=cv_train_grid_names,
+    n_folds=N_CV_FOLDS,
+    seed=CV_SEED,
+    n_posterior_samples=N_CV_POSTERIOR_SAMPLES,
+    n_workers=N_CV_WORKERS,
+)
+```
+
+```{python}
+cv_results
+```
+
+```{python}
+# Summarise: mean outcome MSE and coverage per config, sorted best first
+cv_summary = (
+    cv_results
+    .groupby("config_idx")[["outcome_mse", "outcome_95p_cov", "structure_rse", "epochs"]]
+    .mean()
+    .sort_values("outcome_mse")
+)
+cv_summary.head(10)
+```
+
+```{python}
+# Select and display best configuration
+best_train_config, config_mse_agg = select_best_config(
+    cv_results, cv_train_grid_names, metric="outcome_mse"
+)
+print("Best optimizer config (lowest mean CV outcome MSE):")
+for k, v in best_train_config.items():
+    print(f"  {k}: {v}")
+print(f"\nMean CV outcome MSE: {config_mse_agg.min():.4f}")
+```
+
+```{python}
+# Visualise outcome MSE for top configs
+top_n = 10
+top_config_ids = cv_summary.head(top_n).index.tolist()
+top_cv = cv_results[cv_results["config_idx"].isin(top_config_ids)].copy()
+top_cv["config_label"] = (
+    "lr="    + top_cv["initial_lr"].astype(str)
+    + " step=" + top_cv["lr_step_size"].astype(str)
+    + " dec="  + top_cv["lr_decay_factor"].astype(str)
+    + " bs="   + top_cv["minibatch_size"].astype(str)
+)
+label_order = (
+    top_cv.groupby("config_label")["outcome_mse"].mean().sort_values().index.tolist()
+)
+
+p = sns.boxplot(
+    data=top_cv,
+    x="outcome_mse",
+    y="config_label",
+    order=label_order,
+)
+p.set_title(f"CV outcome MSE — top {top_n} configs")
+p.set_xlabel("Outcome MSE (standardised y)")
+p.set_ylabel("")
+```
+
+```{python}
+# Save CV results
+from datetime import datetime
+dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+cv_results.to_csv(f"./results/matrixdecomp/tcga/cv_results_{dt}.csv", index=False)
+print("CV results saved.")
+```
