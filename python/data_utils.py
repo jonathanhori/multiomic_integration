@@ -193,6 +193,11 @@ def scale_sim_struct(struct_list, mean_list, sd_list):
     # return [struct_list[i] * sd_list[i] + mean_list[i] for i in range(len(struct_list))]
     
     
+def scale_sim_cov(sim_cov, sim_sd1, sim_sd2):
+    # For one matrix at a time
+    return torch.diag(1 / sim_sd1) @ sim_cov @ torch.diag(1 / sim_sd2)
+    
+    
 def calc_all_structures_with_rescaling(L,
                                        column_filters,
                                         X_l_mean_list,
@@ -254,9 +259,18 @@ def calc_all_structures_with_rescaling(L,
 def eval_rse(est_struct, sim_struct):
     return torch.norm(sim_struct - est_struct) ** 2 / torch.norm(sim_struct) ** 2
 
-
 def eval_mse(pred_outcome, sim_outcome):
     return torch.nn.functional.mse_loss(sim_outcome, pred_outcome)
+
+def calc_cov(loading1, loading2 = None):
+    if loading2 is None:
+        return loading1 @ loading1.T
+    else:
+        return loading1 @ loading2.T
+    
+def eval_cov(est_cov, sim_cov):
+    # Sim cov should be rescaled by corresponding standard deviations to be on the same scale
+    return torch.norm(sim_cov - est_cov) ** 2 / (est_cov.shape[0] * est_cov.shape[1])
 
 
 def summarise_post_samples(sample_tensor): 
@@ -348,6 +362,9 @@ def eval_performance(sim_joint_data_struct,
         post_pred_outcome_summaries.get('q2.5'),
         post_pred_outcome_summaries.get('q97.5')
         ).item()
+    
+    # covariance_diff = [eval_cov(est, sim).detach().item() for est, sim in \
+    #     ]
 
     eval_metric_table = pd.wide_to_long(pd.DataFrame({
         "joint.rse": joint_rse,
@@ -366,6 +383,108 @@ def eval_performance(sim_joint_data_struct,
     return eval_metric_table
 
 
+def extract_sim_decomp_single_view(sim_data_torch):
+    """Single-view analogue of extract_sim_decomp. Returns SIM_Lambda and SIM_Z."""
+    return {
+        'SIM_Lambda': sim_data_torch['Lambda_l'][0],
+        'SIM_Z': sim_data_torch['Z']
+    }
+
+
+def calc_all_structures_with_rescaling_single_view(
+    col_filter,
+    X_mean,
+    X_sd,
+    post_pred_train_samples,
+    post_pred_test_samples,
+    sim_decomp,
+    train_idx,
+    sim_outcome
+):
+    """
+    Single-view analogue of calc_all_structures_with_rescaling for MatrixDecomp.
+
+    Parameters
+    ----------
+    col_filter : BoolTensor (p,)
+        Column filter from zero_variance_col_filter applied to the raw X.
+    X_mean, X_sd : Tensor (p_filtered,)
+        Column means and sds from normalize_tensor_by_col on the training set.
+    post_pred_train_samples : dict
+        Output of train_handler.predict with return_sites=['structure', 'Lambda_l0'].
+    post_pred_test_samples : dict
+        Output of test_handler.predict with return_sites=['y_pred'].
+    sim_decomp : dict
+        Output of extract_sim_decomp_single_view.
+    train_idx : LongTensor
+        Row indices of training observations in the full simulated dataset.
+    sim_outcome : Tensor (n_test,)
+        Ground-truth y values for the test set (normalized).
+    """
+    SIM_Lambda = sim_decomp['SIM_Lambda'][col_filter]   # (p_filtered, k_true)
+    SIM_Z_train = sim_decomp['SIM_Z'][train_idx]        # (n_train, k_true)
+
+    # Simulated structure in normalized space: (Z @ Lambda.T - X_mean) / X_sd
+    SIM_struct = scale_sim_struct([SIM_Z_train @ SIM_Lambda.T], [X_mean], [X_sd])[0]
+
+    # Posterior summaries for structure (training data)
+    # train_handler.predict stores structure under the key "structure"
+    structure_summary = summarise_post_samples(post_pred_train_samples['structure'])
+
+    # Covariance in normalized space: diag(1/sd) @ (Lambda @ Lambda.T) @ diag(1/sd)
+    # Use posterior mean of Lambda (samples shape: N_samples x p_filtered x k)
+    Lambda_post_mean = post_pred_train_samples['Lambda_l0'].mean(dim=0).squeeze()
+    est_cov = calc_cov(Lambda_post_mean)
+    sim_cov_norm = scale_sim_cov(calc_cov(SIM_Lambda), X_sd, X_sd)
+
+    # Outcome summaries (test set)
+    # test_handler.predict stores outcome under the key Sites.y_pred = 'y_pred'
+    pred_outcome_summary = summarise_post_samples(post_pred_test_samples['y_pred']) #['y']) #['y_pred'])
+
+    return {
+        'sim_struct': SIM_struct,
+        'structure_summary': structure_summary,
+        'est_cov': est_cov,
+        'sim_cov_norm': sim_cov_norm,
+        'sim_outcome': sim_outcome,
+        'pred_outcome_summary': pred_outcome_summary,
+    }
+
+
+def eval_performance_single_view(
+    sim_struct,
+    structure_summary,
+    est_cov,
+    sim_cov_norm,
+    sim_outcome,
+    pred_outcome_summary
+):
+    """
+    Single-view analogue of eval_performance for MatrixDecomp.
+    Returns a one-row DataFrame with structure RSE, covariance Frobenius error,
+    outcome MSE, and 95% credible interval coverage for structure and outcome.
+    """
+    structure_rse = eval_rse(structure_summary['mean'], sim_struct).item()
+    structure_coverage = eval_post_coverage(
+        sim_struct, structure_summary['q2.5'], structure_summary['q97.5']
+    ).item()
+    cov_norm_frob = eval_cov(est_cov, sim_cov_norm).item()
+    outcome_mse = eval_mse(pred_outcome_summary['mean'], sim_outcome).item()
+    outcome_coverage = eval_post_coverage(
+        sim_outcome,
+        pred_outcome_summary['q2.5'],
+        pred_outcome_summary['q97.5']
+    ).item()
+
+    return pd.DataFrame([{
+        'structure_rse':        structure_rse,
+        'structure_95p_cov':    structure_coverage,
+        'cov_norm_frob':        cov_norm_frob,
+        'outcome_mse':          outcome_mse,
+        'outcome_95p_cov':      outcome_coverage,
+    }])
+
+
 def varimax(Phi, gamma = 1, q = 20, tol = 1e-6):
     # Source - https://stackoverflow.com/a
     # Posted by bmcmenamin
@@ -382,7 +501,7 @@ def varimax(Phi, gamma = 1, q = 20, tol = 1e-6):
         R = dot(u,vh)
         d = sum(s)
         if d/d_old < tol: break
-    return dot(Phi, R)
+    return dot(Phi, R), R
 
 
 def align_tensor_shapes(target, input = None, additional = None):
@@ -391,10 +510,17 @@ def align_tensor_shapes(target, input = None, additional = None):
     applied to loading matrices, the target might have fewer cols than the input because
         of the shrinkage process prior. so pad the target
     '''
-    if additional == None:
+    if additional is None:
         num_to_pad = input.shape[1] - target.shape[1]
-    elif input == None and additional is not None:
+    elif input is None and additional is not None:
         num_to_pad = additional
+        
+    # print(num_to_pad)
     assert num_to_pad >= 0, "input has fewer cols than target. adjust k_max"
 
     return torch.nn.functional.pad(target, (0, num_to_pad))
+
+
+def inv_gamma_moments(a, b):
+    print(f'mean: {b / (a - 1)}')
+    print(f'variance: {(b ** 2) / ((a - 1) ** 2) * (a - 2)}')
