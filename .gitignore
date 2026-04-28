@@ -10,3 +10,4 @@ sim/results/*
 **/__pycache__
 *_old*
 .DS_Store
+**/.DS_Store
