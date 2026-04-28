@@ -1396,3 +1396,219 @@ hyper_metrics |>
 hyper_metrics |> filter(setting == 61)
 ```
 
+
+# Simple model
+
+Evaluating optimier combinations
+
+```{r}
+eval_data <- read_csv("~/multiomic_integration/sim/results/matrixdecomp/metrics/all_metrics_concat.csv")
+```
+
+
+```{r matrixdecomp-load-all}
+md_metric_files <- list.files(
+  "~/multiomic_integration/sim/results/matrixdecomp/metrics",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+md_metric_files <- md_metric_files[basename(md_metric_files) != "all_metrics_concat.csv"]
+
+eval_data <- lapply(md_metric_files, read_csv, show_col_types = FALSE) |>
+  bind_rows()
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+eval_data <- eval_data |> 
+  arrange(outcome_mse) |> 
+  mutate(n = as.factor(n),
+         p = as.factor(p))
+```
+
+```{r}
+eval_data |> group_by(n, p, initial_lr, lr_step_size, lr_decay_factor, betas, minibatch_size, num_particles, min_epochs, max_epochs) |> 
+  summarise(mean_cov_norm = mean(cov_norm_frob),
+            mean_y_mse = mean(outcome_mse),
+            n()) |> 
+  arrange(mean_y_mse) |> 
+  filter(n == 100)
+```
+
+
+
+```{r matrixdecomp-hp-prep}
+eval_data <- eval_data |>
+  mutate(
+    initial_lr     = factor(initial_lr),
+    minibatch_size = factor(minibatch_size),
+    num_particles  = factor(num_particles),
+    betas          = factor(betas),
+    min_epochs     = factor(min_epochs),
+    max_epochs     = factor(max_epochs),
+    total_runtime  = global_runtime + local_runtime
+  )
+```
+
+### Structure RSE
+
+```{r md-hp-structure-rse}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = structure_rse,
+                 group = interaction(initial_lr, minibatch_size),
+                 colour = minibatch_size)) +
+      geom_boxplot() +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Structure RSE — betas = %s", b),
+           subtitle = TeX("$RSE = \\frac{\\|S - \\hat{S}\\|^{2}}{\\|S\\|^{2}}$"),
+           x = "Learning rate", y = "Structure RSE", colour = "Minibatch size")
+  )
+}
+```
+
+### Covariance Frobenius error
+
+```{r md-hp-cov-frob-minibatch}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = cov_norm_frob,
+                 group = interaction(initial_lr, minibatch_size),
+                 colour = minibatch_size)) +
+      geom_boxplot() +
+      scale_y_continuous(trans = "log10") +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Covariance Frobenius error — betas = %s", b),
+           x = "Learning rate", y = "Cov Frobenius norm", colour = "Minibatch size")
+  )
+}
+```
+
+```{r md-hp-cov-frob-particles}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = cov_norm_frob,
+                 group = interaction(initial_lr, num_particles),
+                 colour = num_particles)) +
+      geom_boxplot() +
+      scale_y_continuous(trans = "log10") +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Covariance Frobenius error — betas = %s", b),
+           x = "Learning rate", y = "Cov Frobenius norm", colour = "Num particles")
+  )
+}
+```
+
+```{r md-hp-cov-frob-minepochs}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = cov_norm_frob,
+                 group = interaction(initial_lr, min_epochs),
+                 colour = min_epochs)) +
+      geom_boxplot() +
+      scale_y_continuous(trans = "log10") +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Covariance Frobenius error — betas = %s", b),
+           x = "Learning rate", y = "Cov Frobenius norm", colour = "Min epochs")
+  )
+}
+```
+
+### Outcome MSE
+
+```{r md-hp-outcome-mse-minibatch}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = outcome_mse,
+                 group = interaction(initial_lr, minibatch_size),
+                 colour = minibatch_size)) +
+      geom_boxplot() +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Outcome MSE — betas = %s", b),
+           x = "Learning rate", y = "Outcome MSE", colour = "Minibatch size")
+  )
+}
+```
+
+```{r md-hp-outcome-mse-particles}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = outcome_mse,
+                 group = interaction(initial_lr, num_particles),
+                 colour = num_particles)) +
+      geom_boxplot() +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Outcome MSE — betas = %s", b),
+           x = "Learning rate", y = "Outcome MSE", colour = "Num particles")
+  )
+}
+```
+
+```{r md-hp-outcome-mse-minepochs}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = initial_lr, y = outcome_mse,
+                 group = interaction(initial_lr, min_epochs),
+                 colour = min_epochs)) +
+      geom_boxplot() +
+      facet_grid(n + lr_decay_factor ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("Outcome MSE — betas = %s", b),
+           x = "Learning rate", y = "Outcome MSE", colour = "Min epochs")
+  )
+}
+```
+
+### 95% Credible interval coverage
+
+```{r md-hp-coverage}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      pivot_longer(cols = c(structure_95p_cov, outcome_95p_cov),
+                   names_to = "coverage_type", values_to = "coverage") |>
+      mutate(coverage_type = recode(coverage_type,
+                                    structure_95p_cov = "Structure",
+                                    outcome_95p_cov   = "Outcome")) |>
+      ggplot(aes(x = initial_lr, y = coverage,
+                 group = interaction(initial_lr, minibatch_size),
+                 colour = minibatch_size)) +
+      geom_boxplot() +
+      geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+      facet_grid(coverage_type + n ~ p + lr_step_size, labeller = label_both) +
+      labs(title = sprintf("95%% CI coverage — betas = %s", b),
+           x = "Learning rate", y = "Coverage", colour = "Minibatch size")
+  )
+}
+```
+
+### Runtime
+
+```{r md-hp-runtime}
+for (b in levels(eval_data$betas)) {
+  print(
+    eval_data |> filter(betas == b) |>
+      ggplot(aes(x = minibatch_size, y = total_runtime,
+                 group = interaction(minibatch_size, num_particles),
+                 colour = num_particles)) +
+      geom_boxplot() +
+      facet_grid(n + min_epochs ~ p + initial_lr, labeller = label_both) +
+      scale_y_continuous(trans = "log10") +
+      guides(y = "axis_logticks") +
+      labs(title = sprintf("Runtime (global + local) — betas = %s", b),
+           x = "Minibatch size", y = "Total runtime (s)", colour = "Num particles")
+  )
+}
+```
+
