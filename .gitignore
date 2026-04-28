@@ -3,7 +3,10 @@
 .RData
 .Ruserdata
 *.rds
+*.csv
+*.xlsx
 sim/logs
 sim/results/*
 **/__pycache__
 *_old*
+.DS_Store
