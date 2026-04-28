@@ -19,7 +19,7 @@ opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
 
 PROJECT_ROOT <- "~/multiomic_integration"
 DATA_DIR     <- file.path(PROJECT_ROOT, "data/tcga")
-EXPORT_DIR   <- file.path(DATA_DIR, "processed/kirc")
+EXPORT_DIR   <- file.path(DATA_DIR, "processed")
 MD_RESULT_DIR <- file.path(PROJECT_ROOT, "sim/results/matrixdecomp/tcga")
 
 dir.create(EXPORT_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -29,7 +29,8 @@ dir.create(EXPORT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 ```{r load-data}
 TMB_F1CDX <- readRDS(file.path(DATA_DIR, "TMB_F1CDX_data.rds"))
-subtype_raw  <- TMB_F1CDX$kirc_tcga_pub
+# subtype_raw  <- TMB_F1CDX$kirc_tcga_pub
+subtype_raw  <- TMB_F1CDX$coadread_tcga_pub
 
 y_raw      <- subtype_raw$TMB_NONSYNONYMOUS
 X_raw      <- subtype_raw |> select(-sampleId, -TMB_NONSYNONYMOUS) |> as.matrix()
@@ -37,6 +38,12 @@ sample_ids <- subtype_raw$sampleId
 
 cat(sprintf("n = %d samples,  p = %d gene features\n", nrow(X_raw), ncol(X_raw)))
 ```
+
+```{r}
+subtype_raw
+# write.csv(subtype_raw, file.path(DATA_DIR, "tmb_f1cdx_coad.csv"), row.names = FALSE)
+```
+
 
 ```{r}
 TMB_F1CDX$kirc_tcga_pub |> filter(TMB_NONSYNONYMOUS > 200)
@@ -65,6 +72,9 @@ ggplot(tibble(TMB = y_raw), aes(x = TMB)) +
   labs(title = "Distribution of TMB_NONSYNONYMOUS (COAD)",
        x = "TMB (mutations / Mb)", y = "Count") +
   theme_minimal()
+```
+```{r}
+train_idx_old <- train_idx
 ```
 
 
@@ -103,6 +113,11 @@ cat(sprintf("Train: %d | Test: %d | Features after filtering: %d\n",
 ```
 
 
+```{r}
+y_train_z
+```
+
+
 ```{r tmb-distribution}
 ggplot(tibble(TMB = y_train_z), aes(x = TMB)) +
   geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
@@ -120,6 +135,8 @@ is the standardised outcome.
 ```{r export}
 train_df <- as.data.frame(X_train); train_df$y <- y_train_z
 test_df  <- as.data.frame(X_test);  test_df$y  <- y_test_z
+
+write.csv(train_idx, file.path(DATA_DIR, "/processed/coad", "train_idx.csv"), row.names = FALSE)
 
 write.csv(train_df, file.path(EXPORT_DIR, "train.csv"), row.names = FALSE)
 write.csv(test_df,  file.path(EXPORT_DIR, "test.csv"),  row.names = FALSE)
@@ -197,7 +214,7 @@ pca_fit <- prcomp(X_train, center = FALSE, scale. = FALSE)
 fviz_eig(pca_fit, ncp = 30, col.var = "steelblue",
          main = "PCA scree plot – COAD gene expression")
 
-k_pca_values <- c(5, 10, 20, 50)
+k_pca_values <- c(5, 10, 30, 50)
 p <- ncol(X_train)
 
 metrics_pca <- map_dfr(k_pca_values, function(k) {
@@ -235,7 +252,7 @@ Factor analysis is fit on the standardised training set; factor scores on new da
 are obtained via `fa_fit$weights`.
 
 ```{r fa-ols}
-k_fa_values <- c(5, 10, 20)
+k_fa_values <- c(5, 10, 30)
 
 metrics_fa <- map_dfr(k_fa_values, function(k) {
   fa_fit     <- psych::fa(X_train, nfactors = k, rotate = "varimax",
@@ -277,12 +294,17 @@ Results are saved to `sim/results/matrixdecomp/tcga/`.
 # Expects predictions written by data/tcga/tcga_matrixdecomp.qmd.
 # structure_rse / structure_95p_cov / cov_norm_frob are not yet computed in the
 # Python notebook and will be NA until added there.
-md_metrics_path_sparse <- file.path(MD_RESULT_DIR, "metrics_20260418-233259.csv")
-md_metrics_path_dense <- file.path(MD_RESULT_DIR, "metrics_20260422-111536.csv")
-md_metrics_path_cv <- file.path(MD_RESULT_DIR, "metrics_20260422-143856.csv")
+# md_metrics_path_sparse <- file.path(MD_RESULT_DIR, "metrics_20260418-233259.csv")
+# md_metrics_path_dense <- file.path(MD_RESULT_DIR, "metrics_20260422-111536.csv")
+# md_metrics_path_cv <- file.path(MD_RESULT_DIR, "metrics_20260422-143856.csv")
+md_metrics_path_dense <- file.path(MD_RESULT_DIR, "metrics_20260423-135808.csv")
+md_metrics_path_dense_cv <- file.path(MD_RESULT_DIR, "metrics_20260423-142723.csv")
+md_metrics_path_sparse_cv <- file.path(MD_RESULT_DIR, "metrics_20260423-145423.csv")
 
-path_list <- c(md_metrics_path_sparse, md_metrics_path_dense, md_metrics_path_cv)
-path_types <- c("_sparse", "_dense", "_cv")
+
+
+path_list <- c(md_metrics_path_dense, md_metrics_path_dense_cv, md_metrics_path_sparse_cv)
+path_types <- c("_dense", "_dense_cv", "_sparse_cv")
 
 matrix_decomp_results <- lapply(
   1:length(path_list),
@@ -404,4 +426,18 @@ all_metrics |>
 Lasso has no explicit factor decomposition so structure and covariance metrics are NA.
 MatrixDecomp structure metrics require additional outputs from `tcga_matrixdecomp.qmd`
 (not yet computed).
+
+
+
+# Loading Interpretations
+
+
+```{r}
+decomp_loadings <- read_csv(file.path(PROJECT_ROOT, "sim", "coad_tmb_loadings.csv"))
 ```
+
+```{r}
+decomp_loadings
+```
+
+
