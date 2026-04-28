@@ -5,6 +5,7 @@ from sklearn.model_selection import train_test_split, KFold
 import torch
 from torch.utils.data import TensorDataset
 import pyro
+from pyro.optim import AdagradRMSProp
 from pyro.infer import Trace_ELBO
 
 from constants import Sites
@@ -522,7 +523,10 @@ def process_data_single_view(sim_data, training_size, seed=123,
     return train_subset, test_subset, data_package
 
 
-def train_model_single_view(model_config, train_config, train_subset, verbose=False):
+def train_model_single_view(model_config, train_config, train_subset, 
+                            opt = "adagrad",
+                            scheduled = False,
+                            verbose=False):
     """Single-view analogue of train_model. Trains a MatrixDecomp model globally.
 
     Parameters
@@ -544,19 +548,31 @@ def train_model_single_view(model_config, train_config, train_subset, verbose=Fa
     )
 
     LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-    scheduler = pyro.optim.StepLR({
-        "optimizer": torch.optim.Adam,
-        "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-        "step_size": train_config["lr_step_size"],
-        "gamma":     train_config["lr_decay_factor"],
-    })
-
-    train_handler = ModelHandler(
-        "train", factor_model,
-        loss=LOSS,
-        opt_scheduler=scheduler,
-        orthogonal_projection=False,
+    if opt == "adagrad":
+        OPT = AdagradRMSProp({
+            "eta": train_config['eta'], 
+            "delta": train_config['delta'], 
+            "t": train_config['t']})
+        train_handler = ModelHandler(
+            "train", factor_model,
+            opt = OPT,
+            loss=LOSS,
+            opt_scheduler=None,
+            orthogonal_projection=False,
     )
+    elif scheduled:
+        scheduler = pyro.optim.StepLR({
+            "optimizer": torch.optim.Adam,
+            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
+            "step_size": train_config["lr_step_size"],
+            "gamma":     train_config["lr_decay_factor"],
+        })
+        train_handler = ModelHandler(
+            "train", factor_model,
+            loss=LOSS,
+            opt_scheduler=scheduler,
+            orthogonal_projection=False,
+        )
 
     t0 = time.time()
     train_handler.do_inference(
@@ -573,30 +589,51 @@ def train_model_single_view(model_config, train_config, train_subset, verbose=Fa
     return factor_model, train_handler, runtime
 
 
-def train_model_locally_single_view(factor_model, train_config, test_subset, verbose=False):
+def train_model_locally_single_view(factor_model, train_config, test_subset,
+                                    opt="adagrad", verbose=False):
     """Single-view analogue of train_model_locally. Infers local Z for test observations.
 
     Global variational parameters are frozen (read from factor_model.params).
     No files are written.
+
+    Parameters
+    ----------
+    opt : str
+        "adagrad" to use AdagradRMSProp (requires eta/delta/t in train_config);
+        "scheduled" to use StepLR with Adam (requires initial_lr/betas/lr_step_size/
+        lr_decay_factor in train_config).
 
     Returns
     -------
     test_handler, runtime (seconds)
     """
     LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-    scheduler = pyro.optim.StepLR({
-        "optimizer": torch.optim.Adam,
-        "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-        "step_size": train_config["lr_step_size"],
-        "gamma":     train_config["lr_decay_factor"],
-    })
-
-    test_handler = ModelHandler(
-        "predict", factor_model,
-        loss=LOSS,
-        opt_scheduler=scheduler,
-        orthogonal_projection=False,
-    )
+    if opt == "adagrad":
+        OPT = AdagradRMSProp({
+            "eta":   train_config["eta"],
+            "delta": train_config["delta"],
+            "t":     train_config["t"],
+        })
+        test_handler = ModelHandler(
+            "predict", factor_model,
+            opt=OPT,
+            loss=LOSS,
+            opt_scheduler=None,
+            orthogonal_projection=False,
+        )
+    else:
+        scheduler = pyro.optim.StepLR({
+            "optimizer": torch.optim.Adam,
+            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
+            "step_size": train_config["lr_step_size"],
+            "gamma":     train_config["lr_decay_factor"],
+        })
+        test_handler = ModelHandler(
+            "predict", factor_model,
+            loss=LOSS,
+            opt_scheduler=scheduler,
+            orthogonal_projection=False,
+        )
 
     t0 = time.time()
     test_handler.do_inference(
@@ -657,7 +694,7 @@ def make_cv_folds(n, n_folds=5, seed=123):
 
 
 def train_eval_cv_fold(X_raw, y_raw, train_idx, val_idx, model_config, train_config,
-                       n_posterior_samples=100, verbose=False):
+                       n_posterior_samples=100, opt="adagrad", verbose=False):
     """Train a MatrixDecomp on one CV fold and evaluate on the held-out fold.
 
     Designed to be called either directly (sequential) or inside an isolated
@@ -702,10 +739,10 @@ def train_eval_cv_fold(X_raw, y_raw, train_idx, val_idx, model_config, train_con
     pyro.clear_param_store()
 
     factor_model, train_handler, _ = train_model_single_view(
-        model_config, train_config, train_ds, verbose=verbose
+        model_config, train_config, train_ds, opt=opt, verbose=verbose
     )
     val_handler, _ = train_model_locally_single_view(
-        factor_model, train_config, val_ds, verbose=verbose
+        factor_model, train_config, val_ds, opt=opt, verbose=verbose
     )
 
     post_train = train_handler.predict(
@@ -751,7 +788,7 @@ def _fold_worker(args):
 
 def run_cv_grid(X_raw, y_raw, model_config, train_grid, train_grid_names,
                 n_folds=5, seed=123, n_posterior_samples=100,
-                n_workers=1, verbose=False):
+                opt="adagrad", n_workers=1, verbose=False):
     """Run k-fold CV over all configs in train_grid.
 
     Parameters
@@ -778,18 +815,21 @@ def run_cv_grid(X_raw, y_raw, model_config, train_grid, train_grid_names,
 
     for i, train_params in enumerate(train_grid):
         train_config = dict(zip(train_grid_names, train_params))
-        print(
-            f"[{i+1}/{len(train_grid)}] "
-            f"lr={train_config['initial_lr']}  "
-            f"step={train_config['lr_step_size']}  "
-            f"decay={train_config['lr_decay_factor']}  "
-            f"bs={train_config['minibatch_size']}",
-            flush=True,
-        )
+        if opt == "adagrad":
+            config_str = (f"eta={train_config.get('eta')}  "
+                          f"delta={train_config.get('delta')}  "
+                          f"t={train_config.get('t')}  "
+                          f"bs={train_config.get('minibatch_size')}")
+        else:
+            config_str = (f"lr={train_config.get('initial_lr')}  "
+                          f"step={train_config.get('lr_step_size')}  "
+                          f"decay={train_config.get('lr_decay_factor')}  "
+                          f"bs={train_config.get('minibatch_size')}")
+        print(f"[{i+1}/{len(train_grid)}] {config_str}", flush=True)
 
         fold_args = [
             (X_raw, y_raw, tr_idx, va_idx, model_config, train_config,
-             n_posterior_samples, verbose)
+             n_posterior_samples, opt, verbose)
             for tr_idx, va_idx in folds
         ]
 

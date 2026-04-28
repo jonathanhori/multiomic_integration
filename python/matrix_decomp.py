@@ -257,44 +257,46 @@ class MatrixDecomp(PyroModule):
         # Psi: Variational params a, b
         a_psi = pyro.param(Params.a_psi_l.format(l = l),
                              lambda: self.a_psi * torch.ones((self.p)),
-                             constraint = dist.constraints.positive)     
+                             constraint = dist.constraints.positive)
+        a_psi = torch.nan_to_num(a_psi, nan=self.a_psi, posinf=1e6, neginf=1e-6)
         b_psi = pyro.param(Params.b_psi_l.format(l = l),
                              lambda: self.b_psi * torch.ones((self.p)),
-                             constraint = dist.constraints.positive)  
+                             constraint = dist.constraints.positive)
+        b_psi = torch.nan_to_num(b_psi, nan=self.b_psi, posinf=1e6, neginf=1e-6)
         psi = pyro.sample(Sites.psi_l.format(l = l), dist.InverseGamma(a_psi, b_psi).to_event(1))
         # psi_sqrt = torch.sqrt(psi)
-        
+
         if self.supervised_model:
             # Outcome model coefficients
-            a_sigma_beta = pyro.param(Params.a_sigma_beta, 
+            a_sigma_beta = pyro.param(Params.a_sigma_beta,
                                 self.a_sigma_beta * torch.ones(self.k),
                                   constraint = dist.constraints.positive)
-            b_sigma_beta = pyro.param(Params.b_sigma_beta, 
+            b_sigma_beta = pyro.param(Params.b_sigma_beta,
                                     self.b_sigma_beta * torch.ones(self.k),
                                     constraint = dist.constraints.positive)
             sigma2_beta = pyro.sample(Sites.sigma2_beta,
                                     dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
-        
-            loc_beta = pyro.param(Params.loc_beta, 
+
+            loc_beta = pyro.param(Params.loc_beta,
                                   torch.zeros(self.k))
-            scale_beta = pyro.param(Params.scale_beta, 
+            scale_beta = pyro.param(Params.scale_beta,
                                     torch.tensor(self.init_scale_param).expand([self.k]),
                                     constraint = dist.constraints.positive)
             beta = pyro.sample(Sites.beta,
                             dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
-                                
-                            
+
+
             # Outcome variances
             if self.outcome == "gaussian":
-                a_sigma_y = pyro.param(Params.a_sigma_y, 
+                a_sigma_y = pyro.param(Params.a_sigma_y,
                                     torch.tensor(self.a_sigma_y),
                                     constraint = dist.constraints.positive)
-                b_sigma_y = pyro.param(Params.b_sigma_y, 
+                b_sigma_y = pyro.param(Params.b_sigma_y,
                                     torch.tensor(self.b_sigma_y),
                                     constraint = dist.constraints.positive)
                 sigma2_y = pyro.sample(Sites.sigma2_y,
                                     dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
-        
+
         # Local latent variables Z: Variational params loc, scale
         Z_loc = pyro.param(Params.loc_Z, lambda: torch.zeros(self.n, self.k))
         Z_scale = pyro.param(Params.scale_Z, lambda: torch.ones(self.n, self.k),
@@ -430,27 +432,29 @@ class MatrixDecomp(PyroModule):
         # Psi: Variational params a, b
         a_psi = pyro.param(Params.a_psi_l.format(l = l),
                              lambda: self.a_psi * torch.ones((self.p)),
-                             constraint = dist.constraints.positive)     
+                             constraint = dist.constraints.positive)
+        a_psi = torch.nan_to_num(a_psi, nan=self.a_psi, posinf=1e6, neginf=1e-6)
         b_psi = pyro.param(Params.b_psi_l.format(l = l),
                              lambda: self.b_psi * torch.ones((self.p)),
-                             constraint = dist.constraints.positive)  
+                             constraint = dist.constraints.positive)
+        b_psi = torch.nan_to_num(b_psi, nan=self.b_psi, posinf=1e6, neginf=1e-6)
         psi = pyro.sample(Sites.psi_l.format(l = l), dist.InverseGamma(a_psi, b_psi).to_event(1))
         # psi_sqrt = torch.sqrt(psi)
-        
+
         if self.supervised_model:
             # Outcome model coefficients
-            a_sigma_beta = pyro.param(Params.a_sigma_beta, 
+            a_sigma_beta = pyro.param(Params.a_sigma_beta,
                                 self.a_sigma_beta * torch.ones(self.k),
                                   constraint = dist.constraints.positive)
-            b_sigma_beta = pyro.param(Params.b_sigma_beta, 
+            b_sigma_beta = pyro.param(Params.b_sigma_beta,
                                     self.b_sigma_beta * torch.ones(self.k),
                                     constraint = dist.constraints.positive)
             sigma2_beta = pyro.sample(Sites.sigma2_beta,
                                     dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
-        
+
             loc_beta = pyro.param(Params.loc_beta,
                                   torch.zeros(self.k))
-            scale_beta = pyro.param(Params.scale_beta, 
+            scale_beta = pyro.param(Params.scale_beta,
                                     # torch.ones(self.num_outcome_factors),
                                     torch.tensor(self.init_scale_param).expand([self.k]),
                                     constraint = dist.constraints.positive)
