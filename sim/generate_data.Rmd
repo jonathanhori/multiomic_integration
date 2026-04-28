@@ -611,6 +611,83 @@ sim_grid$loading_sparsity)
 
 
 #--------------------
+# Multiple reps - single view (MatrixDecomp evaluation)
+
+```{r}
+set.seed(123)
+
+reps      <- 10
+test_n    <- 100
+
+n_array           <- c(100, 500)
+p_array           <- c(100, 500)
+K_array           <- c(5, 10)
+snr_x_array       <- c(1, 2)
+snr_y_array       <- c(1, 2)
+loading_sparsity  <- 0.25
+
+data_name_base   <- "sim_data_rep%s.rds"
+data_path_base   <- "n%sp%s_snr%s.%s_sparse%s"
+
+sim_grid_sv <- expand.grid(
+  n             = n_array,
+  p_l           = p_array,
+  K             = K_array,
+  snr_x         = snr_x_array,
+  snr_y         = snr_y_array,
+  loading_sparsity = loading_sparsity,
+  stringsAsFactors = FALSE
+)
+
+mapply(function(n, p_l, K, snr_x, snr_y, loading_sparsity) {
+  cond_dir <- sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+  k_dir    <- sprintf("k.%s", K)
+
+  out_path_train <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data", "single_view", k_dir, "train", cond_dir
+  )
+  out_path_test <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data", "single_view", k_dir, "test", cond_dir
+  )
+
+  dir.create(out_path_train, showWarnings = FALSE, recursive = TRUE)
+  dir.create(out_path_test,  showWarnings = FALSE, recursive = TRUE)
+
+  for (rep in 1:reps) {
+    train_file <- file.path(out_path_train, sprintf(data_name_base, rep))
+    test_file  <- file.path(out_path_test,  sprintf(data_name_base, rep))
+
+    if (file.exists(test_file)) next
+
+    train_data <- generate_single_view_factor_data(
+      N = n, p_l = p_l, K = K,
+      snr_x = snr_x, snr_y = snr_y,
+      sparsity = loading_sparsity
+    )
+    test_data <- generate_single_view_factor_data_testing(
+      N = test_n, p_l = p_l, K = K,
+      snr_x = snr_x, snr_y = snr_y,
+      sparsity = loading_sparsity,
+      training_loadings = train_data$Lambda,
+      training_beta     = train_data$beta
+    )
+
+    saveRDS(train_data, train_file)
+    saveRDS(test_data,  test_file)
+  }
+},
+sim_grid_sv$n,
+sim_grid_sv$p_l,
+sim_grid_sv$K,
+sim_grid_sv$snr_x,
+sim_grid_sv$snr_y,
+sim_grid_sv$loading_sparsity)
+```
+
+
+#--------------------
 # Generate simple factorized matrix
 
 X = Z %*% Lambda^T + E
