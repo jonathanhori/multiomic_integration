@@ -14,6 +14,8 @@ from data_utils import (
     extract_sim_decomp, normalize_tensor_by_col, zero_variance_col_filter,
     extract_sim_decomp_single_view, calc_all_structures_with_rescaling_single_view,
     eval_performance_single_view, calc_cov, scale_sim_cov, summarise_post_samples,
+    extract_sim_decomp_shared, calc_all_structures_with_rescaling_shared,
+    eval_performance_shared,
 )
 from handler import ModelHandler
 from model import SupMultiviewDecomp
@@ -868,3 +870,238 @@ def run_cv_grid(X_raw, y_raw, model_config, train_grid, train_grid_names,
             )
 
     return pd.DataFrame(rows)
+
+
+##############################################################################
+# SupMultiviewShared helpers
+##############################################################################
+
+def process_data_shared(sim_data, sim_data_test, training_split, training_size, seed=123):
+    """Multiview shared-structure analogue of process_data. No k_l_list or view factors."""
+    import pandas as pd
+
+    L = int(sim_data.get("L"))
+    X_l_list = sim_data.get("X_l")
+    y = sim_data.get("y")
+    k = int(sim_data.get("K"))
+    n = X_l_list[0].shape[0]
+
+    if training_split:
+        train_idx, test_idx = train_test_split(
+            torch.arange(n), train_size=training_size, random_state=seed, shuffle=True
+        )
+        train_X_l_list = [X[train_idx] for X in X_l_list]
+        test_X_l_list  = [X[test_idx]  for X in X_l_list]
+        train_y = y[train_idx]
+        test_y  = y[test_idx]
+    else:
+        X_l_list_test = sim_data_test.get("X_l")
+        y_test = sim_data_test.get("y")
+        n_test = X_l_list_test[0].shape[0]
+        train_idx = torch.arange(n)
+        test_idx  = torch.arange(n_test)
+        train_X_l_list = X_l_list
+        test_X_l_list  = X_l_list_test
+        train_y = y
+        test_y  = y_test
+
+    X_l_list_column_filters = [zero_variance_col_filter(X) for X in train_X_l_list]
+    train_X_l_list = [X[:, f] for X, f in zip(train_X_l_list, X_l_list_column_filters)]
+    test_X_l_list  = [X[:, f] for X, f in zip(test_X_l_list,  X_l_list_column_filters)]
+
+    clean_train = [normalize_tensor_by_col(X) for X in train_X_l_list]
+    X_l_mean_list        = [d["means"]      for d in clean_train]
+    X_l_sd_list          = [d["sds"]        for d in clean_train]
+    train_X_l_list_clean = [d["data_clean"] for d in clean_train]
+
+    clean_test = [normalize_tensor_by_col(X, m, s)
+                  for X, m, s in zip(test_X_l_list, X_l_mean_list, X_l_sd_list)]
+    test_X_l_list_clean = [d["data_clean"] for d in clean_test]
+
+    y_mean = torch.mean(train_y)
+    y_std  = torch.std(train_y)
+    train_y_clean = (train_y - y_mean) / y_std
+    test_y_clean  = (test_y  - y_mean) / y_std
+
+    train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]),
+                                 *train_X_l_list_clean, train_y_clean)
+    test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
+                                 *test_X_l_list_clean,  test_y_clean)
+
+    SIM_decomp = extract_sim_decomp_shared(sim_data)
+    train_SIM_decomp = {**SIM_decomp, "SIM_Z": SIM_decomp["SIM_Z"][train_idx]}
+
+    return train_subset, test_subset, {
+        "k": k, "L": L,
+        "train_X_l_list_clean": train_X_l_list_clean,
+        "test_X_l_list_clean":  test_X_l_list_clean,
+        "train_y_clean":        train_y_clean,
+        "test_y_clean":         test_y_clean,
+        "X_l_list_column_filters": X_l_list_column_filters,
+        "X_l_mean_list":        X_l_mean_list,
+        "X_l_sd_list":          X_l_sd_list,
+        "SIM_decomp":           SIM_decomp,
+        "train_SIM_decomp":     train_SIM_decomp,
+    }
+
+
+def train_model_shared(model_config, train_config, train_subset,
+                       model_out_filename, opt="adagrad", verbose=False, write=True):
+    """Train SupMultiviewShared globally.
+
+    Parameters
+    ----------
+    opt : str
+        "adagrad" uses AdagradRMSProp (requires eta/delta/t in train_config).
+        "scheduled" uses StepLR with Adam (requires initial_lr/betas/
+        lr_step_size/lr_decay_factor in train_config).
+    """
+    from multiview_shared import SupMultiviewShared
+
+    k     = model_config["k"]
+    dense = model_config["dense_model"]
+
+    factor_model = SupMultiviewShared(k, dense=dense)
+    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
+
+    if opt == "adagrad":
+        OPT = AdagradRMSProp({
+            "eta":   train_config["eta"],
+            "delta": train_config["delta"],
+            "t":     train_config["t"],
+        })
+        train_handler = ModelHandler("train", factor_model,
+                                     opt=OPT, loss=LOSS, opt_scheduler=None)
+    else:
+        scheduler = pyro.optim.StepLR({
+            "optimizer":  torch.optim.Adam,
+            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
+            "step_size":  train_config["lr_step_size"],
+            "gamma":      train_config["lr_decay_factor"],
+        })
+        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler)
+
+    try:
+        t0 = time.time()
+        train_handler.do_inference(
+            train_dataset=train_subset,
+            min_epochs=train_config["min_epochs"],
+            epochs=train_config["max_epochs"],
+            minibatch_flag=True,
+            minibatch_size=train_config["minibatch_size"],
+            variational_diff_func=np.mean,
+            verbose=verbose,
+        )
+        run_time = time.time() - t0
+
+        model_state_dict = {
+            "inference_time":            run_time,
+            "epochs":                    factor_model.total_epochs,
+            "model_state_dict":          pyro.get_param_store().get_state(),
+            "optimizer_state":           train_handler.opt.get_state(),
+            "loss_history":              factor_model.loss_history,
+            "param_convergence_history": factor_model.var_param_convergence_history,
+            "config":                    train_config,
+        }
+        if write:
+            torch.save(model_state_dict, model_out_filename + ".pth")
+            pyro.get_param_store().save(model_out_filename + "_paramstore.pth")
+    except Exception as e:
+        print(e)
+
+    return factor_model, train_handler, model_state_dict
+
+
+def train_model_locally_shared(factor_model, train_config, data_subset,
+                                opt="adagrad", verbose=False):
+    """Local inference for SupMultiviewShared: infers Z for test observations.
+
+    Global variational parameters are frozen (loaded from factor_model).
+    No files are written.
+
+    Parameters
+    ----------
+    opt : str
+        "adagrad" uses AdagradRMSProp; "scheduled" uses StepLR with Adam.
+
+    Returns
+    -------
+    factor_model, test_handler, model_state_dict
+    """
+    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
+
+    if opt == "adagrad":
+        OPT = AdagradRMSProp({
+            "eta":   train_config["eta"],
+            "delta": train_config["delta"],
+            "t":     train_config["t"],
+        })
+        test_handler = ModelHandler("predict", factor_model,
+                                    opt=OPT, loss=LOSS, opt_scheduler=None)
+    else:
+        scheduler = pyro.optim.StepLR({
+            "optimizer":  torch.optim.Adam,
+            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
+            "step_size":  train_config["lr_step_size"],
+            "gamma":      train_config["lr_decay_factor"],
+        })
+        test_handler = ModelHandler("predict", factor_model, loss=LOSS, opt_scheduler=scheduler)
+
+    t0 = time.time()
+    test_handler.do_inference(
+        train_dataset=data_subset,
+        min_epochs=train_config["min_epochs"],
+        epochs=train_config["max_epochs"],
+        minibatch_flag=True,
+        minibatch_size=train_config["minibatch_size"],
+        variational_diff_func=np.mean,
+        verbose=verbose,
+    )
+    runtime = time.time() - t0
+
+    model_state_dict = {
+        "inference_time":            runtime,
+        "epochs":                    factor_model.local_epochs,
+        "model_state_dict":          pyro.get_param_store().get_state(),
+        "optimizer_state":           test_handler.opt.get_state(),
+        "loss_history":              factor_model.local_loss_history,
+        "param_convergence_history": factor_model.local_var_param_convergence_history,
+        "config":                    train_config,
+    }
+    return factor_model, test_handler, model_state_dict
+
+
+def evaluate_fitted_model_shared(rep_config, data_package,
+                                  train_handler, test_handler,
+                                  global_train_state, local_train_state,
+                                  N_POSTERIOR_SAMPLES, metric_out_filename):
+    """Evaluate SupMultiviewShared after global training + local inference."""
+    train_X_l_list_clean     = data_package["train_X_l_list_clean"]
+    test_X_l_list_clean      = data_package["test_X_l_list_clean"]
+    test_y_clean             = data_package["test_y_clean"]
+    X_l_list_column_filters  = data_package["X_l_list_column_filters"]
+    X_l_mean_list            = data_package["X_l_mean_list"]
+    X_l_sd_list              = data_package["X_l_sd_list"]
+    train_SIM_decomp         = data_package["train_SIM_decomp"]
+    L                        = data_package["L"]
+
+    sites        = [Sites.joint_structure_l.format(l=l) for l in range(L)]
+    outcome_sites = [Sites.y_pred]
+    post_samples   = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
+    post_samples_y = test_handler.predict(test_X_l_list_clean,  N_POSTERIOR_SAMPLES, outcome_sites)
+
+    eval_structures = calc_all_structures_with_rescaling_shared(
+        L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,
+        post_samples, post_samples_y, train_SIM_decomp, test_y_clean.squeeze()
+    )
+
+    eval_metric_table = eval_performance_shared(**eval_structures)
+    eval_metric_table = eval_metric_table.assign(
+        n=rep_config["n"],       p=rep_config["p_l"],
+        snr_x=rep_config["snr_x"], snr_y=rep_config["snr_y"],
+        rep=rep_config["rep"],   sparsity=rep_config["sparsity"],
+        k_delta=rep_config["k_delta"],
+        runtime=global_train_state["inference_time"],
+        predict_runtime=local_train_state["inference_time"],
+    )
+    return eval_metric_table

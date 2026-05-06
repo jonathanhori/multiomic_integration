@@ -383,6 +383,75 @@ def eval_performance(sim_joint_data_struct,
     return eval_metric_table
 
 
+def extract_sim_decomp_shared(sim_data_dict):
+    """Shared-structure analogue of extract_sim_decomp. No view-specific factors."""
+    return {
+        "SIM_Lambda_l_list": sim_data_dict["Lambda_l"],
+        "SIM_Z": sim_data_dict["Z"],
+    }
+
+
+def calc_all_structures_with_rescaling_shared(
+    L,
+    column_filters,
+    X_l_mean_list,
+    X_l_sd_list,
+    post_pred_structure_samples,
+    post_pred_outcome_samples,
+    sim_decomp,
+    sim_outcome
+):
+    """Shared-structure analogue of calc_all_structures_with_rescaling. Joint structure only."""
+    SIM_joint_struct_l_list = list(map(calc_struct,
+        [sim_decomp["SIM_Z"]] * L, sim_decomp["SIM_Lambda_l_list"]))
+    SIM_joint_struct_l_list = [s[:, f] for s, f in zip(SIM_joint_struct_l_list, column_filters)]
+    SIM_joint_struct_l_list_rescaled = scale_sim_struct(
+        SIM_joint_struct_l_list, X_l_mean_list, X_l_sd_list)
+
+    joint_structure_summaries = summarise_structure_list(post_pred_structure_samples, L, "joint")
+    POST_joint_struct_l_list = [s["mean"] for s in joint_structure_summaries]
+
+    PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples["y_pred"])
+
+    return {
+        "sim_joint_data_struct": SIM_joint_struct_l_list_rescaled,
+        "post_pred_joint_data_struct": POST_joint_struct_l_list,
+        "post_pred_joint_summaries": joint_structure_summaries,
+        "sim_outcome": sim_outcome,
+        "post_pred_outcome": PRED_outcome_summary["mean"],
+        "post_pred_outcome_summaries": PRED_outcome_summary,
+    }
+
+
+def eval_performance_shared(
+    sim_joint_data_struct,
+    post_pred_joint_data_struct,
+    post_pred_joint_summaries,
+    sim_outcome,
+    post_pred_outcome,
+    post_pred_outcome_summaries
+):
+    """Shared-structure analogue of eval_performance. Joint structure + outcome only."""
+    joint_rse = [eval_rse(est, sim).detach().item()
+                 for est, sim in zip(post_pred_joint_data_struct, sim_joint_data_struct)]
+    joint_coverage = eval_credible_interval(
+        sim_joint_data_struct, post_pred_joint_summaries, "95")
+    outcome_mse = eval_mse(post_pred_outcome, sim_outcome).item()
+    outcome_coverage = eval_post_coverage(
+        sim_outcome,
+        post_pred_outcome_summaries["q2.5"],
+        post_pred_outcome_summaries["q97.5"]
+    ).item()
+
+    return pd.DataFrame({
+        "view": range(len(joint_rse)),
+        "joint_rse": joint_rse,
+        "joint_95p_coverage": joint_coverage,
+        "outcome_mse": outcome_mse,
+        "outcome_95p_coverage": outcome_coverage,
+    })
+
+
 def extract_sim_decomp_single_view(sim_data_torch):
     """Single-view analogue of extract_sim_decomp. Returns SIM_Lambda and SIM_Z."""
     return {

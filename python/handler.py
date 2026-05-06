@@ -146,7 +146,7 @@ class ModelHandler:
                     if self.model.model_type == "MatrixDecomp":
                         y_batch = batch.pop(-1).squeeze()
                         loss = inference.step(batch, batch_idx, y_batch)
-                    elif self.model.model_type == "SupMultiviewDecomp":
+                    elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
                         y_batch = batch.pop(-1).squeeze()
                         loss = inference.step(batch, batch_idx, y_batch)
                     # print(loss)
@@ -260,7 +260,7 @@ class ModelHandler:
                     # Do not project at last iteration
                     # Means = P @ M
                     # Vars = P @ diag(S) @ P.T
-                    if self.orthogonal_projection:
+                    if self.orthogonal_projection and hasattr(self.model, 'k_l_list'):
                         if isinstance(self.guide, pyro.infer.autoguide.guides.AutoNormal):
                             loc_Z_name = 'AutoNormal.locs.Z'
                             loc_Lambda_l_name = 'AutoNormal.locs.Lambda_l{l}'
@@ -333,10 +333,10 @@ class ModelHandler:
                 X_list,
                 torch.arange(n)
                 )
-        elif self.model.model_type == "SupMultiviewDecomp":
+        elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
             n = X_list[0].shape[0]
-            predictive = Predictive(self.forward, 
-                                    guide = self.guide, 
+            predictive = Predictive(self.forward,
+                                    guide = self.guide,
                                     num_samples = num_samples,
                                     return_sites = return_sites)
             return predictive(
