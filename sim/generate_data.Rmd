@@ -688,6 +688,89 @@ sim_grid_sv$loading_sparsity)
 
 
 #--------------------
+# Multiple reps - shared multiview (SupMultiviewShared evaluation)
+
+```{r}
+set.seed(123)
+
+reps     <- 10
+test_n   <- 100
+
+L <- 3
+K <- 5
+
+n_array                <- c(100, 500, 1000, 5000)
+p_array                <- c(50, 100, 1000, 5000)
+snr_x_array            <- c(2)
+snr_y_array            <- c(2)
+loading_sparsity_array <- c(0.25)
+
+data_name_base <- "sim_data_shared_rep%s.rds"
+data_path_base <- "n%sp%s_snr%s.%s_sparse%s"
+
+sim_grid_shared <- expand.grid(
+  n                = n_array,
+  p_l              = p_array,
+  snr_x            = snr_x_array,
+  snr_y            = snr_y_array,
+  loading_sparsity = loading_sparsity_array,
+  stringsAsFactors = FALSE
+)
+
+mapply(function(n, p_l, snr_x, snr_y, loading_sparsity) {
+  cond_dir <- sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+
+  out_path_train <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data", "multi_view_shared", "k.5", "train", cond_dir
+  )
+  out_path_test <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data", "multi_view_shared", "k.5", "test", cond_dir
+  )
+
+  dir.create(out_path_train, showWarnings = FALSE, recursive = TRUE)
+  dir.create(out_path_test,  showWarnings = FALSE, recursive = TRUE)
+
+  for (rep in 1:reps) {
+    test_file <- file.path(out_path_test, sprintf(data_name_base, rep))
+    if (file.exists(test_file)) next
+
+    train_data <- generate_factor_data_shared(
+      L            = L,
+      N            = n,
+      p_l_vec      = rep(p_l, L),
+      K            = K,
+      snr_x_vec    = rep(snr_x, L),
+      sparsity_vec = rep(loading_sparsity, L),
+      snr_y        = snr_y
+    )
+
+    test_data <- generate_factor_data_shared_testing(
+      L                 = L,
+      N                 = test_n,
+      p_l_vec           = rep(p_l, L),
+      K                 = K,
+      snr_x_vec         = rep(snr_x, L),
+      sparsity_vec      = rep(loading_sparsity, L),
+      snr_y             = snr_y,
+      training_loadings = train_data$Lambda_l,
+      training_beta     = train_data$beta
+    )
+
+    saveRDS(train_data, file.path(out_path_train, sprintf(data_name_base, rep)))
+    saveRDS(test_data,  test_file)
+  }
+},
+sim_grid_shared$n,
+sim_grid_shared$p_l,
+sim_grid_shared$snr_x,
+sim_grid_shared$snr_y,
+sim_grid_shared$loading_sparsity)
+```
+
+
+#--------------------
 # Generate simple factorized matrix
 
 X = Z %*% Lambda^T + E

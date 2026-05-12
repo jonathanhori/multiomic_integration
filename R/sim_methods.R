@@ -204,6 +204,130 @@ generate_factor_data <- function(L,
 }
 
 
+generate_factor_data_shared <- function(L,
+                                         N,
+                                         p_l_vec,
+                                         K,
+                                         snr_x_vec,
+                                         sparsity_vec,
+                                         snr_y) {
+  # X_l = Z @ Lambda_l^T + E_l,  l = 1..L
+  # y   = Z @ beta + e
+  # No view-specific factors.
+
+  sim_data_spec <- lapply(1:L,
+                          function(l) list(N = N,
+                                           p_l = p_l_vec[[l]],
+                                           K = K,
+                                           snr_x = snr_x_vec[[l]],
+                                           sparsity = sparsity_vec[[l]]))
+
+  # View-specific loading matrices, shared scores
+  sim_loadings.shared <- lapply(sim_data_spec,
+                                function(spec) {
+                                  generate_factor_loadings(spec,
+                                                           sparsity_prob = 1 - spec$sparsity,
+                                                           K)
+                                })
+
+  sim_factors.shared <- generate_factor_scores(sim_data_spec[[1]], K)
+
+  # Per-feature noise scaled to desired SNR
+  view_vars <- lapply(1:L, function(l) {
+    diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]))
+  })
+  noise_x_views <- lapply(1:L, function(l) {
+    matrix(
+      rnorm(N * sim_data_spec[[l]]$p_l) *
+        rep(sqrt(view_vars[[l]] / sim_data_spec[[l]]$snr_x), each = N),
+      nrow = N, ncol = sim_data_spec[[l]]$p_l
+    )
+  })
+
+  sim_data.x <- lapply(1:L, function(l) {
+    sim_factors.shared %*% t(sim_loadings.shared[[l]]) + noise_x_views[[l]]
+  })
+
+  beta_sim    <- rnorm(n = K)
+  outcome_var <- as.numeric(t(beta_sim) %*% beta_sim)
+  noise_y     <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+  sim_data.y  <- sim_factors.shared %*% beta_sim + noise_y
+
+  return(list(
+    L        = L,
+    N        = N,
+    p_l      = p_l_vec,
+    K        = K,
+    sparsity = sparsity_vec,
+    beta     = beta_sim,
+    snr_x    = snr_x_vec,
+    snr_y    = snr_y,
+    X_l      = sim_data.x,
+    y        = sim_data.y,
+    Lambda_l = sim_loadings.shared,
+    Z        = sim_factors.shared
+  ))
+}
+
+
+generate_factor_data_shared_testing <- function(L,
+                                                  N,
+                                                  p_l_vec,
+                                                  K,
+                                                  snr_x_vec,
+                                                  sparsity_vec,
+                                                  snr_y,
+                                                  training_loadings,
+                                                  training_beta) {
+  # Loadings and beta fixed from training; new Z scores drawn for test observations.
+
+  sim_data_spec <- lapply(1:L,
+                          function(l) list(N = N,
+                                           p_l = p_l_vec[[l]],
+                                           K = K,
+                                           snr_x = snr_x_vec[[l]],
+                                           sparsity = sparsity_vec[[l]]))
+
+  sim_loadings.shared <- training_loadings
+  sim_factors.shared  <- generate_factor_scores(sim_data_spec[[1]], K)
+
+  view_vars <- lapply(1:L, function(l) {
+    diag(sim_loadings.shared[[l]] %*% t(sim_loadings.shared[[l]]))
+  })
+  noise_x_views <- lapply(1:L, function(l) {
+    matrix(
+      rnorm(N * sim_data_spec[[l]]$p_l) *
+        rep(sqrt(view_vars[[l]] / sim_data_spec[[l]]$snr_x), each = N),
+      nrow = N, ncol = sim_data_spec[[l]]$p_l
+    )
+  })
+
+  sim_data.x <- lapply(1:L, function(l) {
+    sim_factors.shared %*% t(sim_loadings.shared[[l]]) + noise_x_views[[l]]
+  })
+
+  beta_sim    <- training_beta
+  outcome_var <- as.numeric(t(beta_sim) %*% beta_sim)
+  noise_y     <- rnorm(n = N, mean = 0, sd = sqrt(outcome_var / snr_y))
+  sim_data.y  <- sim_factors.shared %*% beta_sim + noise_y
+
+  return(list(
+    L        = L,
+    N        = N,
+    p_l      = p_l_vec,
+    K        = K,
+    sparsity = sparsity_vec,
+    beta     = beta_sim,
+    snr_x    = snr_x_vec,
+    snr_y    = snr_y,
+    X_l      = sim_data.x,
+    y        = sim_data.y,
+    Lambda_l = sim_loadings.shared,
+    Z        = sim_factors.shared
+  ))
+}
+
+
 generate_single_view_factor_data <- function(N, p_l, K, snr_x, snr_y, sparsity) {
   data_spec <- list(N = N, p_l = p_l, K = K, K_l = K, snr_x = snr_x, sparsity = sparsity)
 
