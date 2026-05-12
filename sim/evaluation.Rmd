@@ -31,6 +31,22 @@ dir.create(output_dir) #, showWarnings = FALSE)
 # getwd()
 ```
 
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("MOFA2")
+
+```
+
+
+
+```{r}
+library(MOFA2)
+```
+
+
 ```{r}
 getwd()
 ```
@@ -1610,5 +1626,216 @@ for (b in levels(eval_data$betas)) {
            x = "Minibatch size", y = "Total runtime (s)", colour = "Num particles")
   )
 }
+```
+
+
+# Shared Factor Model and MOFA
+
+## Load data
+
+```{r shared-mofa-load}
+shared_metric_files <- list.files(
+  "./results/integration_shared/metrics",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+shared_metric_files <- shared_metric_files[!grepl("_cov\\.csv$", shared_metric_files)]
+
+shared_metrics_raw <- lapply(shared_metric_files, read_csv, show_col_types = FALSE) |>
+  bind_rows()
+
+mofa_metric_files <- list.files(
+  "./results/integration_shared/metrics_mofa",
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+mofa_metric_files <- mofa_metric_files[!grepl("_cov\\.rds$", mofa_metric_files)]
+
+mofa_metrics_raw <- lapply(mofa_metric_files, readRDS) |>
+  bind_rows()
+```
+
+## Reshape to long format
+
+Pivot RSE/MSE and coverage columns to a long format with `structure`, `metric`, and `value`
+columns, matching the convention used in the Combined plots section.
+
+```{r shared-mofa-reshape}
+reshape_shared_metrics <- function(df, model_name) {
+  rse_long <- df |>
+    pivot_longer(
+      cols = c(joint_rse, test_rse, outcome_mse),
+      names_to  = "structure_metric",
+      values_to = "value"
+    ) |>
+    mutate(
+      structure = case_when(
+        structure_metric == "joint_rse"   ~ "joint",
+        structure_metric == "test_rse"    ~ "data_reconstruction",
+        structure_metric == "outcome_mse" ~ "outcome"
+      ),
+      metric = case_when(
+        structure_metric %in% c("joint_rse", "test_rse") ~ "rse",
+        structure_metric == "outcome_mse"                ~ "mse"
+      )
+    ) |>
+    select(-structure_metric)
+
+  cov_long <- df |>
+    pivot_longer(
+      cols      = any_of(c("joint_95p_coverage", "outcome_95p_coverage")),
+      names_to  = "structure_metric",
+      values_to = "value"
+    ) |>
+    mutate(
+      structure = case_when(
+        structure_metric == "joint_95p_coverage"   ~ "joint",
+        structure_metric == "outcome_95p_coverage" ~ "outcome"
+      ),
+      metric = "95p_coverage"
+    ) |>
+    select(-structure_metric)
+
+  bind_rows(rse_long, cov_long) |>
+    mutate(model = model_name)
+}
+
+shared_metrics <- reshape_shared_metrics(shared_metrics_raw, "SharedFactorModel")
+mofa_metrics   <- reshape_shared_metrics(mofa_metrics_raw,   "MOFA")
+
+shared_mofa_combined <- bind_rows(shared_metrics, mofa_metrics) |>
+  mutate(
+    n     = factor(n),
+    p     = factor(p),
+    view  = factor(view),
+    model = factor(model)
+  )
+```
+
+## Runtime
+
+```{r shared-mofa-runtime}
+shared_mofa_combined |>
+  distinct(model, n, p, snr_x, snr_y, rep, sparsity, k_delta, runtime) |>
+  ggplot(aes(x = n, y = runtime,
+             group = interaction(n, model),
+             colour = model)) +
+  geom_boxplot() +
+  facet_wrap(~p, labeller = label_both) +
+  scale_y_continuous(trans = "log10") +
+  guides(y = "axis_logticks") +
+  labs(title = "Wallclock time — SharedFactorModel vs MOFA",
+       y = "Runtime (s)")
+```
+
+## Structure RSE
+
+
+```{r shared-mofa-rse}
+for (struct in c("joint", "data_reconstruction")) {
+  print(
+    shared_mofa_combined |>
+      filter(structure == struct, metric == "rse") |>
+      ggplot(aes(x = n,
+                 y = value,
+                 group = interaction(n, model),
+                 colour = model)) +
+      geom_boxplot() +
+      facet_grid(view ~ p,
+                 scales = "free_y",
+                 labeller = label_both) +
+      labs(
+        title = paste0(struct, " RSE — SharedFactorModel vs MOFA"),
+        subtitle = TeX("$RSE = \\frac{\\|S - \\hat{S}\\|^{2}}{\\|S\\|^{2}}$"),
+        y = "RSE"
+      )
+  )
+}
+```
+
+## Outcome MSE
+
+```{r}
+shared_mofa_combined |>
+  filter(structure == "outcome", metric == "mse", model == "SharedFactorModel")
+```
+
+
+```{r shared-mofa-outcome-mse}
+shared_mofa_combined |>
+  filter(structure == "outcome", metric == "mse", view == 0) |>
+  ggplot(aes(x = n,
+             y = value,
+             group = interaction(n, model),
+             colour = model)) +
+  geom_boxplot() +
+  facet_wrap(vars(p),
+             scales = "free_y",
+             labeller = label_both) +
+  labs(
+    title = "Outcome MSE — SharedFactorModel vs MOFA",
+    y = "MSE"
+  )
+```
+
+## 95% Credible interval coverage
+
+```{r shared-mofa-coverage}
+shared_mofa_combined |>
+  filter(metric == "95p_coverage") |>
+  ggplot(aes(x = n,
+             y = value,
+             group = interaction(n, model),
+             colour = model)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+  facet_grid(structure ~ p,
+             scales = "fixed",
+             labeller = label_both) +
+  labs(
+    title = "95% CI coverage — SharedFactorModel vs MOFA",
+    y = "Coverage"
+  )
+```
+
+## Covariance Frobenius error
+
+```{r shared-mofa-cov-load}
+shared_cov_files <- list.files(
+  "./results/integration_shared/metrics",
+  pattern = "_cov\\.csv$",
+  full.names = TRUE
+)
+shared_cov_raw <- lapply(shared_cov_files, read_csv, show_col_types = FALSE) |>
+  bind_rows() |>
+  mutate(model = "SharedFactorModel")
+
+mofa_cov_files <- list.files(
+  "./results/integration_shared/metrics_mofa",
+  pattern = "_cov\\.rds$",
+  full.names = TRUE
+)
+mofa_cov_raw <- lapply(mofa_cov_files, readRDS) |>
+  bind_rows() |>
+  mutate(model = "MOFA")
+
+shared_mofa_cov <- bind_rows(shared_cov_raw, mofa_cov_raw) |>
+  mutate(n = factor(n), p = factor(p), model = factor(model))
+```
+
+```{r shared-mofa-cov-plot}
+shared_mofa_cov |>
+  ggplot(aes(x = n,
+             y = cov_frob,
+             group = interaction(n, model),
+             colour = model)) +
+  geom_boxplot() +
+  facet_grid(cov_type ~ p, labeller = label_both) +
+  scale_y_continuous(trans = "log10") +
+  guides(y = "axis_logticks") +
+  labs(
+    title = "Covariance Frobenius error — SharedFactorModel vs MOFA",
+    y = "Frobenius norm"
+  )
 ```
 
