@@ -61,9 +61,11 @@ getwd()
 # sim_data <- readRDS("./data/sim_data_n1000p50_snr2.2_ywithview.rds") 
 # sim_data <- readRDS("./data/n500p100_snr1.1/sim_data_ywithview_rep1.rds")
 # sim_data <- readRDS("./data3/n500p100_snr2.2/sim_data_ywithview_rep1.rds")
-sim_data <- readRDS("./data3/n500p100_snr2.2_sparse0.25/sim_data_ywithview_rep1.rds")
+# sim_data <- readRDS("./data3/n500p100_snr2.2_sparse0.25/sim_data_ywithview_rep1.rds")
+sim_data <- readRDS("./data_ortho/train/n500p100_snr2.2_sparse0.25/sim_data_ywithview_rep1.rds")
 
 X_l <- sim_data$X_l
+
 # readRDS("./data/sim_data_x.rds") |> 
   # lapply(function(x) x[sample_ix, ])
 y <- sim_data$y
@@ -138,6 +140,23 @@ tThin = 10
 
 **
 
+
+
+Evaluate:
+```{r}
+eval_table <- eval_performance(mcmc_supervised, sim_data) #|> 
+          # mutate(n = n,
+          #        p = p,
+          #        snr_x = snr_x,
+          #        snr_y = snr_y,
+          #        rep = rep,
+          #        sparsity = loading_sparsity,
+          #        time = as.numeric(difftime(tok, tik, units = "secs"))
+          #        )
+```
+```{r}
+eval_table
+```
 
 
 ### MatchAlign
@@ -660,7 +679,7 @@ snr_x_array <- c(2) #c(2, 1, 0.5)
 snr_y_array <- c(2) #c(2, 1, 0.5)
 # snr_x_array <- c(2, 1, 0.5)
 # snr_y_array <- c(2, 1, 0.5)
-reps = 10
+reps = 3
 loading_sparsity = 0
 
 sim_grid <- expand.grid(n = n_array,
@@ -671,12 +690,13 @@ sim_grid <- expand.grid(n = n_array,
 
 data_name_base <- "sim_data_ywithview_rep%s.rds"
 data_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
-                      "data3",
+                      "data_ortho",
+                      "train",
                       "n%sp%s_snr%s.%s_sparse%s")
 
 out_path_base <- file.path(dirname(rstudioapi::getSourceEditorContext()$path), 
                            "results",
-                           paste0("jafar/sparse", loading_sparsity))
+                           paste0("jafar/sparse_ortho", loading_sparsity))
 out_name_base <- "n%sp%s_snr%s.%s_sparse%s_rep%s.rds"
 
 
@@ -866,7 +886,7 @@ eval_performance <- function(mod, run_data) {
         return(eval_table)
 }
 
-
+# OLD VERSION DO NOT USE
 run_and_eval_model <- function(n, p, snr_x, snr_y, rep, sparsity,
                                in_path_base,
                                in_name_base,
@@ -978,7 +998,7 @@ run_and_eval_model <- function(n, p, snr_x, snr_y, rep, sparsity,
     #          rep = rep,
     #          time = as.numeric(difftime(tok, tik, units = "secs")))
     
-    eval_table <- eval_performance() |> 
+    eval_table <- eval_performance(mcmc_supervised, run_data) |> 
           mutate(n = n,
                  p = p,
                  snr_x = snr_x,
@@ -2008,16 +2028,230 @@ tibble(pred = y_pred.means,
        outcome = y.clean,
        lower = y_lower,
        upper = y_upper,
-       model = "JAFAR") |> 
-  arrange(pred) |> 
-  mutate(id = row_number()) |> 
+       model = "JAFAR") |>
+  arrange(pred) |>
+  mutate(id = row_number()) |>
   ggplot() +
   geom_errorbar(aes(x = id, ymin = lower, ymax = upper, color = model)) +
   geom_point(aes(x = id, y = pred, color = model)) +
   geom_point(aes(x = id, y = outcome)) +
-  # stat_smooth(method = lm) + 
+  # stat_smooth(method = lm) +
   # geom_abline(slope=1, intercept = 0) +
   labs(x = "Simulated outcome",
        y = "Predicted outcome")
 ```
+
+
+# MOFA2
+
+MOFA2 (Multi-Omics Factor Analysis v2) is an unsupervised factor model that decomposes
+multiple views as X_l ≈ Z W_l^T, learning shared latent factors Z and view-specific
+weight matrices W_l. Unlike our supervised model it does not use y during factor
+estimation — y is predicted via a post-hoc regression on the extracted factors.
+
+```{r mofa-setup}
+library(MOFA2)
+source("../R/mofa_run.R")
+source("../R/sim_methods.R")
+```
+
+## Load shared simulation data
+
+We use one rep of the shared-factor simulation so we can compare the recovered
+factors against the ground truth Z.
+
+```{r mofa-load-data}
+train_data <- readRDS(
+  "~/multiomic_integration/sim/data/multi_view_shared/k.5/train/n500p100_snr2.2_sparse0.25/sim_data_shared_rep1.rds"
+)
+test_data <- readRDS(
+  "~/multiomic_integration/sim/data/multi_view_shared/k.5/test/n500p100_snr2.2_sparse0.25/sim_data_shared_rep1.rds"
+)
+
+X_l_train <- train_data$X_l
+X_l_test  <- test_data$X_l
+y_train   <- as.numeric(train_data$y)
+y_test    <- as.numeric(test_data$y)
+
+cat("Train: n =", nrow(X_l_train[[1]]),
+    " p =", ncol(X_l_train[[1]]),
+    " L =", length(X_l_train), "\n")
+cat("K (true) =", train_data$K, "\n")
+```
+
+## Preprocess
+
+Remove zero-variance features and standardise using training statistics.
+
+```{r mofa-preprocess}
+col_filters <- lapply(X_l_train, function(X) apply(X, 2, sd) > 0)
+X_l_train_f <- mapply(function(X, f) X[, f, drop = FALSE],
+                       X_l_train, col_filters, SIMPLIFY = FALSE)
+X_l_test_f  <- mapply(function(X, f) X[, f, drop = FALSE],
+                       X_l_test,  col_filters, SIMPLIFY = FALSE)
+
+X_l_means <- lapply(X_l_train_f, colMeans)
+X_l_sds   <- lapply(X_l_train_f, function(X) apply(X, 2, sd))
+
+std <- function(X, mu, s) sweep(sweep(X, 2, mu, `-`), 2, s, `/`)
+X_l_train_std <- mapply(std, X_l_train_f, X_l_means, X_l_sds, SIMPLIFY = FALSE)
+X_l_test_std  <- mapply(std, X_l_test_f,  X_l_means, X_l_sds, SIMPLIFY = FALSE)
+
+y_mean <- mean(y_train);  y_sd <- sd(y_train)
+y_train_std <- (y_train - y_mean) / y_sd
+y_test_std  <- (y_test  - y_mean) / y_sd
+```
+
+## Fit MOFA2
+
+MOFA2 receives each view as a features × samples matrix (hence the transpose in
+`fit_mofa`). We pass `K = 9` to match the true number of shared factors. In
+practice K would be chosen by cross-validation or by inspecting the variance
+explained plot.
+
+```{r mofa-fit, message=FALSE}
+K_fit <- train_data$K + 10   # 5
+
+set.seed(123)
+mofa_obj <- fit_mofa(X_l_train_std, K = K_fit, seed = 123, verbose = FALSE)
+mofa_obj
+```
+
+### What did MOFA learn?
+
+**Variance explained per view per factor.** Each bar shows how much of one view's
+variance is attributed to each factor. Factors that explain variance across all
+views are truly "shared".
+
+```{r mofa-var-explained, fig.width=8, fig.height=4}
+plot_variance_explained(mofa_obj, x = "view", y = "factor")
+```
+
+**Total variance explained per view.**
+
+```{r mofa-var-explained-total, fig.width=5, fig.height=3}
+plot_variance_explained(mofa_obj, plot_total = TRUE)[[2]]
+```
+
+### Factor scores
+
+Extracted factor scores Z_hat (n × K). Each column is one shared latent
+dimension across all views.
+
+```{r mofa-factor-scores}
+Z_hat <- get_factors(mofa_obj)[[1]]   # samples × K
+dim(Z_hat)
+```
+
+**Correlation between estimated and simulated factor scores.**
+Because factor models are rotation-invariant, individual columns will not match
+one-to-one; what matters is whether the estimated subspace covers the true one.
+The heatmap below shows absolute correlations — a block-diagonal pattern
+(each estimated factor correlating strongly with exactly one true factor) is ideal.
+
+```{r mofa-factor-correlation, fig.width=6, fig.height=5}
+Z_true <- train_data$Z   # n × K_true
+
+cor_mat <- abs(cor(Z_hat, Z_true))
+rownames(cor_mat) <- paste0("est_", seq_len(ncol(Z_hat)))
+colnames(cor_mat) <- paste0("true_", seq_len(ncol(Z_true)))
+
+pheatmap::pheatmap(
+  cor_mat,
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  main = "|Correlation| estimated vs. true factor scores",
+  color = colorRampPalette(c("white", "steelblue"))(50)
+)
+```
+
+### Loading matrices
+
+MOFA's weight matrices W_l (features × K) play the role of our Lambda_l.
+Below we display the loading heatmap for the first view.
+
+```{r mofa-loadings, fig.width=6, fig.height=4}
+W_list <- get_weights(mofa_obj)   # list: p_l × K per view
+pheatmap::pheatmap(
+  W_list[[1]],
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  main = "MOFA loadings — view 1",
+  color = colorRampPalette(c("navy", "white", "firebrick"))(50),
+  show_rownames = FALSE
+)
+```
+
+## Supervised prediction
+
+MOFA does not model y. We recover the outcome association by regressing y_train
+on the extracted factors, then project test samples to get out-of-sample predictions.
+
+```{r mofa-outcome-regression}
+lm_fit <- fit_outcome_mofa(mofa_obj, y_train_std)
+summary(lm_fit)
+```
+
+### Project test factors
+
+Test-sample factors are estimated via closed-form OLS across all views:
+Z_test = X_test_concat W_concat (W^T W)^{-1}.
+
+```{r mofa-project-test}
+Z_test <- project_mofa_test(mofa_obj, X_l_test_std)
+dim(Z_test)   # n_test × K
+```
+
+### Predicted vs. actual outcome
+
+```{r mofa-predict-outcome, fig.width=5, fig.height=4}
+y_pred <- predict_outcome_mofa(lm_fit, Z_test)
+
+tibble(actual = y_test_std, predicted = y_pred) |>
+  ggplot(aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "MOFA2 outcome prediction (test set)",
+       x = "Actual y (standardised)",
+       y = "Predicted y")
+```
+
+```{r mofa-outcome-mse}
+cat("Test outcome MSE:", round(mean((y_pred - y_test_std)^2), 4), "\n")
+```
+
+## Structure recovery evaluation
+
+Use `eval_mofa_shared` to compute joint structure RSE per view — the same metric
+used for `SupMultiviewShared`, enabling a direct comparison.
+
+```{r mofa-eval}
+train_idx <- seq_len(nrow(X_l_train_f[[1]]))
+
+eval_tbl <- eval_mofa_shared(
+  mofa_obj     = mofa_obj,
+  Z_test       = Z_test,
+  y_test_std   = y_test_std,
+  lm_fit       = lm_fit,
+  sim_data     = train_data,
+  X_l_means    = X_l_means,
+  X_l_sds      = X_l_sds,
+  col_filters  = col_filters,
+  train_idx    = train_idx,
+  X_l_test_std = X_l_test_std
+)
+
+eval_tbl |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  knitr::kable(caption = "MOFA2 evaluation metrics")
+```
+
+```{r mofa-cov-eval}
+cov_tbl <- eval_cov_mofa(W_list, train_data, X_l_sds, col_filters)
+
+cov_tbl |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  knitr::kable(caption = "MOFA2 covariance reconstruction metrics")
+```
+
+Credible interval coverage is NA because MOFA2 provides point estimates only;
+uncertainty quantification requires a Bayesian alternative (JAFAR or SupMultiviewShared).
 
