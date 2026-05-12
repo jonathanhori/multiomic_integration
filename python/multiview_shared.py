@@ -533,6 +533,7 @@ class SupMultiviewShared(PyroModule):
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
 
+        Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             for m in range(self.k):
                 a_delta_lambda_l_k = self.params[Params.a_delta_lambda_l_k.format(l=l, m=m)]
@@ -547,14 +548,15 @@ class SupMultiviewShared(PyroModule):
 
             loc_Lambda_l = self.params[Params.loc_Lambda_l.format(l=l)]
             scale_Lambda_l = self.params[Params.scale_Lambda_l.format(l=l)]
-            pyro.sample(Sites.Lambda_l.format(l=l),
+            Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                         dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
+            Lambda_l_list.append(Lambda_l)
 
         for l, p_l in enumerate(self.p_l_list):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             pyro.sample(Sites.psi_l.format(l=l),
-                        dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
+                        dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
         b_sigma_beta = self.params[Params.b_sigma_beta]
@@ -582,6 +584,10 @@ class SupMultiviewShared(PyroModule):
             loc_Z_batch = loc_Z[batch_idx]
             scale_Z_batch = scale_Z[batch_idx]
             Z = pyro.sample(Sites.Z_pred, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
+            
+            for l in range(len(X_list)):
+                pyro.deterministic(Sites.joint_structure_l.format(l=l),
+                                   torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
 
             loc_beta = self.params[Params.loc_beta]
             pyro.deterministic(Sites.outcome_structure_pred,
@@ -610,7 +616,7 @@ class SupMultiviewShared(PyroModule):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             psi_l = pyro.sample(Sites.psi_l.format(l=l),
-                                dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
+                                dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
             psi_sqrt_l_list.append(torch.sqrt(psi_l))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
@@ -660,6 +666,7 @@ class SupMultiviewShared(PyroModule):
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
 
+        Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             a_sigma_lambda = self.params[Params.a_sigma_lambda_l.format(l=l)]
             b_sigma_lambda = self.params[Params.b_sigma_lambda_l.format(l=l)]
@@ -668,14 +675,15 @@ class SupMultiviewShared(PyroModule):
 
             loc_Lambda_l = self.params[Params.loc_Lambda_l.format(l=l)]
             scale_Lambda_l = self.params[Params.scale_Lambda_l.format(l=l)]
-            pyro.sample(Sites.Lambda_l.format(l=l),
+            Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                         dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
+            Lambda_l_list.append(Lambda_l)
 
         for l, p_l in enumerate(self.p_l_list):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             pyro.sample(Sites.psi_l.format(l=l),
-                        dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
+                        dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
         b_sigma_beta = self.params[Params.b_sigma_beta]
@@ -703,6 +711,10 @@ class SupMultiviewShared(PyroModule):
             loc_Z_batch = loc_Z[batch_idx]
             scale_Z_batch = scale_Z[batch_idx]
             Z = pyro.sample(Sites.Z_pred, dist.Normal(loc_Z_batch, scale_Z_batch).to_event(1))
+            
+            for l in range(len(X_list)):
+                pyro.deterministic(Sites.joint_structure_l.format(l=l),
+                                   torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
 
             loc_beta = self.params[Params.loc_beta]
             pyro.deterministic(Sites.outcome_structure_pred,
