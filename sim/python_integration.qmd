@@ -1542,7 +1542,7 @@ sim_data_multiview_torch.get("beta")
 Plot
 
 ```{python}
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 ```
 ```{python}
 p = sns.scatterplot(x = sim_y.tolist(), y = y_clean.T.tolist()[0])
@@ -2734,4 +2734,492 @@ for key in pyro.get_param_store().keys():
 
 ```{python}
 pyro.get_param_store()['AutoNormal.locs.delta_lambda_l2_k0']
+```
+
+
+# SupMultiviewShared
+
+Multiview model with shared latent scores Z and view-specific loading matrices Lambda_l.
+No view-specific factors. Outcome y ~ Z @ beta.
+
+## Setup
+
+```{python}
+import importlib
+import sys
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+
+import os
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+
+# Reload modules so that any edits to multiview_shared.py or run_methods.py
+# are picked up even if the kernel already has old versions cached.
+for _mod in ("multiview_shared", "run_methods", "handler", "data_utils", "constants"):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
+import pyro
+import torch
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+import rpy2.robjects as robjects
+from rpy2.robjects import default_converter, conversion
+
+from run_methods import (
+    process_data_shared,
+    train_model_shared,
+    train_model_locally_shared,
+    evaluate_fitted_model_shared,
+)
+
+from data_utils import r_to_torch, varimax
+
+from constants import Sites, Params
+```
+
+
+```{python}
+
+```
+
+## Load data
+
+```{python}
+conversion.set_conversion(default_converter)
+readRDS = robjects.r['readRDS']
+
+rep_config = {
+    "n": 500, "p_l": 100, "snr_x": 2, "snr_y": 2,
+    "rep": 1, "sparsity": 0.25, "k_delta": K_DELTA,
+}
+
+train_rds = readRDS(
+    f"~/multiomic_integration/sim/data/multi_view_shared/k.5/train/n{rep_config['n']}p{rep_config['p_l']}_snr{rep_config['snr_x']}.{rep_config['snr_y']}_sparse{rep_config['sparsity']}/sim_data_shared_rep{rep_config['rep']}.rds"
+)
+test_rds = readRDS(
+    f"~/multiomic_integration/sim/data/multi_view_shared/k.5/test/n{rep_config['n']}p{rep_config['p_l']}_snr{rep_config['snr_x']}.{rep_config['snr_y']}_sparse{rep_config['sparsity']}/sim_data_shared_rep{rep_config['rep']}.rds"
+)
+```
+
+```{python}
+conversion.set_conversion(default_converter)
+
+sim_data      = {name: r_to_torch(train_rds.rx2(name)) for name in train_rds.names}
+sim_data_test = {name: r_to_torch(test_rds.rx2(name))  for name in test_rds.names}
+
+print("L =", int(sim_data["L"]),
+      " K =", int(sim_data["K"]),
+      " n =", sim_data["X_l"][0].shape[0],
+      " p =", sim_data["X_l"][0].shape[1])
+```
+
+## Process data
+
+```{python}
+train_subset, test_subset, data_package = process_data_shared(
+    sim_data, sim_data_test,
+    training_split=False,
+    training_size=0.8,
+    seed=123,
+)
+
+print("train n:", train_subset.tensors[0].shape[0],
+      " test n:", test_subset.tensors[0].shape[0])
+```
+
+## Train model
+
+```{python}
+K_TRUE  = int(sim_data["K"])
+K_DELTA = 10           # over-specification; try 10 to stress-test
+K_FIT   = K_TRUE + K_DELTA
+
+NUM_EPOCHS = 1000
+MIN_EPOCHS = 200
+
+model_config = {"k": K_FIT, "dense_model": False}
+train_config = {
+    "eta":           0.5,
+    "delta":         1e-16,
+    "t":             1.0, #0.5,
+    "num_particles": 2,
+    "minibatch_size": 32,
+    "min_epochs":    MIN_EPOCHS,
+    "max_epochs":    NUM_EPOCHS,
+}
+
+pyro.clear_param_store()
+factor_model, train_handler, global_state = train_model_shared(
+    model_config, train_config, train_subset,
+    model_out_filename="/tmp/shared_example_rep1",
+    opt="adagrad",
+    verbose=True,
+    write=False,
+)
+print(f"Global training: {factor_model.total_epochs} epochs")
+```
+
+Plot loss
+```{python}
+p = sns.relplot(
+    data = factor_model.loss_history[1:],
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Negative ELBO")
+p.fig.suptitle("Minibatch loss per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+p = sns.relplot(
+    data = factor_model.var_param_convergence_history[1:],
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Norm difference")
+p.fig.suptitle("Variational parameter convergence per epoch")
+# factor_model.loss_history
+```
+
+## Local inference on test set
+
+```{python}
+local_config = {**train_config, "min_epochs": 200}
+
+factor_model, test_handler, local_state = train_model_locally_shared(
+    factor_model, local_config, test_subset,
+    opt="adagrad",
+    verbose=True,
+)
+print(f"Local training: {factor_model.local_epochs} epochs")
+```
+
+## Evaluate
+
+```{python}
+
+
+eval_table, cov_table = evaluate_fitted_model_shared(
+    rep_config, data_package,
+    train_handler, test_handler,
+    global_state, local_state,
+    N_POSTERIOR_SAMPLES=300,
+    metric_out_filename="/tmp/shared_example_metrics_rep1",
+)
+eval_table
+```
+
+```{python}
+cov_table
+```
+
+```{python}
+import seaborn as sns, matplotlib.pyplot as plt
+
+# Loss curve
+fig, ax = plt.subplots()
+ax.plot(factor_model.loss_history)
+ax.set(xlabel="Epoch", ylabel="ELBO loss", title="SupMultiviewShared training loss")
+plt.show()
+```
+
+```{python}
+# Per-view metrics
+print(eval_table[["view", "joint_rse", "test_rse", "joint_95p_coverage"]].to_string(index=False))
+
+print(f"\nOutcome MSE:  {eval_table['outcome_mse'].iloc[0]:.4f}")
+print(f"Outcome 95% CI coverage: {eval_table['outcome_95p_coverage'].iloc[0]:.2f}")
+```
+
+## Outcome predictions: train and test
+
+```{python}
+from data_utils import summarise_post_samples
+
+# Training: posterior mean of Z_train @ beta (global model, no outcome noise)
+train_post = train_handler.predict(
+    data_package["train_X_l_list_clean"],
+    300,
+    [Sites.outcome_structure],
+)
+train_pred_mean = train_post[Sites.outcome_structure].mean(dim=0).squeeze()
+
+# Test: posterior mean of Z_test @ beta (local model, no outcome noise)
+test_post = test_handler.predict(
+    data_package["test_X_l_list_clean"],
+    300,
+    [Sites.outcome_structure_pred],
+)
+test_pred_mean = test_post[Sites.outcome_structure_pred].mean(dim=0).squeeze()
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+for ax, pred, true, title in [
+    (axes[0], train_pred_mean, data_package["train_y_clean"], "Train"),
+    (axes[1], test_pred_mean,  data_package["test_y_clean"],  "Test"),
+]:
+    ax.scatter(pred.tolist(), true.tolist(), alpha=0.6)
+    lim = max(abs(true).max(), abs(pred).max()).item() * 1.1
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.axline((0, 0), slope=1, color="black", ls="--")
+    ax.set_xlabel("Predicted y")
+    ax.set_ylabel("True y")
+    ax.set_title(f"Outcome predictions — {title}")
+plt.tight_layout()
+plt.show()
+```
+
+## Plot loadings
+```{python}
+est_Lambda0 = pyro.param(Params.loc_Lambda_l.format(l = 0)).detach().numpy()
+est_Lambda0_varimax, R = varimax(est_Lambda0)
+```
+
+
+```{python}
+R.shape
+```
+
+```{python}
+R @ pyro.param('loc_beta').detach().numpy()
+```
+
+```{python}
+sns.heatmap(
+    est_Lambda0,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+```
+
+
+```{python}
+sns.heatmap(
+    est_Lambda0_varimax,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+
+```
+
+
+When does tau become large?
+```{python}
+delta_sites = [Sites.delta_lambda_l_k.format(l = 0, m = m) for m in range(K_FIT)]
+delta_post_samples = train_handler.predict(data_package['train_X_l_list_clean'], 100, delta_sites)
+```
+
+```{python}
+delta_means = [np.mean(delta_post_samples[site].squeeze().tolist()) for site in delta_sites]
+tau = np.cumprod(delta_means)
+# delta_post_samples.items() #['delta_lambda_l0_k0'].shape
+# sns.relplot(1 / tau, kind = "scatter")
+p = sns.relplot(tau, kind = "scatter")
+p.set(xlabel = "Factor k", ylabel = "Mean Tau (global shrinkage)")
+# p.set_title("Global shrinkage over increasing factor dimension")
+```
+
+
+
+Plot varimax loadings after order selection
+```{python}
+# est_Lambda0 = pyro.param(Params.loc_Lambda_l.format(l = 0)).detach().numpy()
+est_Lambda0_varimax_sliced, R = varimax(est_Lambda0[:, 0:7])
+
+sns.heatmap(
+    est_Lambda0_varimax_sliced,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+
+```
+
+## Compare outcome effects
+
+```{python}
+sim_data['beta']
+```
+
+```{python}
+pyro.param('loc_beta').detach().double()
+```
+
+
+
+```{python}
+est_betas = pd.DataFrame({
+        'beta': pyro.param('loc_beta').detach().double(),
+        'beta_rot': torch.from_numpy(R).double().T @ pyro.param('loc_beta').detach().double(),
+        'factor': range(0, len(pyro.param('loc_beta')))
+        }
+        ).melt(id_vars = ['factor'], var_name = "type")
+# est_betas['factor'] = np.tile(range(0, len(pyro.param('loc_beta'))), 2)
+# est_betas
+```
+
+```{python}
+g = sns.catplot(
+    data = est_betas,
+    kind = "bar",
+    x = "factor",
+    y = "value",
+    hue = "type",
+
+)
+g.fig.suptitle("Posterior mean beta_k before and after rotation by varimax")
+# g.despine(left = True)
+```
+
+
+## Cross-validation for hyperparameter selection
+
+```{python}
+import itertools
+importlib.reload(sys.modules["run_methods"])
+from run_methods import run_cv_grid_shared
+from data_utils import zero_variance_col_filter
+```
+
+```{python}
+# Pre-filter each view using the full dataset to remove zero-variance columns.
+# Normalisation is deferred to inside each fold so there is no cross-fold leakage.
+X_l_raw    = sim_data["X_l"]
+y_cv_raw   = sim_data["y"].squeeze()
+
+cv_col_filters = [zero_variance_col_filter(X) for X in X_l_raw]
+X_l_cv_raw     = [X[:, f] for X, f in zip(X_l_raw, cv_col_filters)]
+
+print(f"CV data: {X_l_cv_raw[0].shape[0]} observations")
+for l, X in enumerate(X_l_cv_raw):
+    print(f"  View {l}: {X.shape[1]} features (after zero-var filter)")
+```
+
+```{python}
+# ---------------------------------------------------------------------------
+# AdagradRMSProp hyperparameter grid
+# ---------------------------------------------------------------------------
+eta_cv_array       = [0.1, 0.5, 0.75, 1.0]
+delta_cv_array     = [1e-16]
+t_cv_array         = [0.1, 0.5, 0.75, 1.0]
+particle_cv_array  = [2]
+minibatch_cv_array = [32]
+min_epoch_cv_array = [200]
+max_epoch_cv_array = [500]
+
+cv_train_grid_names = (
+    "eta", "delta", "t",
+    "num_particles", "minibatch_size", "min_epochs", "max_epochs",
+)
+
+cv_train_grid = list(itertools.product(
+    eta_cv_array, delta_cv_array, t_cv_array,
+    particle_cv_array, minibatch_cv_array, min_epoch_cv_array, max_epoch_cv_array,
+))
+print(f"{len(cv_train_grid)} hyperparameter configurations")
+```
+
+```{python}
+cv_model_config = {"k": K_FIT, "dense_model": False}
+
+N_CV_FOLDS             = 5
+CV_SEED                = 42
+N_CV_POSTERIOR_SAMPLES = 100
+```
+
+```{python}
+def select_best_config(cv_results, grid_names, metric="outcome_mse", lower_is_better=True):
+    """Return (best_config dict, per-config mean metric Series) from a CV results DataFrame."""
+    agg      = cv_results.groupby("config_idx")[metric].mean()
+    best_idx = int(agg.idxmin() if lower_is_better else agg.idxmax())
+    best_row = cv_results[cv_results["config_idx"] == best_idx].iloc[0]
+
+    best_config = {}
+    for k in grid_names:
+        v = best_row[k]
+        if isinstance(v, np.integer):
+            v = int(v)
+        elif isinstance(v, np.floating):
+            v = float(v)
+        best_config[k] = v
+    return best_config, agg
+```
+
+```{python}
+# n_workers=1  -> sequential, safe everywhere
+# n_workers=N_CV_FOLDS -> all folds in parallel via joblib/loky
+N_CV_WORKERS = N_CV_FOLDS
+
+cv_results_shared = run_cv_grid_shared(
+    X_l_cv_raw, y_cv_raw,
+    model_config=cv_model_config,
+    train_grid=cv_train_grid,
+    train_grid_names=cv_train_grid_names,
+    n_folds=N_CV_FOLDS,
+    seed=CV_SEED,
+    n_posterior_samples=N_CV_POSTERIOR_SAMPLES,
+    opt="adagrad",
+    n_workers=N_CV_WORKERS,
+)
+```
+
+```{python}
+cv_results_shared
+```
+
+```{python}
+# Mean outcome MSE per config, sorted best first
+cv_summary_shared = (
+    cv_results_shared
+    .groupby("config_idx")[["outcome_mse", "epochs", "local_epochs"]]
+    .mean()
+    .sort_values("outcome_mse")
+)
+cv_summary_shared.head(10)
+```
+
+```{python}
+best_train_config_shared, config_mse_agg_shared = select_best_config(
+    cv_results_shared, cv_train_grid_names, metric="outcome_mse"
+)
+print("Best optimizer config (lowest mean CV outcome MSE):")
+for k, v in best_train_config_shared.items():
+    print(f"  {k}: {v}")
+print(f"\nMean CV outcome MSE: {config_mse_agg_shared.min():.4f}")
+```
+
+```{python}
+# Boxplot of outcome MSE for the top configs
+top_n = 10
+top_config_ids = cv_summary_shared.head(top_n).index.tolist()
+top_cv = cv_results_shared[cv_results_shared["config_idx"].isin(top_config_ids)].copy()
+top_cv["config_label"] = (
+    "eta="   + top_cv["eta"].astype(str)
+    + " t="  + top_cv["t"].astype(str)
+    + " bs=" + top_cv["minibatch_size"].astype(str)
+)
+label_order = (
+    top_cv.groupby("config_label")["outcome_mse"].mean()
+    .sort_values().index.tolist()
+)
+
+fig, ax = plt.subplots()
+sns.boxplot(data=top_cv, x="outcome_mse", y="config_label", order=label_order, ax=ax)
+ax.set_title(f"CV outcome MSE — top {top_n} configs")
+ax.set_xlabel("Outcome MSE (standardised y)")
+ax.set_ylabel("")
+plt.tight_layout()
+plt.show()
+```
+
+
+
+```{python}
+# select_best_config(
+#     cv_results_shared.loc[cv_results_shared.delta == 1e-16], 
+#     cv_train_grid_names, 
+#     metric="outcome_mse"
+# )
+
+cv_results_shared.loc[cv_results_shared.config_idx == 7]
 ```
