@@ -1,0 +1,1439 @@
+---
+jupyter: python3
+---
+
+```{python}
+import os
+import sys
+```
+
+```{python}
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+# r_home = "/Library/Frameworks/R.framework/Resources"
+```
+
+```{python}
+os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ["PATH"]
+os.environ['PATH']
+```
+
+```{python}
+import shutil
+```
+
+```{python}
+
+
+import rpy2.robjects as robjects
+from rpy2.robjects import r, vectors
+from rpy2 import rinterface
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import itertools
+import matplotlib.pyplot as plt
+
+from rpy2.robjects import pandas2ri, default_converter, conversion
+
+import torch
+from torch.utils.data import TensorDataset
+from torchvision import transforms
+import pyro
+import pyro.distributions as dist
+from pyro.optim import Adam, ClippedAdam, AdagradRMSProp
+from pyro.infer import SVI, Trace_ELBO, RBFSteinKernel
+
+import importlib
+
+# import sklearn
+from sklearn.model_selection import train_test_split
+
+
+from pathlib import Path
+import time
+```
+
+```{python}
+#| label: Insert path
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+```
+
+```{python}
+#| label: Load data utils
+# importlib.reload(sys.modules["data_utils"])
+
+from data_utils import r_to_torch, normalize_tensor_by_col, \
+    zero_variance_col_filter, obtain_posterior_pred_samples, \
+        calc_all_structures_with_rescaling, extract_sim_decomp, eval_performance, varimax, align_tensor_shapes, calc_cov, scale_sim_cov, summarise_post_samples, eval_post_coverage
+```
+
+```{python}
+# importlib.reload(sys.modules["run_methods"])
+from run_methods import (
+    load_rds,
+    process_data_single_view,
+    train_model_single_view,
+    train_model_locally_single_view,
+    evaluate_fitted_model_single_view,
+) 
+```
+
+```{python}
+# importlib.reload(sys.modules["data_utils"])
+from data_utils import eval_performance_single_view
+```
+
+```{python}
+#| label: Load model objects
+# importlib.reload(sys.modules["matrix_decomp"])
+# importlib.reload(sys.modules["handler"])
+
+from matrix_decomp import MatrixDecomp
+from handler import ModelHandler
+```
+
+```{python}
+from constants import Params, Sites
+```
+
+# Real data analysis — TCGA COAD/KIRC
+
+## Load data
+```{python}
+cancer_type = "coad"
+
+raw_data = pd.read_csv(f'../data/tcga/tmb_f1cdx_{cancer_type}.csv')
+
+train_idx = (pd.read_csv(f'../data/tcga/processed/{cancer_type}/train_idx.csv').values.squeeze() - 1).tolist()
+```
+
+```{python}
+data_train = raw_data.iloc[train_idx]
+data_test = raw_data.drop(train_idx)
+```
+
+```{python}
+tmb_train = data_train['TMB_NONSYNONYMOUS'] #['y'] #['TMB_NONSYNONYMOUS']
+tmb_test = data_test['TMB_NONSYNONYMOUS'] #['y'] #['TMB_NONSYNONYMOUS']
+
+dropped_cols = ['sampleId', 'TMB_NONSYNONYMOUS'] #
+# dropped_cols = data_train.columns[0:3]
+genes_train = data_train.drop(dropped_cols, axis = 1)
+genes_test = data_test.drop(dropped_cols, axis = 1)
+```
+
+```{python}
+# Full data
+genes = raw_data.drop(dropped_cols, axis = 1)
+tmb = raw_data['TMB_NONSYNONYMOUS']
+tmb = torch.log(1 + torch.tensor(tmb.values))
+
+gene_names = genes.columns
+```
+
+```{python}
+genes_train
+```
+
+```{python}
+tmb_train = torch.log(1 + torch.tensor(tmb_train.values))
+tmb_test = torch.log(1 + torch.tensor(tmb_test.values))
+```
+
+
+Filter out outliers in TMB before modeling or splitting
+
+```{python}
+# max_tmb = 200
+# sample_filter = tmb_train.values < 200
+```
+
+```{python}
+# run_data_train = {'X_l': [torch.tensor(genes_train.values)[sample_filter, :]], 
+#             'y': torch.log(1 + torch.tensor(tmb_train.values))[sample_filter], 
+#             'K': torch.tensor(0.),
+#             'Lambda_l': [None],
+#             'Z': None}
+```
+
+```{python}
+run_data_train = {'X_l': [torch.tensor(genes_train.values)], 
+            'y': torch.tensor(tmb_train), 
+            'K': torch.tensor(0.),
+            'Lambda_l': [None],
+            'Z': None}
+
+run_data_test = {'X_l': [torch.tensor(genes_test.values)], 
+            'y': torch.tensor(tmb_test), 
+            'K': torch.tensor(0.),
+            'Lambda_l': [None],
+            'Z': None}
+
+train_samples, test_samples, tmb_data_package = process_data_single_view(
+                            run_data_train,
+                            training_size=0.8,
+                            seed=123,
+                            training_split=False,
+                            sim_data_test=run_data_test,
+                        )
+```
+
+
+## Run model
+
+```{python run-model}
+model_config = {"k": 30, "dense": False}
+# For scheduler
+# train_config = {"initial_lr": 0.1,
+#                 "betas": (0.9, 0.999), 
+#                 "lr_step_size": 10, 
+#                 "lr_decay_factor": 0.9,
+#                 "num_particles": 2, 
+#                 "minibatch_size": 16, 
+#                 "min_epochs": 200, 
+#                 "max_epochs": 500
+#                 }
+
+# For Adagrad
+train_config = {
+    "eta": 1., "delta": 1e-16, "t": .5,
+    "num_particles": 2,
+    "minibatch_size": 32,
+    "min_epochs": 200,
+    "max_epochs": 1000,
+}
+
+pyro.clear_param_store()
+factor_model, train_handler, global_runtime = train_model_single_view(
+    model_config, train_config, train_samples, verbose = True
+    )
+```
+
+
+
+
+## Evaluate
+```{python}
+p = sns.relplot(
+    data = factor_model.loss_history[1:],
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Negative ELBO")
+p.fig.suptitle("Minibatch loss per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+p = sns.relplot(
+    data = factor_model.var_param_convergence_history[1:],
+    kind = "line"
+)
+p.set_axis_labels("Epochs", "Norm difference")
+p.fig.suptitle("Variational parameter convergence per epoch")
+# factor_model.loss_history
+```
+
+```{python}
+test_handler, local_runtime = train_model_locally_single_view(
+    factor_model, train_config, test_samples, verbose = True
+)
+```
+
+
+```{python}
+post_train = train_handler.predict(
+        [tmb_data_package["X_train"]], 200,
+        return_sites=["structure", 
+        Sites.Lambda_l.format(l=0), 
+        Sites.psi_l.format(l = 0),
+        Sites.y],
+)
+post_test = test_handler.predict(
+    [tmb_data_package["X_test"]], 200,
+    return_sites=["y_pred"],
+)
+```
+
+```{python}
+psi_post_mean = post_train['psi_l0'].mean(dim=0).squeeze()
+```
+
+```{python}
+torch.diag(psi_post_mean)
+```
+
+```{python}
+Lambda_post_mean = post_train['Lambda_l0'].mean(dim=0).squeeze()
+psi_post_mean = post_train['psi_l0'].mean(dim=0).squeeze()
+est_cov = calc_cov(Lambda_post_mean) + torch.diag(psi_post_mean)
+
+# Do not rescale the covariance because I am already calculating with rescaled data.
+data_cov_norm = tmb_data_package["X_train"].T @ tmb_data_package["X_train"] / tmb_data_package["X_train"].shape[0] 
+# data_cov_norm = scale_sim_cov(tmb_data_package["X_train"].T @ tmb_data_package["X_train"] / tmb_data_package["X_train"].shape[0], tmb_data_package["X_sd"], tmb_data_package["X_sd"])
+
+pred_outcome_summary = summarise_post_samples(post_test['y_pred'])
+```
+
+```{python}
+single_view_metrics = eval_performance_single_view(
+    **{
+    'sim_struct': tmb_data_package["X_train"],
+    'structure_summary': summarise_post_samples(post_train['structure']),
+    'est_cov': est_cov,
+    'sim_cov_norm': data_cov_norm,
+    'sim_outcome': tmb_data_package["y_test"],
+    'pred_outcome_summary': pred_outcome_summary,
+    }
+    # sim_struct,
+    # structure_summary,
+    # est_cov,
+    # sim_cov_norm,
+    # sim_outcome,
+    # pred_outcome_summary
+)
+single_view_metrics.assign(**train_config)
+```
+
+
+```{python}
+single_view_metrics
+```
+
+```{python}
+from datetime import datetime
+```
+```{python}
+dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+single_view_metrics.\
+    assign(**train_config).\
+    to_csv(f"./results/matrixdecomp/tcga/metrics_{dt}.csv")
+```
+
+
+Visualize outcome predictions
+
+```{python}
+torch.nn.functional.mse_loss(post_test['y_pred'].mean(dim = 0), tmb_data_package["y_test"].detach())
+```
+
+```{python}
+y_pred = post_test['y_pred'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = y_pred.squeeze().tolist(), 
+                    y = tmb_data_package["y_test"].detach().tolist())
+p.set(xlabel = "Predicted y", ylabel = "True y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = y_pred.squeeze().tolist() ,
+            y = tmb_data_package["y_test"].detach().tolist(), scatter = False, ax = p)
+```
+
+
+```{python}
+y_pred_train = post_train['y'].mean(dim = 0)
+
+p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(), 
+                    x = y_pred_train.squeeze().tolist(), 
+                    y = tmb_data_package["y_train"].detach().tolist())
+p.set(xlabel = "Predicted y", ylabel = "True y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = y_pred_train.squeeze().tolist(),
+            y = tmb_data_package["y_train"].detach().tolist() , scatter = False, ax = p)
+```
+
+
+Evaluate loadings
+
+```{python}
+lambda_est = summarise_post_samples(post_train['Lambda_l0'])['mean'].squeeze().detach().numpy()
+```
+
+
+```{python}
+sns.heatmap(
+    lambda_est,
+    cmap="coolwarm"
+)
+```
+
+
+```{python}
+lambda_est_rotated, R = varimax(lambda_est)
+
+sns.heatmap(
+    lambda_est_rotated,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+
+```
+
+
+```{python}
+# working_Lambda = lambda_est # est_Lambda0_varimax
+
+Lambda_colsums = np.sum(lambda_est ** 2, axis = 0)
+# Lambda_colsums = np.sum(Lambda_est.detach().numpy() ** 2, axis = 0)
+Lambda_totalsum = np.sum(Lambda_colsums)
+sns.relplot(
+    Lambda_colsums / Lambda_totalsum,
+    # np.sum(Lambda_est_rotated ** 2, axis = 0),
+    kind="line"
+    )
+```
+
+```{python}
+Lambda_rot_colsums = np.sum(lambda_est_rotated ** 2, axis = 0)
+# Lambda_colsums = np.sum(Lambda_est.detach().numpy() ** 2, axis = 0)
+Lambda_rot_totalsum = np.sum(Lambda_rot_colsums)
+
+sns.relplot(
+    Lambda_rot_colsums / Lambda_rot_totalsum,
+    # np.sum(Lambda_est_rotated ** 2, axis = 0),
+    kind="line"
+    )
+```
+
+When does tau become large?
+```{python}
+delta_sites = [Sites.delta_lambda_l_k.format(l = 0, m = m) for m in range(30)]
+delta_post_samples = train_handler.predict([tmb_data_package['X_train']], 100, delta_sites)
+```
+
+```{python}
+delta_means = [np.mean(delta_post_samples[site].squeeze().tolist()) for site in delta_sites]
+tau = np.cumprod(delta_means)
+# delta_post_samples.items() #['delta_lambda_l0_k0'].shape
+# sns.relplot(1 / tau, kind = "scatter")
+p = sns.relplot(tau, kind = "scatter")
+p.set(xlabel = "Factor k", ylabel = "Mean Tau (global shrinkage)")
+# p.set_title("Global shrinkage over increasing factor dimension")
+```
+
+Directional effects of factors
+```{python}
+pyro.param('loc_beta') / pyro.param('scale_beta')
+```
+
+```{python}
+R
+```
+
+```{python}
+torch.from_numpy(R).double().T @ pyro.param('loc_beta').detach().double()
+```
+
+
+```{python}
+est_betas = pd.DataFrame({
+        'beta': pyro.param('loc_beta').detach().double(),
+        'beta_rot': torch.from_numpy(R).double().T @ pyro.param('loc_beta').detach().double(),
+        'factor': range(0, len(pyro.param('loc_beta')))
+        }
+        ).melt(id_vars = ['factor'], var_name = "type")
+# est_betas['factor'] = np.tile(range(0, len(pyro.param('loc_beta'))), 2)
+# est_betas
+```
+
+```{python}
+g = sns.catplot(
+    data = est_betas,
+    kind = "bar",
+    x = "factor",
+    y = "value",
+    hue = "type",
+
+)
+g.fig.suptitle("Posterior mean beta_k before and after rotation by varimax")
+# g.despine(left = True)
+```
+
+```{python}
+pyro.param('loc_beta').detach()
+```
+
+
+```{python}
+np.min(lambda_est)
+```
+
+```{python}
+factor0 = lambda_est[:, 0]
+```
+
+
+
+```{python}
+sns.histplot(factor0)
+```
+
+```{python}
+factor0_names = pd.DataFrame({'names': gene_names, 'loading0': factor0})
+loadings_named = pd.concat([pd.DataFrame({'names': gene_names}), pd.DataFrame(lambda_est)], axis = 1)
+```
+
+```{python}
+loadings_named
+```
+
+```{python}
+loadings_named.to_csv('coad_tmb_loadings.csv', index = False)
+```
+
+```{python}
+loadings_sort0 = loadings_named.sort_values(by = 0, ascending = False)
+```
+
+```{python}
+sns.heatmap(
+    loadings_sort0.drop('names', axis = 1),
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+```
+
+```{python}
+loadings_sort0
+```
+
+
+```{python}
+lambda_est_sliced_rotated, R = varimax(lambda_est[:, 0:23])
+```
+
+```{python}
+sns.heatmap(
+    lambda_est_sliced_rotated,
+# sim_data_multiview_torch.get('Lambda_l')[0],
+cmap="coolwarm"
+)
+```
+
+
+```{python}
+loadings_rotated_named = pd.concat([pd.DataFrame({'names': gene_names}), 
+pd.DataFrame(lambda_est_rotated)], axis = 1)
+
+loadings_sliced_rotated_named = pd.concat([pd.DataFrame({'names': gene_names}), 
+pd.DataFrame(lambda_est_sliced_rotated)], axis = 1)
+```
+
+
+
+```{python}
+loadings_rotated_named.sort_values(by = 0, ascending = False)
+```
+
+```{python}
+
+```
+
+```{python}
+torch.tensor(tmb.values)
+```
+
+
+
+## Gene co-expression networks
+
+
+Gene co-expression networks are derived from the factor loadings matrix. Two
+complementary views are shown:
+
+1. **Per-factor networks** — for each of the top active factors, the genes with
+   the largest absolute loadings are shown as nodes.  An edge connects two genes
+   whose co-loading on that factor exceeds a threshold (edge weight ∝ implied
+   co-expression |λ_i · λ_j|).
+2. **Global implied co-expression network** — the full co-expression matrix
+   Λ Λᵀ is computed from the (varimax-rotated) loadings and thresholded; only
+   the top-N genes by total loading magnitude are displayed to keep the graph
+   readable.  Nodes are coloured by the factor on which each gene loads most
+   strongly.
+
+# Determine the top factors by variance 
+```{python}
+Lambda_rot = lambda_est_rotated          # (p_genes, k_factors)
+factor_var = np.sum(Lambda_rot ** 2, axis=0)
+top_factors = np.argsort(factor_var)[::-1]
+```
+
+```{python}
+import networkx as nx
+
+import matplotlib.patches as mpatches
+```
+
+```{python}
+# ── helpers ───────────────────────────────────────────────────────────────
+
+def _loading_color(v, vmax):
+    """Map a signed loading value to an RGB colour (red +, blue -)."""
+    t = v / vmax if vmax != 0 else 0
+    if t >= 0:
+        return (t, 0.15 * (1 - t), 0.15 * (1 - t))
+    else:
+        return (0.15 * (1 + t), 0.15 * (1 + t), -t)
+
+
+def build_factor_graph(loading_vec, gene_names, top_n=20, edge_threshold=0.04):
+    """
+    NetworkX graph for a single factor.
+
+    Nodes  : top_n genes by |loading|
+    Edges  : pairs where |λ_i · λ_j| > edge_threshold
+    """
+    idx   = np.argsort(np.abs(loading_vec))[::-1][:top_n]
+    names = np.array(gene_names)[idx]
+    vals  = loading_vec[idx]
+
+    G = nx.Graph()
+    for i, (name, val) in enumerate(zip(names, vals)):
+        G.add_node(i, gene=name, loading=float(val))
+
+    for i in range(top_n):
+        for j in range(i + 1, top_n):
+            w = abs(vals[i] * vals[j])
+            if w > edge_threshold:
+                G.add_edge(i, j, weight=w)
+    return G, names, vals
+```
+
+```{python}
+# ── 1. Per-factor co-expression networks ─────────────────────────────────
+
+
+N_FACTORS_SHOW = 6
+TOP_GENES_PER_FACTOR = 15
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+axes = axes.flatten()
+
+for plot_i, f_idx in enumerate(top_factors[:N_FACTORS_SHOW]):
+    ax = axes[plot_i]
+    loading_vec = Lambda_rot[:, f_idx]
+    G, names, vals = build_factor_graph(loading_vec, gene_names,
+                                        top_n=TOP_GENES_PER_FACTOR)
+
+    vmax = np.max(np.abs(vals)) if np.max(np.abs(vals)) > 0 else 1.0
+    node_colors = [_loading_color(v, vmax) for v in vals]
+    node_sizes  = 200 + 1000 * (np.abs(vals) / vmax)
+    edge_widths = [G[u][v]["weight"] * 25 for u, v in G.edges()]
+
+    pos = nx.spring_layout(G, seed=42, k=1.8)
+    nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors,
+                           node_size=node_sizes, alpha=0.88)
+    nx.draw_networkx_labels(G, pos, ax=ax,
+                            labels={i: names[i] for i in G.nodes()},
+                            font_size=6)
+    if G.edges():
+        nx.draw_networkx_edges(G, pos, ax=ax, width=edge_widths,
+                               edge_color="grey", alpha=0.5)
+
+    pct_var = factor_var[f_idx] / factor_var.sum() * 100
+    ax.set_title(f"Factor {f_idx + 1}  ({pct_var:.1f}% var. explained)", fontsize=11)
+    ax.axis("off")
+
+red_patch  = mpatches.Patch(color=(0.85, 0.1, 0.1), label="Positive loading")
+blue_patch = mpatches.Patch(color=(0.1, 0.1, 0.85), label="Negative loading")
+fig.legend(handles=[red_patch, blue_patch], loc="lower center", ncol=2, fontsize=10)
+fig.suptitle(
+    "Gene co-expression networks — top factors\n"
+    "(node size ∝ |loading|, edge width ∝ |λ_i · λ_j|)",
+    fontsize=13,
+)
+plt.tight_layout(rect=[0, 0.05, 1, 1])
+plt.show()
+```
+
+```{python}
+# ── 2. Global implied co-expression network ───────────────────────────────
+
+N_GLOBAL_GENES = 50       # keep graph readable
+CORR_THRESHOLD = 0.25     # |implied corr| cutoff for drawing an edge
+
+# Select top genes by total loading energy (Frobenius per-row)
+gene_energy    = np.sum(Lambda_rot ** 2, axis=1)
+top_gene_idx   = np.argsort(gene_energy)[::-1][:N_GLOBAL_GENES]
+top_gene_names = np.array(gene_names)[top_gene_idx]
+
+Lambda_sub = Lambda_rot[top_gene_idx, :]              # (N_GLOBAL_GENES, k)
+cov_sub    = Lambda_sub @ Lambda_sub.T                # implied covariance
+var_diag   = np.sqrt(np.diag(cov_sub))
+corr_sub   = cov_sub / np.outer(var_diag + 1e-10, var_diag + 1e-10)
+
+# Dominant factor per gene → node colour
+dominant_factor = np.argmax(np.abs(Lambda_sub), axis=1)
+palette         = sns.color_palette("tab20", n_colors=min(20, Lambda_rot.shape[1]))
+node_colors_g   = [palette[int(f) % len(palette)] for f in dominant_factor]
+
+# Build graph
+G_global = nx.Graph()
+for i, name in enumerate(top_gene_names):
+    G_global.add_node(i, gene=name)
+
+for i in range(N_GLOBAL_GENES):
+    for j in range(i + 1, N_GLOBAL_GENES):
+        c = corr_sub[i, j]
+        if abs(c) > CORR_THRESHOLD:
+            G_global.add_edge(i, j, weight=abs(c), sign=float(np.sign(c)))
+
+print(f"Global network: {G_global.number_of_nodes()} nodes, "
+      f"{G_global.number_of_edges()} edges  (threshold |corr| > {CORR_THRESHOLD})")
+
+fig, ax = plt.subplots(figsize=(16, 14))
+pos = nx.spring_layout(G_global, seed=0, k=2.2)
+
+node_sizes_g = 80 + 700 * (gene_energy[top_gene_idx] /
+                             gene_energy[top_gene_idx].max())
+
+nx.draw_networkx_nodes(G_global, pos, ax=ax, node_color=node_colors_g,
+                       node_size=node_sizes_g, alpha=0.88)
+nx.draw_networkx_labels(G_global, pos, ax=ax,
+                        labels={i: top_gene_names[i] for i in G_global.nodes()},
+                        font_size=6)
+
+if G_global.edges():
+    edge_colors = ["#d73027" if G_global[u][v]["sign"] > 0 else "#4575b4"
+                   for u, v in G_global.edges()]
+    edge_widths = [G_global[u][v]["weight"] * 4 for u, v in G_global.edges()]
+    nx.draw_networkx_edges(G_global, pos, ax=ax,
+                           edge_color=edge_colors, width=edge_widths, alpha=0.45)
+
+# Legend — dominant factors present in this subgraph
+present_factors = sorted(set(dominant_factor))
+legend_handles = [
+    mpatches.Patch(color=palette[int(f) % len(palette)], label=f"Factor {int(f) + 1}")
+    for f in present_factors
+]
+ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
+          title="Dominant factor", ncol=2)
+
+pos_patch  = mpatches.Patch(color="#d73027", label="Positive co-expression")
+neg_patch  = mpatches.Patch(color="#4575b4", label="Negative co-expression")
+ax.legend(handles=legend_handles + [pos_patch, neg_patch],
+          loc="upper left", fontsize=8, title="", ncol=2)
+
+ax.set_title(
+    f"Implied gene co-expression network — top {N_GLOBAL_GENES} genes\n"
+    f"(nodes coloured by dominant factor; edges: |implied corr| > {CORR_THRESHOLD})",
+    fontsize=13,
+)
+ax.axis("off")
+plt.tight_layout()
+plt.show()
+```
+
+## Factor Interpretation
+
+The sections below compare the MatrixDecomp (MD) latent factors to classical
+methods, assess how well the model recovers the data covariance structure, and
+annotate the top genes per factor for biological plausibility.
+
+### 1. Comparison with classical Factor Analysis
+
+Both the MD and classical FA loadings are varimax-rotated before comparison.
+The Hungarian algorithm is used to optimally align the two sets of factors
+(handling label-switching and sign flips) before computing per-factor loading
+correlations.
+
+```{python}
+from sklearn.decomposition import FactorAnalysis
+from scipy.optimize import linear_sum_assignment
+
+K = model_config["k"]
+
+# sklearn FA fit on the column-standardised training data
+X_np = tmb_data_package["X_train"].numpy()
+
+fa = FactorAnalysis(n_components=K, random_state=42, max_iter=1000, svd_method = "lapack", rotation = "varimax")
+fa.fit(X_np)
+
+# Apply varimax to FA loadings so orientations are comparable to MD
+fa_loadings_rot = fa.components_.T   # (p, k)
+# fa_loadings_rot, _ = varimax(fa_loadings_raw)
+md_loadings_rot    = lambda_est_rotated   # already computed above
+```
+
+```{python}
+print(fa_loadings_rot.shape)
+print(md_loadings_rot.shape)
+```
+
+```{python}
+# Cross-correlation matrix: MD factors (rows) × FA factors (cols)
+cross_corr = np.corrcoef(md_loadings_rot.T, fa_loadings_rot.T)[:K, K:]
+cross_corr
+```
+
+```{python}
+np.diag(cross_corr)
+```
+
+```{python}
+# Hungarian algorithm: maximise total absolute correlation across matched pairs
+row_ind, col_ind = linear_sum_assignment(1 - np.abs(cross_corr))
+matched_corr     = cross_corr[row_ind, col_ind]   # signed, for sign-flip detection
+
+# Sign-align FA columns so direction agrees with matched MD factor
+fa_loadings_aligned  = fa_loadings_rot[:, col_ind].copy()
+fa_loadings_aligned *= np.sign(matched_corr)[np.newaxis, :]
+```
+
+```{python}
+# Heatmap: all cross-correlations (MD rows in top_factors order, FA in original order)
+fig, ax = plt.subplots(figsize=(12, 9))
+sns.heatmap(
+    cross_corr[:, col_ind],
+    ax=ax,
+    cmap="coolwarm_r", vmin=-1, vmax=1, center=0,
+    xticklabels=[f"FA {col_ind[i]+1}" for i in range(K)],   # FA factors in matched order
+    yticklabels=[f"MD {i+1}" for i in range(K)],             # MD factors in natural order
+
+    # xticklabels=[f"FA {i+1}" for i in range(K)],
+    # yticklabels=[f"MD {int(row_ind[i])+1}" for i in range(K)],
+)
+ax.set_title(
+    "Cross-correlations of varimax-rotated loadings: MatrixDecomp vs. classical FA\n"
+    "(rows = MD factors sorted by variance; cols = FA factors in original order)"
+)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Per-factor scatter: MD loading vs aligned FA loading for the top 6 factors
+N_COMPARE = 6
+fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+axes = axes.flatten()
+
+for plot_i in range(N_COMPARE):
+    md_col = row_ind[plot_i]
+    fa_col = col_ind[plot_i]
+    ax     = axes[plot_i]
+
+    md_vec = md_loadings_rot[:, md_col]
+    fa_vec = fa_loadings_rot[:, fa_col] * np.sign(matched_corr[plot_i])
+
+    ax.scatter(md_vec, fa_vec, s=8, alpha=0.4)
+    r = np.corrcoef(md_vec, fa_vec)[0, 1]
+    ax.set_xlabel(f"MD Factor {md_col+1} loading")
+    ax.set_ylabel(f"FA Factor {fa_col+1} loading (sign-aligned)")
+    ax.set_title(f"r = {r:.3f}")
+    ax.axhline(0, color="grey", lw=0.8, ls="--")
+    ax.axvline(0, color="grey", lw=0.8, ls="--")
+
+fig.suptitle(
+    "Per-factor loading comparison: MatrixDecomp vs. classical FA\n"
+    "(top 6 factors by MD variance explained)",
+    fontsize=12
+)
+plt.tight_layout()
+plt.show()
+```
+
+### 2. Factor score scatter plots (PCA-style)
+
+Factor scores are the variational posterior means of the latent **Z** matrix.
+Consecutive factor pairs are shown — analogous to PCA biplots — coloured by
+log(1 + TMB).
+
+```{python}
+# Factor scores: variational posterior mean of Z for all training observations
+Z_scores   = pyro.param(Params.loc_Z).detach().numpy()   # (n_train, k)
+y_train_np = tmb_data_package["y_train"].numpy()
+
+N_PAIRS = 5   # show N_PAIRS consecutive pairs from the top active factors
+# top_k   = top_factors[:N_PAIRS + 1]
+top_k   = list(range(len(top_factors)))[:N_PAIRS + 1]
+
+fig, axes = plt.subplots(1, N_PAIRS, figsize=(5 * N_PAIRS, 4))
+for i, ax in enumerate(axes):
+    f1, f2 = top_k[i], top_k[i + 1]
+    sc = ax.scatter(
+        Z_scores[:, f1], Z_scores[:, f2],
+        c=y_train_np, cmap="viridis", s=18, alpha=0.7
+    )
+    ax.set_xlabel(f"Factor {f1+1} score")
+    ax.set_ylabel(f"Factor {f2+1} score")
+    ax.set_title(f"F{f1+1} vs F{f2+1}")
+    plt.colorbar(sc, ax=ax, label="log(1+TMB)")
+
+fig.suptitle(
+    "Factor score scatter plots (coloured by log TMB)\n"
+    "Top active factors — consecutive pairs",
+    fontsize=12
+)
+plt.tight_layout()
+plt.show()
+```
+
+### 3. Implied vs observed covariance matrix
+
+The factor model implies a low-rank covariance Λ Λᵀ. Comparing it to the
+empirical sample covariance reveals how much of the observed correlation
+structure the model captures.
+
+```{python}
+# Implied covariance from factor loadings: Λ Λᵀ (full gene set)
+# implied_cov = lambda_est_rotated @ lambda_est_rotated.T
+implied_cov = est_cov
+
+# Empirical sample covariance (full gene set)
+# X_full_np = tmb_data_package["X_train"].numpy()
+# obs_cov   = np.cov(X_full_np, rowvar=False)
+# obs_cov = data_cov_norm
+obs_cov = tmb_data_package["X_train"].T @ tmb_data_package["X_train"] / tmb_data_package["X_train"].shape[0]
+
+# Convert both to correlation matrices for visual comparability
+def cov_to_corr(C):
+    d = np.sqrt(np.diag(C))
+    return C / np.outer(d + 1e-12, d + 1e-12)
+
+# implied_corr = implied_cov
+# obs_corr     = obs_cov
+
+diff_cov    = implied_cov - obs_cov
+```
+
+
+Covariances
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+
+kw = dict(cmap="coolwarm", center=0, #vmin=-1, vmax=1, 
+          xticklabels=False, yticklabels=False, square=True)
+
+sns.heatmap(obs_cov,     ax=axes[0], **kw)
+axes[0].set_title("Observed sample covariance")
+
+sns.heatmap(implied_cov, ax=axes[1], **kw)
+axes[1].set_title("Implied covariance from Λ Λᵀ")
+
+sns.heatmap(diff_cov,    ax=axes[2], **kw)
+axes[2].set_title("Difference: implied − observed")
+
+frob = np.linalg.norm(diff_cov, "fro") ** 2/ (diff_cov.shape[0] * diff_cov.shape[1])
+fig.suptitle(
+    f"Covariance recovery  |  Frobenius ‖implied − observed‖ / p_1 * p_2 = {frob:.4f}",
+    fontsize=13
+)
+plt.tight_layout()
+plt.show()
+```
+
+Correlations
+```{python}
+implied_corr = cov_to_corr(implied_cov)
+obs_corr     = cov_to_corr(obs_cov)
+diff_corr    = implied_corr - obs_corr
+
+fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+
+kw = dict(cmap="coolwarm", center=0, #vmin=-1, vmax=1, 
+          xticklabels=False, yticklabels=False, square=True)
+
+sns.heatmap(obs_corr,     ax=axes[0], **kw)
+axes[0].set_title("Observed sample correlation")
+
+sns.heatmap(implied_corr, ax=axes[1], **kw)
+axes[1].set_title("Implied correlation from Λ Λᵀ\n(varimax-rotated loadings)")
+
+sns.heatmap(diff_corr,    ax=axes[2], **kw)
+axes[2].set_title("Difference: implied − observed")
+
+frob = np.linalg.norm(diff_corr, "fro") ** 2 / (diff_corr.shape[0] * diff_corr.shape[1])
+fig.suptitle(
+    f"Covariance recovery  |  Frobenius ‖implied − observed‖ / p_1 * p_2 = {frob:.4f}",
+    fontsize=13
+)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+torch.round(implied_corr[0:10, 0:10], decimals = 2)
+```
+
+```{python}
+torch.round(obs_corr[0:10, 0:10], decimals = 2)
+```
+
+### 4. Top-gene annotation per factor
+
+For each of the top active factors, the genes with the highest absolute
+loadings are tabulated. This provides a first pass at biological
+interpretation (metagene membership).
+
+```{python}
+TOP_GENES_SHOW  = 10
+N_FACTORS_ANNOT = 8
+
+rows = []
+for f_idx in top_factors[:N_FACTORS_ANNOT]:
+    loading_vec = lambda_est_rotated[:, f_idx]
+    pct_var     = factor_var[f_idx] / factor_var.sum() * 100
+    sorted_idx  = np.argsort(np.abs(loading_vec))[::-1][:TOP_GENES_SHOW]
+    for rank, gene_i in enumerate(sorted_idx):
+        rows.append({
+            "Factor":  int(f_idx + 1),
+            "Pct_var": round(pct_var, 2),
+            "Rank":    rank + 1,
+            "Gene":    gene_names[gene_i],
+            "Loading": round(float(loading_vec[gene_i]), 4),
+        })
+
+top_genes_df = pd.DataFrame(rows)
+
+# Wide pivot: one column per factor, rows = rank
+wide = top_genes_df.pivot_table(
+    index="Rank", columns="Factor", values="Gene", aggfunc="first"
+)
+wide.columns = [
+    f"F{c} ({top_genes_df[top_genes_df.Factor == c]['Pct_var'].iloc[0]:.1f}%)"
+    for c in wide.columns
+]
+print("Top genes per factor (ranked by |loading|):\n")
+wide
+```
+
+```{python}
+# Waterfall bar chart for the single most active factor
+TOP_GENES_BAR = 20
+f_best        = top_factors[0]
+loading_vec   = lambda_est_rotated[:, f_best]
+
+top_bar_idx      = np.argsort(np.abs(loading_vec))[::-1][:TOP_GENES_BAR]
+top_bar_names    = np.array(gene_names)[top_bar_idx]
+top_bar_loadings = loading_vec[top_bar_idx]
+order            = np.argsort(top_bar_loadings)[::-1]   # sort by signed value
+
+fig, ax = plt.subplots(figsize=(10, 5))
+colors = ["#d73027" if v >= 0 else "#4575b4" for v in top_bar_loadings[order]]
+ax.bar(range(TOP_GENES_BAR), top_bar_loadings[order], color=colors)
+ax.set_xticks(range(TOP_GENES_BAR))
+ax.set_xticklabels(top_bar_names[order], rotation=60, ha="right", fontsize=9)
+ax.axhline(0, color="black", lw=0.8)
+ax.set_ylabel("Loading value")
+ax.set_title(
+    f"Top {TOP_GENES_BAR} genes — Factor {f_best+1} "
+    f"({factor_var[f_best]/factor_var.sum()*100:.1f}% var. explained)"
+)
+plt.tight_layout()
+plt.show()
+```
+
+### 5. Factor scores and TMB
+
+For each factor, we ask: do samples with high scores on that factor also tend
+to have higher (or lower) tumour mutational burden?
+
+**Part 1** compares the mean log(1+TMB) between the top-50 and bottom-50
+scoring samples per factor, across all active factors.
+
+**Part 2** shows the individual TMB values for all samples ranked by their
+score on each of the most active factors, revealing whether the
+score–outcome relationship is monotone or non-linear.
+
+```{python}
+# Factor scores and outcome for the training set
+# Z_scores and y_train_np were computed in §2
+TOP_BOT_N = 50   # samples per group
+
+n_factors_tmb = len(top_factors)   # use all factors; filter by significance in plot
+
+# ── Part 1: mean TMB — top-50 vs bottom-50 per factor ───────────────────────
+top_means, bot_means, diffs = [], [], []
+for f_idx in top_factors:
+    scores = Z_scores[:, f_idx]
+    ranked = np.argsort(scores)
+    top_mean = y_train_np[ranked[-TOP_BOT_N:]].mean()
+    bot_mean = y_train_np[ranked[:TOP_BOT_N]].mean()
+    top_means.append(top_mean)
+    bot_means.append(bot_mean)
+    diffs.append(top_mean - bot_mean)
+
+tmb_diff_df = pd.DataFrame({
+    "Factor":   [f"F{f+1}" for f in top_factors],
+    "Top 50":   top_means,
+    "Bottom 50": bot_means,
+    "Diff (top − bot)": diffs,
+})
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(18, 5))
+
+# Left: mean TMB per group, one pair of bars per factor
+tmb_long = tmb_diff_df.melt(
+    id_vars="Factor", value_vars=["Top 50", "Bottom 50"],
+    var_name="Group", value_name="Mean log(1+TMB)"
+)
+factor_order = tmb_diff_df["Factor"].tolist()
+sns.barplot(
+    data=tmb_long, x="Factor", y="Mean log(1+TMB)",
+    hue="Group", order=factor_order, ax=axes[0],
+    palette={"Top 50": "#d73027", "Bottom 50": "#4575b4"},
+)
+axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=60, ha="right", fontsize=7)
+axes[0].set_title(f"Mean log(1+TMB): top-{TOP_BOT_N} vs bottom-{TOP_BOT_N} samples per factor")
+axes[0].set_xlabel("")
+
+# Right: difference (top − bottom) sorted by magnitude
+diff_sorted = tmb_diff_df.sort_values("Diff (top − bot)")
+colors_diff = ["#d73027" if v >= 0 else "#4575b4" for v in diff_sorted["Diff (top − bot)"]]
+axes[1].barh(diff_sorted["Factor"], diff_sorted["Diff (top − bot)"], color=colors_diff)
+axes[1].axvline(0, color="black", lw=0.8)
+axes[1].set_xlabel("Mean log(1+TMB): top − bottom")
+axes[1].set_title("TMB difference by factor (top-50 minus bottom-50 scores)")
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Part 2: TMB along ranked scores — top active factors ────────────────────
+N_FACTORS_TMB_SHOW = 6
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+axes = axes.flatten()
+
+for plot_i, f_idx in enumerate(top_factors[:N_FACTORS_TMB_SHOW]):
+    ax     = axes[plot_i]
+    scores = Z_scores[:, f_idx]
+    order  = np.argsort(scores)   # ascending rank
+
+    ax.scatter(
+        np.arange(len(order)), y_train_np[order],
+        c=scores[order], cmap="coolwarm", s=14, alpha=0.7
+    )
+
+    # Smoothed trend via rolling mean
+    window = max(1, len(order) // 10)
+    smoothed = pd.Series(y_train_np[order]).rolling(window, center=True, min_periods=1).mean()
+    ax.plot(np.arange(len(order)), smoothed, color="black", lw=1.5, label=f"Rolling mean (w={window})")
+
+    pct_var = factor_var[f_idx] / factor_var.sum() * 100
+    ax.set_xlabel(f"Sample rank by Factor {f_idx+1} score")
+    ax.set_ylabel("log(1+TMB)")
+    ax.set_title(f"Factor {f_idx+1}  ({pct_var:.1f}% var.)\n(colour = score value)")
+    ax.legend(fontsize=7)
+
+fig.suptitle(
+    "TMB values along samples ranked by factor score\n"
+    "(top active factors; colour = score, black = rolling mean)",
+    fontsize=12
+)
+plt.tight_layout()
+plt.show()
+```
+
+### 6. WGCNA comparison
+
+Co-expression modules are inferred using
+[PyWGCNA](https://github.com/mortazavilab/PyWGCNA), a Python implementation
+of the WGCNA algorithm.  Install with `pip install PyWGCNA`.
+
+The module assignments are compared to the dominant-factor assignments from
+the MD model via a contingency table and Jaccard similarity.
+
+```{python}
+import anndata as ad
+import PyWGCNA
+```
+
+```{python}
+# Build an AnnData object: obs = samples, var = genes
+X_wgcna_np = tmb_data_package["X_train"].numpy()   # (n_samples, n_genes)
+
+adata_wgcna = ad.AnnData(
+    X   = X_wgcna_np.astype(np.float32),
+    obs = pd.DataFrame(index=[f"S{i}" for i in range(X_wgcna_np.shape[0])]),
+    var = pd.DataFrame(index=list(gene_names)),
+)
+```
+
+```{python}
+X_wgcna_np
+```
+
+```{python}
+pyWGCNA_obj = PyWGCNA.WGCNA(
+    name    = "KIRC_TMB",
+    species = "hsapiens",
+    anndata = adata_wgcna,
+    save    = False,
+)
+pyWGCNA_obj.preprocess()
+pyWGCNA_obj.findModules()
+```
+
+```{python}
+pyWGCNA_obj.geneExpr.to_df()
+```
+
+```{python}
+# Extract integer module labels per gene (0 = unassigned / grey)
+wgcna_modules_py = pyWGCNA_obj.datExpr.var["moduleLabels"].values.astype(int)
+gene_order       = pyWGCNA_obj.geneExpr.var.index.tolist()   # genes may have been filtered
+
+# Align module vector back to the full gene_names index
+module_series = pd.Series(wgcna_modules_py, index=gene_order)
+wgcna_labels  = module_series.reindex(list(gene_names), fill_value=0).values
+
+n_modules_py = len(set(wgcna_labels)) - (1 if 0 in wgcna_labels else 0)
+print(f"PyWGCNA found {n_modules_py} modules "
+      f"({(wgcna_labels == 0).sum()} unassigned genes).")
+```
+
+```{python}
+# ── Contingency table: WGCNA module × dominant MD factor ────────────────────
+# Determine which factor each gene has a highest magnitude loading for? Loadings = correlations, so which factor is the gene most correlated with
+dominant_md_factor = np.argmax(np.abs(lambda_est_rotated), axis=1)
+
+keep_factors      = set(top_factors[:N_FACTORS_ANNOT])
+dom_factor_capped = np.where(
+    np.isin(dominant_md_factor, list(keep_factors)),
+    dominant_md_factor, -1
+)
+
+factor_labels = sorted(keep_factors) + [-1]
+module_ids_py = sorted(np.unique(wgcna_labels))
+
+cont_rows = []
+for mod in module_ids_py:
+    mask_mod = wgcna_labels == mod
+    row = {f: int(np.sum(mask_mod & (dom_factor_capped == f))) for f in factor_labels}
+    cont_rows.append(row)
+
+cont_df_py = pd.DataFrame(cont_rows, index=[f"M{m}" for m in module_ids_py])
+cont_df_py.columns = [f"F{f+1}" if f >= 0 else "Other" for f in factor_labels]
+cont_norm_py = cont_df_py.div(cont_df_py.sum(axis=1), axis=0)
+
+fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(module_ids_py) * 0.45 + 2)))
+
+sns.heatmap(cont_df_py, ax=axes[0], cmap="YlOrRd", annot=True, fmt="d",
+            linewidths=0.3, cbar_kws={"label": "Gene count"})
+axes[0].set_title("WGCNA modules × dominant MD factor\n(gene counts)")
+axes[0].set_xlabel("MD factor")
+axes[0].set_ylabel("WGCNA module")
+
+sns.heatmap(cont_norm_py, ax=axes[1], cmap="YlOrRd", vmin=0, vmax=1,
+            annot=True, fmt=".2f", linewidths=0.3,
+            cbar_kws={"label": "Fraction of module genes"})
+axes[1].set_title("WGCNA modules × dominant MD factor\n(fraction of module)")
+axes[1].set_xlabel("MD factor")
+axes[1].set_ylabel("WGCNA module")
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Jaccard similarity: top-N MD factor gene set vs WGCNA module gene sets ───
+TOP_JACCARD = 50
+
+def jaccard(set_a, set_b):
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return inter / union if union > 0 else 0.0
+
+md_gene_sets = {
+    f_idx: set(np.argsort(np.abs(lambda_est_rotated[:, f_idx]))[::-1][:TOP_JACCARD])
+    for f_idx in top_factors[:N_FACTORS_ANNOT]
+}
+wgcna_gene_sets = {
+    mod: set(np.where(wgcna_labels == mod)[0]) for mod in module_ids_py
+}
+
+jac_rows = [
+    [jaccard(wgcna_gene_sets[mod], md_gene_sets[f]) for f in top_factors[:N_FACTORS_ANNOT]]
+    for mod in module_ids_py
+]
+jac_df = pd.DataFrame(
+    jac_rows,
+    index  =[f"M{m}" for m in module_ids_py],
+    columns=[f"F{f+1}" for f in top_factors[:N_FACTORS_ANNOT]],
+)
+
+fig, ax = plt.subplots(figsize=(N_FACTORS_ANNOT * 1.3 + 2,
+                                max(5, len(module_ids_py) * 0.45 + 2)))
+sns.heatmap(jac_df, ax=ax, cmap="YlOrRd", vmin=0, vmax=max(jac_df.values.max(), 0.01),
+            annot=True, fmt=".2f", linewidths=0.3,
+            cbar_kws={"label": "Jaccard similarity"})
+ax.set_title(
+    f"Jaccard similarity: WGCNA modules vs. top-{TOP_JACCARD} MD factor genes",
+    fontsize=12
+)
+ax.set_xlabel("MatrixDecomp factor")
+ax.set_ylabel("WGCNA module")
+plt.tight_layout()
+plt.show()
+```
+
+## Cross-validation for hyperparameter selection
+
+```{python}
+importlib.reload(sys.modules["run_methods"])
+from run_methods import make_cv_folds, train_eval_cv_fold, run_cv_grid
+```
+
+```{python}
+# ---------------------------------------------------------------------------
+# Train grid — AdagradRMSProp hyperparameters to search over
+# ---------------------------------------------------------------------------
+eta_cv_array       = [0.01, 0.1, 1.0]
+delta_cv_array     = [1e-16]
+t_cv_array         = [0.1, 1.0]
+particle_cv_array  = [2]
+minibatch_cv_array = [16, 32]
+min_epoch_cv_array = [200]
+max_epoch_cv_array = [500]
+
+cv_train_grid_names = (
+    "eta", "delta", "t",
+    "num_particles", "minibatch_size", "min_epochs", "max_epochs",
+)
+
+cv_train_grid = list(itertools.product(
+    eta_cv_array, delta_cv_array, t_cv_array,
+    particle_cv_array, minibatch_cv_array, min_epoch_cv_array, max_epoch_cv_array,
+))
+print(f"{len(cv_train_grid)} hyperparameter configurations")
+```
+
+```{python}
+# Fixed settings for this CV run
+cv_model_config = {"k": 30, "dense": False}
+
+N_CV_FOLDS             = 5
+CV_SEED                = 42
+N_CV_POSTERIOR_SAMPLES = 100
+```
+
+```{python}
+# make_cv_folds, train_eval_cv_fold, and run_cv_grid live in run_methods.py
+# so they can be used as multiprocessing worker targets (spawn requires the
+# worker to be importable from a module, not defined in a notebook).
+
+
+def select_best_config(cv_results, grid_names, metric="outcome_mse", lower_is_better=True):
+    """Identify best train_config from a CV results DataFrame.
+
+    Betas strings (serialised as str(tuple)) are converted back to tuples.
+
+    Returns
+    -------
+    best_config : dict compatible with train_model_single_view.
+    agg         : Series of per-config mean metric values.
+    """
+    agg      = cv_results.groupby("config_idx")[metric].mean()
+    best_idx = int(agg.idxmin() if lower_is_better else agg.idxmax())
+    best_row = cv_results[cv_results["config_idx"] == best_idx].iloc[0]
+
+    best_config = {}
+    for k in grid_names:
+        v = best_row[k]
+        if isinstance(v, (np.integer,)):
+            v = int(v)
+        elif isinstance(v, (np.floating,)):
+            v = float(v)
+        best_config[k] = v
+    return best_config, agg
+```
+
+```{python}
+# Prepare raw training data for CV.
+# The col_filter is derived from the full training set (not per-fold); applying it
+# before folding is standard practice and does not leak per-fold label information.
+X_full_raw = torch.tensor(genes.values, dtype=torch.float32)
+y_full_raw = torch.tensor(tmb, dtype=torch.float32)
+
+X_cv_raw = X_full_raw[:, tmb_data_package["col_filter"]] #[tmb_data_package["train_idx"], :]
+y_cv_raw = y_full_raw#[tmb_data_package["train_idx"]]
+
+print(f"CV data: {X_cv_raw.shape[0]} observations x {X_cv_raw.shape[1]} features")
+print(f"Grid size: {len(cv_train_grid)} configs x {N_CV_FOLDS} folds = "
+      f"{len(cv_train_grid) * N_CV_FOLDS} model fits")
+```
+
+```{python}
+# Run cross-validation.
+# n_workers=1  → sequential, one fold at a time (safe everywhere, good for debugging)
+# n_workers=N_CV_FOLDS → one process per fold via torch.multiprocessing spawn
+# Tip: reduce cv_train_grid or N_CV_FOLDS for a quick trial run.
+N_CV_WORKERS = N_CV_FOLDS #1  # change to N_CV_FOLDS to run folds in parallel
+
+cv_results = run_cv_grid(
+    X_cv_raw, y_cv_raw,
+    model_config=cv_model_config,
+    train_grid=cv_train_grid,
+    train_grid_names=cv_train_grid_names,
+    n_folds=N_CV_FOLDS,
+    seed=CV_SEED,
+    n_posterior_samples=N_CV_POSTERIOR_SAMPLES,
+    opt="adagrad",
+    n_workers=N_CV_WORKERS,
+)
+```
+
+```{python}
+cv_results
+```
+
+```{python}
+# Summarise: mean outcome MSE and coverage per config, sorted best first
+cv_summary = (
+    cv_results
+    .groupby("config_idx")[["outcome_mse", "outcome_95p_cov", "structure_rse", "epochs"]]
+    .mean()
+    .sort_values("outcome_mse")
+)
+cv_summary.head(10)
+```
+
+```{python}
+# Select and display best configuration
+best_train_config, config_mse_agg = select_best_config(
+    cv_results, cv_train_grid_names, metric="outcome_mse"
+)
+print("Best optimizer config (lowest mean CV outcome MSE):")
+for k, v in best_train_config.items():
+    print(f"  {k}: {v}")
+print(f"\nMean CV outcome MSE: {config_mse_agg.min():.4f}")
+```
+
+```{python}
+# Visualise outcome MSE for top configs
+top_n = 10
+top_config_ids = cv_summary.head(top_n).index.tolist()
+top_cv = cv_results[cv_results["config_idx"].isin(top_config_ids)].copy()
+top_cv["config_label"] = (
+    "lr="    + top_cv["initial_lr"].astype(str)
+    + " step=" + top_cv["lr_step_size"].astype(str)
+    + " dec="  + top_cv["lr_decay_factor"].astype(str)
+    + " bs="   + top_cv["minibatch_size"].astype(str)
+)
+label_order = (
+    top_cv.groupby("config_label")["outcome_mse"].mean().sort_values().index.tolist()
+)
+
+p = sns.boxplot(
+    data=top_cv,
+    x="outcome_mse",
+    y="config_label",
+    order=label_order,
+)
+p.set_title(f"CV outcome MSE — top {top_n} configs")
+p.set_xlabel("Outcome MSE (standardised y)")
+p.set_ylabel("")
+```
+
+```{python}
+# Save CV results
+from datetime import datetime
+dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+cv_results.to_csv(f"./results/matrixdecomp/tcga/cv_results_{dt}.csv", index=False)
+print("CV results saved.")
