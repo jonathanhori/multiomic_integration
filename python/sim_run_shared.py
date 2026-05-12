@@ -40,19 +40,19 @@ from constants import Sites
 # ---------------------------------------------------------------------------
 # Data paths  (edit K to match the simulation design)
 # ---------------------------------------------------------------------------
-K = 9
-train_sim_data_path = f"~/multiomic_integration/sim/data_ortho/k.{K}/train/"
-test_sim_data_path  = f"~/multiomic_integration/sim/data_ortho/k.{K}/test/"
+K = 5
+train_sim_data_path = f"~/multiomic_integration/sim/data/multi_view_shared/k.{K}/train/"
+test_sim_data_path  = f"~/multiomic_integration/sim/data/multi_view_shared/k.{K}/test/"
 
 # ---------------------------------------------------------------------------
 # Simulation grid
 # ---------------------------------------------------------------------------
-n_array              = (50, 100, 500)
+n_array              = (100, 500)
 p_array              = (50, 100, 1000)
 snr_x_array          = [2]
 snr_y_array          = [2]
 reps                 = 10
-loading_sparsity     = [0, 0.25, 0.5]
+loading_sparsity     = [0.25]
 k_deltas             = [0, 10]       # over-specification of k at inference time
 
 sim_grid = itertools.product(
@@ -64,16 +64,16 @@ sim_grid = itertools.product(
 # ---------------------------------------------------------------------------
 N_POSTERIOR_SAMPLES = 500
 MINIBATCH_SIZE      = 32
-MINIBATCH_SIZE_LOW  = 16
-MIN_EPOCHS          = 100
-MIN_EPOCHS_HIGH     = 500   # for n=50
-MIN_EPOCHS_LOCAL    = 100
+# MINIBATCH_SIZE_LOW  = 16
+MIN_EPOCHS          = 200
+# MIN_EPOCHS_HIGH     = 500   # for n=50
+MIN_EPOCHS_LOCAL    = 200
 NUM_EPOCHS          = 1000
 
 # AdagradRMSProp defaults (match single-view model)
-ETA   = 0.1
-DELTA = 1e-7
-T     = 0.1
+ETA   = 0.5
+DELTA = 1e-16
+T     = 1.0
 
 TRAINING_SPLIT = False
 TRAINING_SIZE  = 0.8
@@ -158,8 +158,8 @@ if __name__ == "__main__":
                 "delta":         DELTA,
                 "t":             T,
                 "num_particles": 1,
-                "minibatch_size": MINIBATCH_SIZE_LOW if n == 50 else MINIBATCH_SIZE,
-                "min_epochs":    MIN_EPOCHS_HIGH    if n == 50 else MIN_EPOCHS,
+                "minibatch_size": MINIBATCH_SIZE, #MINIBATCH_SIZE_LOW if n == 50 else MINIBATCH_SIZE,
+                "min_epochs":    MIN_EPOCHS, #MIN_EPOCHS_HIGH    if n == 50 else MIN_EPOCHS,
                 "max_epochs":    NUM_EPOCHS,
             }
 
@@ -186,17 +186,20 @@ if __name__ == "__main__":
                     metric_out_path,
                     metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, rep))
 
-                eval_table = evaluate_fitted_model_shared(
+                eval_table, cov_table = evaluate_fitted_model_shared(
                     rep_config, data_package,
                     train_handler, test_handler,
                     global_state, local_state,
                     N_POSTERIOR_SAMPLES, metric_out_filename,
                 )
                 eval_table.to_csv(metric_out_filename + ".csv")
+                if cov_table is not None:
+                    cov_table.to_csv(metric_out_filename + "_cov.csv")
                 metric_list.append(eval_table)
                 print(f"  rep {rep}: done. "
                       f"epochs={factor_model.total_epochs}  "
-                      f"outcome_mse={eval_table['outcome_mse'].iloc[0]:.4f}")
+                      f"outcome_mse={eval_table['outcome_mse'].iloc[0]:.4f}  "
+                      f"mean_test_rse={eval_table['test_rse'].mean():.4f}")
 
             except Exception as e:
                 print(f"  rep {rep}: FAILED — {e}")
