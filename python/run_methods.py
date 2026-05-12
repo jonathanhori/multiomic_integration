@@ -15,7 +15,7 @@ from data_utils import (
     extract_sim_decomp_single_view, calc_all_structures_with_rescaling_single_view,
     eval_performance_single_view, calc_cov, scale_sim_cov, summarise_post_samples,
     extract_sim_decomp_shared, calc_all_structures_with_rescaling_shared,
-    eval_performance_shared,
+    eval_performance_shared, eval_cov_shared, eval_rse,
 )
 from handler import ModelHandler
 from model import SupMultiviewDecomp
@@ -1085,23 +1085,190 @@ def evaluate_fitted_model_shared(rep_config, data_package,
     train_SIM_decomp         = data_package["train_SIM_decomp"]
     L                        = data_package["L"]
 
-    sites        = [Sites.joint_structure_l.format(l=l) for l in range(L)]
+    sites = (
+        [Sites.joint_structure_l.format(l=l) for l in range(L)]
+        + [Sites.Lambda_l.format(l=l) for l in range(L)]
+    )
     outcome_sites = [Sites.y_pred]
-    post_samples   = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
-    post_samples_y = test_handler.predict(test_X_l_list_clean,  N_POSTERIOR_SAMPLES, outcome_sites)
+    test_struct_sites = [Sites.joint_structure_l_pred.format(l=l) for l in range(L)]
+    post_samples        = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
+    post_samples_y      = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES, outcome_sites)
+    post_samples_struct = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES, test_struct_sites)
 
     eval_structures = calc_all_structures_with_rescaling_shared(
         L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,
-        post_samples, post_samples_y, train_SIM_decomp, test_y_clean.squeeze()
+        post_samples, post_samples_y, train_SIM_decomp, test_y_clean.squeeze(),
+        post_loading_samples=post_samples,
     )
 
-    eval_metric_table = eval_performance_shared(**eval_structures)
-    eval_metric_table = eval_metric_table.assign(
-        n=rep_config["n"],       p=rep_config["p_l"],
+    # Per-view RSE of test data reconstruction (Z_test @ Lambda_l^T vs X_l_test)
+    test_rse = [
+        eval_rse(
+            post_samples_struct[Sites.joint_structure_l_pred.format(l=l)].mean(dim=0),
+            test_X_l_list_clean[l],
+        ).item()
+        for l in range(L)
+    ]
+
+    condition_cols = dict(
+        n=rep_config["n"],         p=rep_config["p_l"],
         snr_x=rep_config["snr_x"], snr_y=rep_config["snr_y"],
-        rep=rep_config["rep"],   sparsity=rep_config["sparsity"],
+        rep=rep_config["rep"],     sparsity=rep_config["sparsity"],
         k_delta=rep_config["k_delta"],
         runtime=global_train_state["inference_time"],
         predict_runtime=local_train_state["inference_time"],
     )
-    return eval_metric_table
+
+    # Performance table (structure RSE, coverage, outcome MSE, test reconstruction RSE)
+    perf_keys = {k: v for k, v in eval_structures.items()
+                 if k not in ("est_cov", "sim_cov")}
+    eval_metric_table = (
+        eval_performance_shared(**perf_keys)
+        .assign(test_rse=test_rse)
+        .assign(**condition_cols)
+    )
+
+    # Covariance table (within- and cross-view Frobenius error)
+    cov_metric_table = None
+    if "est_cov" in eval_structures:
+        cov_metric_table = eval_cov_shared(
+            eval_structures["est_cov"], eval_structures["sim_cov"], L
+        ).assign(**condition_cols)
+
+    return eval_metric_table, cov_metric_table
+
+
+##############################################################################
+# Cross-validation helpers — SupMultiviewShared
+##############################################################################
+
+def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
+                               model_config, train_config,
+                               n_posterior_samples=100, opt="adagrad", verbose=False):
+    """Train SupMultiviewShared on one CV fold and evaluate on the held-out fold.
+
+    Normalises each view independently using training-fold statistics only.
+    No files are written; param store is cleared at the start of each call.
+
+    Parameters
+    ----------
+    X_l_raw_list : list of (n, p_l) float tensors
+        Pre-filtered (zero-variance columns removed) but NOT normalised.
+    y_raw : (n,) float tensor
+
+    Returns
+    -------
+    dict with keys: outcome_mse, epochs, local_epochs
+    """
+    X_l_tr_raw = [X[train_idx] for X in X_l_raw_list]
+    X_l_va_raw = [X[val_idx]   for X in X_l_raw_list]
+    y_tr_raw   = y_raw[train_idx]
+    y_va_raw   = y_raw[val_idx]
+
+    train_norms = [normalize_tensor_by_col(X) for X in X_l_tr_raw]
+    X_l_tr   = [d["data_clean"] for d in train_norms]
+    X_l_mean = [d["means"]      for d in train_norms]
+    X_l_sd   = [d["sds"]        for d in train_norms]
+
+    val_norms = [normalize_tensor_by_col(X, m, s)
+                 for X, m, s in zip(X_l_va_raw, X_l_mean, X_l_sd)]
+    X_l_va = [d["data_clean"] for d in val_norms]
+
+    y_mean = torch.mean(y_tr_raw)
+    y_std  = torch.std(y_tr_raw)
+    y_tr   = ((y_tr_raw - y_mean) / y_std).squeeze()
+    y_va   = ((y_va_raw - y_mean) / y_std).squeeze()
+
+    train_ds = TensorDataset(torch.arange(len(train_idx)), *X_l_tr, y_tr)
+    val_ds   = TensorDataset(torch.arange(len(val_idx)),   *X_l_va, y_va)
+
+    pyro.clear_param_store()
+
+    factor_model, train_handler, _ = train_model_shared(
+        model_config, train_config, train_ds,
+        model_out_filename="", opt=opt, verbose=verbose, write=False,
+    )
+    factor_model, val_handler, _ = train_model_locally_shared(
+        factor_model, train_config, val_ds, opt=opt, verbose=verbose,
+    )
+
+    post_val     = val_handler.predict(X_l_va, n_posterior_samples, [Sites.y_pred])
+    pred_mean    = summarise_post_samples(post_val[Sites.y_pred])["mean"]
+    outcome_mse  = float(torch.mean((pred_mean - y_va) ** 2).item())
+
+    return {
+        "outcome_mse":  outcome_mse,
+        "epochs":       factor_model.total_epochs,
+        "local_epochs": factor_model.local_epochs,
+    }
+
+
+def _fold_worker_shared(args):
+    """Single-argument entry point for multiprocessing.Pool.map (shared model)."""
+    try:
+        return train_eval_cv_fold_shared(*args)
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+
+def run_cv_grid_shared(X_l_raw_list, y_raw, model_config, train_grid, train_grid_names,
+                       n_folds=5, seed=123, n_posterior_samples=100,
+                       opt="adagrad", n_workers=1, verbose=False):
+    """Run k-fold CV over all configs in train_grid for SupMultiviewShared.
+
+    Parameters
+    ----------
+    X_l_raw_list : list of (n, p_l) float tensors
+        Pre-filtered but NOT normalised, one tensor per view.
+    y_raw : (n,) float tensor
+    n_workers : int
+        1 = sequential; >1 = parallel via joblib/loky (n_workers folds at once).
+
+    Returns
+    -------
+    pd.DataFrame with columns: config_idx, fold, outcome_mse, epochs,
+    local_epochs, and one column per train_grid_names entry.
+    """
+    import pandas as pd
+
+    n     = X_l_raw_list[0].shape[0]
+    folds = make_cv_folds(n, n_folds=n_folds, seed=seed)
+    rows  = []
+
+    for i, train_params in enumerate(train_grid):
+        train_config = dict(zip(train_grid_names, train_params))
+        config_str = (f"eta={train_config.get('eta')}  "
+                      f"delta={train_config.get('delta')}  "
+                      f"t={train_config.get('t')}  "
+                      f"bs={train_config.get('minibatch_size')}")
+        print(f"[{i+1}/{len(train_grid)}] {config_str}", flush=True)
+
+        fold_args = [
+            (X_l_raw_list, y_raw, tr_idx, va_idx, model_config, train_config,
+             n_posterior_samples, opt, verbose)
+            for tr_idx, va_idx in folds
+        ]
+
+        if n_workers == 1:
+            fold_results = [_fold_worker_shared(a) for a in fold_args]
+        else:
+            from joblib import Parallel, delayed
+            fold_results = Parallel(n_jobs=n_workers, backend="loky")(
+                delayed(_fold_worker_shared)(a) for a in fold_args
+            )
+
+        for fold_idx, m in enumerate(fold_results):
+            if m is None:
+                continue
+            if "_error" in m:
+                print(f"  fold {fold_idx} FAILED: {m['_error']}")
+                continue
+            row = {"config_idx": i, "fold": fold_idx, **m}
+            row.update({
+                k: str(v) if isinstance(v, tuple) else v
+                for k, v in train_config.items()
+            })
+            rows.append(row)
+            print(f"  fold {fold_idx}  outcome_mse={m['outcome_mse']:.4f}", flush=True)
+
+    return pd.DataFrame(rows)
