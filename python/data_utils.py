@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from constants import Sites
+
 ######## 
 # Utilities for converting data from R
 def floatmatrix_to_torch(m):
@@ -399,9 +401,16 @@ def calc_all_structures_with_rescaling_shared(
     post_pred_structure_samples,
     post_pred_outcome_samples,
     sim_decomp,
-    sim_outcome
+    sim_outcome,
+    post_loading_samples=None,
 ):
-    """Shared-structure analogue of calc_all_structures_with_rescaling. Joint structure only."""
+    """Shared-structure analogue of calc_all_structures_with_rescaling.
+
+    If post_loading_samples is provided (a dict that includes Lambda_l{l} keys),
+    also computes within-view and cross-view covariance matrices for both the
+    posterior mean estimate and the rescaled simulation truth, and includes them
+    in the returned dict under 'est_cov' and 'sim_cov'.
+    """
     SIM_joint_struct_l_list = list(map(calc_struct,
         [sim_decomp["SIM_Z"]] * L, sim_decomp["SIM_Lambda_l_list"]))
     SIM_joint_struct_l_list = [s[:, f] for s, f in zip(SIM_joint_struct_l_list, column_filters)]
@@ -413,7 +422,7 @@ def calc_all_structures_with_rescaling_shared(
 
     PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples["y_pred"])
 
-    return {
+    result = {
         "sim_joint_data_struct": SIM_joint_struct_l_list_rescaled,
         "post_pred_joint_data_struct": POST_joint_struct_l_list,
         "post_pred_joint_summaries": joint_structure_summaries,
@@ -421,6 +430,33 @@ def calc_all_structures_with_rescaling_shared(
         "post_pred_outcome": PRED_outcome_summary["mean"],
         "post_pred_outcome_summaries": PRED_outcome_summary,
     }
+
+    if post_loading_samples is not None:
+        # Posterior mean loading matrix (p_l x k) for each view
+        est_Lambda_list = [
+            post_loading_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze()
+            for l in range(L)
+        ]
+        # Simulated loadings filtered to the training feature subset
+        sim_Lambda_list = [
+            sim_decomp["SIM_Lambda_l_list"][l][column_filters[l]]
+            for l in range(L)
+        ]
+
+        est_cov = {}
+        sim_cov = {}
+        for l in range(L):
+            for m in range(l, L):
+                loading2_est = est_Lambda_list[m] if l != m else None
+                loading2_sim = sim_Lambda_list[m] if l != m else None
+                est_cov[(l, m)] = calc_cov(est_Lambda_list[l], loading2_est)
+                raw_cov = calc_cov(sim_Lambda_list[l], loading2_sim)
+                sim_cov[(l, m)] = scale_sim_cov(raw_cov, X_l_sd_list[l], X_l_sd_list[m])
+
+        result["est_cov"] = est_cov
+        result["sim_cov"] = sim_cov
+
+    return result
 
 
 def eval_performance_shared(
@@ -450,6 +486,34 @@ def eval_performance_shared(
         "outcome_mse": outcome_mse,
         "outcome_95p_coverage": outcome_coverage,
     })
+
+
+def eval_cov_shared(est_cov, sim_cov, L):
+    """Evaluate within-view and cross-view covariance reconstruction.
+
+    Uses eval_cov (normalised squared Frobenius norm) for every (l, m) pair
+    with l <= m, reusing the same helper as the single-view model.
+
+    Parameters
+    ----------
+    est_cov, sim_cov : dict mapping (l, m) -> tensor
+        As produced by calc_all_structures_with_rescaling_shared when
+        post_loading_samples is provided.
+
+    Returns
+    -------
+    DataFrame with columns: view_l, view_m, cov_type ('within'/'cross'), cov_frob
+    """
+    rows = []
+    for l in range(L):
+        for m in range(l, L):
+            rows.append({
+                "view_l":   l,
+                "view_m":   m,
+                "cov_type": "within" if l == m else "cross",
+                "cov_frob": eval_cov(est_cov[(l, m)], sim_cov[(l, m)]).item(),
+            })
+    return pd.DataFrame(rows)
 
 
 def extract_sim_decomp_single_view(sim_data_torch):
