@@ -11,3 +11,7 @@ sim/results/*
 *_old*
 .DS_Store
 **/.DS_Store
+**/.txt
+*.txt
+data
+*.pth
