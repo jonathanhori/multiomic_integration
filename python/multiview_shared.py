@@ -290,7 +290,8 @@ class SupMultiviewShared(PyroModule):
 
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
-                                        torch.tensor(self.init_param).expand([p_l, self.k]),
+                                        torch.ones(p_l, self.k),
+                                        # torch.tensor(self.init_param).expand([p_l, self.k]),
                                         constraint=dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -333,7 +334,8 @@ class SupMultiviewShared(PyroModule):
                                    torch.tensor(self.inv_gamma_init_param),
                                    constraint=dist.constraints.positive)
             b_sigma_y = pyro.param(Params.b_sigma_y,
-                                   torch.tensor(self.init_param),
+                                   torch.tensor(0.5),
+                                #    torch.tensor(self.init_param),
                                    constraint=dist.constraints.positive)
             pyro.sample(Sites.sigma2_y,
                         dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
@@ -343,7 +345,8 @@ class SupMultiviewShared(PyroModule):
         # Local scores Z
         loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
         scale_Z = pyro.param(Params.scale_Z,
-                             torch.tensor(self.init_param).expand([self.n, self.k]),
+                             torch.ones(self.n, self.k),
+                            #  torch.tensor(self.init_param).expand([self.n, self.k]),
                              constraint=dist.constraints.positive)
 
         with pyro.plate("obs", self.n, subsample=batch_idx):
@@ -374,7 +377,8 @@ class SupMultiviewShared(PyroModule):
 
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
-                                        torch.tensor(self.init_param).expand([p_l, self.k]),
+                                        torch.ones(p_l, self.k),
+                                        # torch.tensor(self.init_param).expand([p_l, self.k]),
                                         constraint=dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -417,7 +421,8 @@ class SupMultiviewShared(PyroModule):
                                    torch.tensor(self.inv_gamma_init_param),
                                    constraint=dist.constraints.positive)
             b_sigma_y = pyro.param(Params.b_sigma_y,
-                                   torch.tensor(self.init_param),
+                                   torch.tensor(0.5),
+                                #    torch.tensor(self.init_param),
                                    constraint=dist.constraints.positive)
             pyro.sample(Sites.sigma2_y,
                         dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
@@ -427,7 +432,8 @@ class SupMultiviewShared(PyroModule):
         # Local scores Z
         loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
         scale_Z = pyro.param(Params.scale_Z,
-                             torch.tensor(self.init_param).expand([self.n, self.k]),
+                             torch.ones(self.n, self.k),
+                            #  torch.tensor(self.init_param).expand([self.n, self.k]),
                              constraint=dist.constraints.positive)
 
         with pyro.plate("obs", self.n, subsample=batch_idx):
