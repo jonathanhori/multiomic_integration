@@ -89,6 +89,20 @@ def load_and_process_rds_data_for_condition(
     return files
 
 
+def load_rds_rep(directory_name, directory_path, filename_dict, rep_stem):
+    """Load a single replicate RDS file by its stem name (filename without extension)."""
+    conversion._converter = None
+    conversion.set_conversion(default_converter)
+    readRDS = robjects.r['readRDS']
+
+    all_files = filename_dict.get(directory_name, [])
+    match = next((f for f in all_files if Path(f).stem == rep_stem), None)
+    if match is None:
+        raise FileNotFoundError(f"No file with stem '{rep_stem}' in {directory_name}")
+    filepath = os.path.expanduser(os.path.join(directory_path, directory_name, match))
+    return r_to_torch(readRDS(filepath))
+
+
 ##########
 # Input data processing
 def normalize_tensor_by_col(data, training_means = None, training_stds = None):
@@ -417,15 +431,18 @@ def calc_all_structures_with_rescaling_shared(
     SIM_joint_struct_l_list_rescaled = scale_sim_struct(
         SIM_joint_struct_l_list, X_l_mean_list, X_l_sd_list)
 
-    joint_structure_summaries = summarise_structure_list(post_pred_structure_samples, L, "joint")
-    POST_joint_struct_l_list = [s["mean"] for s in joint_structure_summaries]
+    mean_Z = post_pred_structure_samples[Sites.Z].mean(dim=0).squeeze()
+    POST_joint_struct_l_list = [
+        mean_Z @ post_pred_structure_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze().mT
+        for l in range(L)
+    ]
 
     PRED_outcome_summary = summarise_post_samples(post_pred_outcome_samples["y_pred"])
 
     result = {
         "sim_joint_data_struct": SIM_joint_struct_l_list_rescaled,
         "post_pred_joint_data_struct": POST_joint_struct_l_list,
-        "post_pred_joint_summaries": joint_structure_summaries,
+        "post_pred_joint_summaries": None,
         "sim_outcome": sim_outcome,
         "post_pred_outcome": PRED_outcome_summary["mean"],
         "post_pred_outcome_summaries": PRED_outcome_summary,
@@ -470,8 +487,6 @@ def eval_performance_shared(
     """Shared-structure analogue of eval_performance. Joint structure + outcome only."""
     joint_rse = [eval_rse(est, sim).detach().item()
                  for est, sim in zip(post_pred_joint_data_struct, sim_joint_data_struct)]
-    joint_coverage = eval_credible_interval(
-        sim_joint_data_struct, post_pred_joint_summaries, "95")
     outcome_mse = eval_mse(post_pred_outcome, sim_outcome).item()
     outcome_coverage = eval_post_coverage(
         sim_outcome,
@@ -482,7 +497,7 @@ def eval_performance_shared(
     return pd.DataFrame({
         "view": range(len(joint_rse)),
         "joint_rse": joint_rse,
-        "joint_95p_coverage": joint_coverage,
+        "joint_95p_coverage": float("nan"),
         "outcome_mse": outcome_mse,
         "outcome_95p_coverage": outcome_coverage,
     })
