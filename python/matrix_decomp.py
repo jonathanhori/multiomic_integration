@@ -543,8 +543,10 @@ class MatrixDecomp(PyroModule):
         Lambda = pyro.sample(Sites.Lambda_l.format(l=l),
                              dist.Normal(loc_Lambda, scale_Lambda).to_event(2)).squeeze()
 
-        a_psi = self.params[Params.a_psi_l.format(l=l)]
-        b_psi = self.params[Params.b_psi_l.format(l=l)]
+        a_psi = torch.nan_to_num(self.params[Params.a_psi_l.format(l=l)], 
+                                 nan=self.a_psi, posinf=1e6, neginf=1e-6)
+        b_psi = torch.nan_to_num(self.params[Params.b_psi_l.format(l=l)], 
+                                 nan=self.a_psi, posinf=1e6, neginf=1e-6)
         psi = pyro.sample(Sites.psi_l.format(l=l),
                           dist.InverseGamma(a_psi, b_psi).expand([self.p]).to_event(1))
         psi_sqrt = torch.sqrt(psi)
@@ -608,8 +610,10 @@ class MatrixDecomp(PyroModule):
         pyro.sample(Sites.Lambda_l.format(l=l),
                     dist.Normal(loc_Lambda, scale_Lambda).to_event(2))
 
-        a_psi = self.params[Params.a_psi_l.format(l=l)]
-        b_psi = self.params[Params.b_psi_l.format(l=l)]
+        a_psi = torch.nan_to_num(self.params[Params.a_psi_l.format(l=l)], 
+                                 nan=self.a_psi, posinf=1e6, neginf=1e-6)
+        b_psi = torch.nan_to_num(self.params[Params.b_psi_l.format(l=l)], 
+                                 nan=self.a_psi, posinf=1e6, neginf=1e-6)
         pyro.sample(Sites.psi_l.format(l=l),
                     dist.InverseGamma(a_psi, b_psi).to_event(1))
 
