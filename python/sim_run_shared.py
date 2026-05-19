@@ -21,21 +21,18 @@ from rpy2 import rinterface
 
 import torch
 import pyro
-from pyro.optim import ClippedAdam
-from pyro.infer import Trace_ELBO
-
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
-from data_utils import load_and_process_rds_data_for_condition
+from data_utils import load_rds_rep
 from run_methods import (
     process_data_shared,
+    load_model_shared,
     train_model_shared,
     train_model_locally_shared,
     evaluate_fitted_model_shared,
 )
-from constants import Sites
 
 # ---------------------------------------------------------------------------
 # Data paths  (edit K to match the simulation design)
@@ -47,8 +44,8 @@ test_sim_data_path  = f"~/multiomic_integration/sim/data/multi_view_shared/k.{K}
 # ---------------------------------------------------------------------------
 # Simulation grid
 # ---------------------------------------------------------------------------
-n_array              = (100, 500)
-p_array              = (50, 100, 1000)
+n_array              = (100, 500, 1000, 5000)
+p_array              = (50, 100, 1000, 5000)
 snr_x_array          = [2]
 snr_y_array          = [2]
 reps                 = 10
@@ -62,7 +59,7 @@ sim_grid = itertools.product(
 # ---------------------------------------------------------------------------
 # Training hyperparameters
 # ---------------------------------------------------------------------------
-N_POSTERIOR_SAMPLES = 500
+N_POSTERIOR_SAMPLES = 200
 MINIBATCH_SIZE      = 32
 # MINIBATCH_SIZE_LOW  = 16
 MIN_EPOCHS          = 200
@@ -118,29 +115,29 @@ if __name__ == "__main__":
         cond_str = file_dir_base.format(n, p, snr_x, snr_y, sparsity)
         print(f"\n=== Condition: {cond_str}  k_delta={k_delta} ===")
 
-        # Skip if all reps already done
-        check_filename = os.path.join(
-            model_out_path,
-            model_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, reps))
-        if os.path.isfile(check_filename + ".pth"):
+        # Skip if all reps already have metrics
+        check_metric = os.path.join(
+            metric_out_path,
+            metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, reps))
+        if os.path.isfile(check_metric + ".csv"):
             print("All reps done, skipping.")
             continue
-
-        files_for_condition = load_and_process_rds_data_for_condition(
-            cond_str, train_sim_data_path, filename_dict, reps)
-        test_files_for_condition = load_and_process_rds_data_for_condition(
-            cond_str, test_sim_data_path, test_filename_dict, reps)
 
         for rep in range(1, reps + 1):
             model_out_filename = os.path.join(
                 model_out_path,
                 model_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, rep))
-            if os.path.isfile(model_out_filename + ".pth"):
-                print(f"  rep {rep}: already trained, skipping.")
+            metric_out_filename = os.path.join(
+                metric_out_path,
+                metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, rep))
+
+            if os.path.isfile(metric_out_filename + ".csv"):
+                print(f"  rep {rep}: metrics already computed, skipping.")
                 continue
 
-            sim_data      = files_for_condition.get(file_name_base.format(rep))
-            sim_data_test = test_files_for_condition.get(file_name_base.format(rep))
+            rep_stem      = file_name_base.format(rep)
+            sim_data      = load_rds_rep(cond_str, train_sim_data_path, filename_dict,      rep_stem)
+            sim_data_test = load_rds_rep(cond_str, test_sim_data_path,  test_filename_dict, rep_stem)
 
             # ------- data prep -------
             train_subset, test_subset, data_package = process_data_shared(
@@ -158,18 +155,25 @@ if __name__ == "__main__":
                 "delta":         DELTA,
                 "t":             T,
                 "num_particles": 1,
-                "minibatch_size": MINIBATCH_SIZE, #MINIBATCH_SIZE_LOW if n == 50 else MINIBATCH_SIZE,
-                "min_epochs":    MIN_EPOCHS, #MIN_EPOCHS_HIGH    if n == 50 else MIN_EPOCHS,
+                "minibatch_size": MINIBATCH_SIZE,
+                "min_epochs":    MIN_EPOCHS,
                 "max_epochs":    NUM_EPOCHS,
             }
 
             try:
-                # ------- global training -------
-                pyro.clear_param_store()
-                factor_model, train_handler, global_state = train_model_shared(
-                    model_config, train_config, train_subset,
-                    model_out_filename, opt="adagrad", verbose=False, write=True,
-                )
+                if os.path.isfile(model_out_filename + ".pth"):
+                    # Model already trained — restore param store and skip to eval
+                    print(f"  rep {rep}: model found, re-running evaluation.")
+                    factor_model, train_handler, global_state = load_model_shared(
+                        model_out_filename, model_config, len(train_subset), train_config,
+                    )
+                else:
+                    # ------- global training -------
+                    pyro.clear_param_store()
+                    factor_model, train_handler, global_state = train_model_shared(
+                        model_config, train_config, train_subset,
+                        model_out_filename, opt="adagrad", verbose=False, write=True,
+                    )
 
                 # ------- local inference on test set -------
                 local_config = {**train_config, "min_epochs": MIN_EPOCHS_LOCAL}
@@ -182,9 +186,6 @@ if __name__ == "__main__":
                     "n": n, "p_l": p, "snr_x": snr_x, "snr_y": snr_y,
                     "rep": rep, "sparsity": sparsity, "k_delta": k_delta,
                 }
-                metric_out_filename = os.path.join(
-                    metric_out_path,
-                    metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, rep))
 
                 eval_table, cov_table = evaluate_fitted_model_shared(
                     rep_config, data_package,
@@ -197,7 +198,6 @@ if __name__ == "__main__":
                     cov_table.to_csv(metric_out_filename + "_cov.csv")
                 metric_list.append(eval_table)
                 print(f"  rep {rep}: done. "
-                      f"epochs={factor_model.total_epochs}  "
                       f"outcome_mse={eval_table['outcome_mse'].iloc[0]:.4f}  "
                       f"mean_test_rse={eval_table['test_rse'].mean():.4f}")
 

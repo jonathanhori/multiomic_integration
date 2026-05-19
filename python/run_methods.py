@@ -945,6 +945,44 @@ def process_data_shared(sim_data, sim_data_test, training_split, training_size, 
     }
 
 
+def load_model_shared(model_out_filename, model_config, n_train, train_config, opt="adagrad"):
+    """Restore a saved SupMultiviewShared for prediction without retraining.
+
+    Sets the two instance attributes that are not persisted to disk but are
+    required before any forward/guide or predict_forward/predict_guide call:
+      - model.n      : training-set size (needed by guide_mgp to size loc_Z/scale_Z init tensors)
+      - model.params : reference to the param store (needed by predict_forward/predict_guide)
+    """
+    from multiview_shared import SupMultiviewShared
+
+    pyro.clear_param_store()
+    pyro.get_param_store().load(model_out_filename + "_paramstore.pth")
+
+    factor_model = SupMultiviewShared(model_config["k"], dense=model_config["dense_model"])
+    factor_model.n = n_train
+    factor_model.params = pyro.get_param_store()
+
+    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
+    if opt == "adagrad":
+        OPT = AdagradRMSProp({
+            "eta":   train_config["eta"],
+            "delta": train_config["delta"],
+            "t":     train_config["t"],
+        })
+        train_handler = ModelHandler("train", factor_model, opt=OPT, loss=LOSS)
+    else:
+        scheduler = pyro.optim.StepLR({
+            "optimizer":  torch.optim.Adam,
+            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
+            "step_size":  train_config["lr_step_size"],
+            "gamma":      train_config["lr_decay_factor"],
+        })
+        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler)
+
+    global_state = torch.load(model_out_filename + ".pth", weights_only=False)
+    return factor_model, train_handler, global_state
+
+
 def train_model_shared(model_config, train_config, train_subset,
                        model_out_filename, opt="adagrad", verbose=False, write=True):
     """Train SupMultiviewShared globally.
@@ -1085,26 +1123,24 @@ def evaluate_fitted_model_shared(rep_config, data_package,
     train_SIM_decomp         = data_package["train_SIM_decomp"]
     L                        = data_package["L"]
 
-    sites = (
-        [Sites.joint_structure_l.format(l=l) for l in range(L)]
-        + [Sites.Lambda_l.format(l=l) for l in range(L)]
-    )
-    outcome_sites = [Sites.y_pred]
-    test_struct_sites = [Sites.joint_structure_l_pred.format(l=l) for l in range(L)]
-    post_samples        = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
-    post_samples_y      = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES, outcome_sites)
-    post_samples_struct = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES, test_struct_sites)
+    sites = [Sites.Z, Sites.y] + [Sites.Lambda_l.format(l=l) for l in range(L)]
+    test_sites = [Sites.y_pred, Sites.Z_pred]
+    post_samples      = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, 
+                                              sites)
+    post_samples_test = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES,
+                                             test_sites)
 
     eval_structures = calc_all_structures_with_rescaling_shared(
         L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,
-        post_samples, post_samples_y, train_SIM_decomp, test_y_clean.squeeze(),
+        post_samples, post_samples_test, train_SIM_decomp, test_y_clean.squeeze(),
         post_loading_samples=post_samples,
     )
 
     # Per-view RSE of test data reconstruction (Z_test @ Lambda_l^T vs X_l_test)
+    mean_Z_pred = post_samples_test[Sites.Z_pred].mean(dim=0).squeeze()
     test_rse = [
         eval_rse(
-            post_samples_struct[Sites.joint_structure_l_pred.format(l=l)].mean(dim=0),
+            mean_Z_pred @ post_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze().mT,
             test_X_l_list_clean[l],
         ).item()
         for l in range(L)
@@ -1135,7 +1171,7 @@ def evaluate_fitted_model_shared(rep_config, data_package,
             eval_structures["est_cov"], eval_structures["sim_cov"], L
         ).assign(**condition_cols)
 
-    return eval_metric_table, cov_metric_table
+    return eval_metric_table, cov_metric_table, post_samples, post_samples_test
 
 
 ##############################################################################
