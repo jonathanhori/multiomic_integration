@@ -375,9 +375,9 @@ class SupMultiviewShared(PyroModule):
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             a_sigma_lambda = pyro.param(Params.a_sigma_lambda_l.format(l=l),
-                                        torch.tensor(self.inv_gamma_init_param))
+                                        torch.tensor(self.a_sigma_joint))
             b_sigma_lambda = pyro.param(Params.b_sigma_lambda_l.format(l=l),
-                                        torch.tensor(self.inv_gamma_init_param))
+                                        torch.tensor(self.b_sigma_joint))
             pyro.sample(Sites.sigma2_lambda_l.format(l=l),
                         dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).expand([self.k]).to_event(1))
 
@@ -397,20 +397,20 @@ class SupMultiviewShared(PyroModule):
         # Idiosyncratic error variance
         for l, p_l in enumerate(self.p_l_list):
             a_psi_l = pyro.param(Params.a_psi_l.format(l=l),
-                                 torch.tensor(self.inv_gamma_init_param),
+                                 torch.tensor(self.a_psi),
                                  constraint=dist.constraints.positive)
             b_psi_l = pyro.param(Params.b_psi_l.format(l=l),
-                                 torch.tensor(self.init_param),
+                                 torch.tensor(self.b_psi),
                                  constraint=dist.constraints.positive)
             pyro.sample(Sites.psi_l.format(l=l),
                         dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
 
         # Outcome model coefficients
         a_sigma_beta = pyro.param(Params.a_sigma_beta,
-                                  torch.tensor(self.inv_gamma_init_param),
+                                  torch.tensor(self.a_sigma_beta),
                                   constraint=dist.constraints.positive)
         b_sigma_beta = pyro.param(Params.b_sigma_beta,
-                                  torch.tensor(self.init_param),
+                                  torch.tensor(self.b_sigma_beta),
                                   constraint=dist.constraints.positive)
         pyro.sample(Sites.sigma2_beta,
                     dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
@@ -424,11 +424,10 @@ class SupMultiviewShared(PyroModule):
 
         if self.outcome == "gaussian":
             a_sigma_y = pyro.param(Params.a_sigma_y,
-                                   torch.tensor(self.inv_gamma_init_param),
+                                   torch.tensor(self.a_sigma_y),
                                    constraint=dist.constraints.positive)
             b_sigma_y = pyro.param(Params.b_sigma_y,
-                                   torch.tensor(0.5),
-                                #    torch.tensor(self.init_param),
+                                   torch.tensor(self.b_sigma_y),
                                    constraint=dist.constraints.positive)
             pyro.sample(Sites.sigma2_y,
                         dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
