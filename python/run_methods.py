@@ -1029,6 +1029,9 @@ def train_model_shared(model_config, train_config, train_subset,
             minibatch_size=train_config["minibatch_size"],
             variational_diff_func=np.mean,
             verbose=verbose,
+            convergence_criterion = train_config["convergence_criterion"],
+            window = train_config["window"],
+            snr_threshold = train_config["snr_threshold"],
         )
         run_time = time.time() - t0
 
@@ -1094,6 +1097,9 @@ def train_model_locally_shared(factor_model, train_config, data_subset,
         minibatch_size=train_config["minibatch_size"],
         variational_diff_func=np.mean,
         verbose=verbose,
+        convergence_criterion = train_config["convergence_criterion"],
+        window = train_config["window"],
+        snr_threshold = train_config["snr_threshold"],
     )
     runtime = time.time() - t0
 
@@ -1123,7 +1129,7 @@ def evaluate_fitted_model_shared(rep_config, data_package,
     train_SIM_decomp         = data_package["train_SIM_decomp"]
     L                        = data_package["L"]
 
-    sites = [Sites.Z, Sites.y] + [Sites.Lambda_l.format(l=l) for l in range(L)]
+    sites = [Sites.Z, Sites.y, Sites.beta] + [Sites.Lambda_l.format(l=l) for l in range(L)]
     test_sites = [Sites.y_pred, Sites.Z_pred]
     post_samples      = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, 
                                               sites)
