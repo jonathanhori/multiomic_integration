@@ -100,6 +100,12 @@ class ModelHandler:
         # Handle minibatching of dataset
         ########################
         loader = DataLoader(train_dataset, batch_size = minibatch_size, shuffle = True, drop_last=True)
+        if len(loader) == 0:
+            raise ValueError(
+                f"DataLoader produced 0 batches: minibatch_size={minibatch_size} "
+                f"exceeds dataset size={len(train_dataset)} (drop_last=True). "
+                f"Reduce minibatch_size to <= {len(train_dataset)}."
+            )
         
         ########################
         # Initialize instances for optimization

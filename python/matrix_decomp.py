@@ -286,7 +286,7 @@ class MatrixDecomp(PyroModule):
             loc_beta = pyro.param(Params.loc_beta,
                                   torch.zeros(self.k))
             scale_beta = pyro.param(Params.scale_beta,
-                                    torch.tensor(self.init_scale_param).expand([self.k]),
+                                    torch.full((self.k,), self.init_scale_param),
                                     constraint = dist.constraints.positive)
             beta = pyro.sample(Sites.beta,
                             dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
@@ -473,7 +473,7 @@ class MatrixDecomp(PyroModule):
             loc_beta = pyro.param(Params.loc_beta,
                                   torch.zeros(self.k))
             scale_beta = pyro.param(Params.scale_beta,
-                                    torch.tensor(self.init_scale_param).expand([self.k]),
+                                    torch.full((self.k,), self.init_scale_param),
                                     constraint = dist.constraints.positive)
             beta = pyro.sample(Sites.beta,
                             dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)

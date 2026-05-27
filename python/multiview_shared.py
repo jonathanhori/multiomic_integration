@@ -307,24 +307,20 @@ class SupMultiviewShared(PyroModule):
                 a_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l=l, m=m),
                                                 torch.tensor(self.init_param, device=self.device),
                                                 constraint=dist.constraints.positive)
-                a_delta_lambda_l_k = torch.nan_to_num(a_delta_lambda_l_k, nan=self.init_param, posinf=1e6, neginf=1e-6)
                 b_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l=l, m=m),
                                                 torch.tensor(self.init_param, device=self.device),
                                                 constraint=dist.constraints.positive)
-                b_delta_lambda_l_k = torch.nan_to_num(b_delta_lambda_l_k, nan=self.init_param, posinf=1e6, neginf=1e-6)
                 pyro.sample(Sites.delta_lambda_l_k.format(l=l, m=m),
                             dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
 
             a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l=l),
-                                        torch.tensor(self.init_param, device=self.device),
+                                        torch.full((p_l, self.k), self.init_param, device=self.device),
                                         constraint=dist.constraints.positive)
-            a_rho_lambda_l = torch.nan_to_num(a_rho_lambda_l, nan=self.init_param, posinf=1e6, neginf=1e-6)
             b_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l=l),
-                                        torch.tensor(self.init_param, device=self.device),
+                                        torch.full((p_l, self.k), self.init_param, device=self.device),
                                         constraint=dist.constraints.positive)
-            b_rho_lambda_l = torch.nan_to_num(b_rho_lambda_l, nan=self.init_param, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.rho_lambda_l.format(l=l),
-                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
+                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).to_event(2)).squeeze()
 
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), torch.zeros(p_l, self.k, device=self.device))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
@@ -341,31 +337,27 @@ class SupMultiviewShared(PyroModule):
         # Idiosyncratic error variance
         for l, p_l in enumerate(self.p_l_list):
             a_psi_l = pyro.param(Params.a_psi_l.format(l=l),
-                                 torch.tensor(self.a_psi, device=self.device),
+                                 torch.full((p_l,), self.a_psi, device=self.device),
                                  constraint=dist.constraints.positive)
-            a_psi_l = torch.nan_to_num(a_psi_l, nan=self.a_psi, posinf=1e6, neginf=1e-6)
             b_psi_l = pyro.param(Params.b_psi_l.format(l=l),
-                                 torch.tensor(self.b_psi, device=self.device),
+                                 torch.full((p_l,), self.b_psi, device=self.device),
                                  constraint=dist.constraints.positive)
-            b_psi_l = torch.nan_to_num(b_psi_l, nan=self.b_psi, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.psi_l.format(l=l),
-                        dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+                        dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
 
         # Outcome model coefficients
         a_sigma_beta = pyro.param(Params.a_sigma_beta,
-                                  torch.tensor(self.a_sigma_beta, device=self.device),
+                                  torch.full((self.k,), self.a_sigma_beta, device=self.device),
                                   constraint=dist.constraints.positive)
-        a_sigma_beta = torch.nan_to_num(a_sigma_beta, nan=self.a_sigma_beta, posinf=1e6, neginf=1e-6)
         b_sigma_beta = pyro.param(Params.b_sigma_beta,
-                                  torch.tensor(self.b_sigma_beta, device=self.device),
+                                  torch.full((self.k,), self.b_sigma_beta, device=self.device),
                                   constraint=dist.constraints.positive)
-        b_sigma_beta = torch.nan_to_num(b_sigma_beta, nan=self.b_sigma_beta, posinf=1e6, neginf=1e-6)
         pyro.sample(Sites.sigma2_beta,
-                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
         loc_beta = pyro.param(Params.loc_beta, torch.zeros(self.k, device=self.device))
         scale_beta = pyro.param(Params.scale_beta,
-                                torch.tensor(self.init_param, device=self.device).expand([self.k]),
+                                torch.full((self.k,), self.init_param, device=self.device),
                                 constraint=dist.constraints.positive)
         pyro.sample(Sites.beta,
                     dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
@@ -374,22 +366,18 @@ class SupMultiviewShared(PyroModule):
             a_sigma_y = pyro.param(Params.a_sigma_y,
                                    torch.tensor(self.a_sigma_y, device=self.device),
                                    constraint=dist.constraints.positive)
-            a_sigma_y = torch.nan_to_num(a_sigma_y, nan=self.a_sigma_y, posinf=1e6, neginf=1e-6)
             b_sigma_y = pyro.param(Params.b_sigma_y,
                                    torch.tensor(self.b_sigma_y, device=self.device),
                                    constraint=dist.constraints.positive)
-            b_sigma_y = torch.nan_to_num(b_sigma_y, nan=self.b_sigma_y, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.sigma2_y,
                         dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
         elif self.outcome == "censored":
             a_weibull_c = pyro.param(Params.a_weibull_concentration,
                                      torch.tensor(self.a_weibull, device=self.device),
                                      constraint=dist.constraints.positive)
-            a_weibull_c = torch.nan_to_num(a_weibull_c, nan=self.a_weibull, posinf=1e6, neginf=1e-6)
             b_weibull_c = pyro.param(Params.b_weibull_concentration,
                                      torch.tensor(self.b_weibull, device=self.device),
                                      constraint=dist.constraints.positive)
-            b_weibull_c = torch.nan_to_num(b_weibull_c, nan=self.b_weibull, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.weibull_concentration,
                         dist.Gamma(a_weibull_c, b_weibull_c))
         else:
@@ -421,13 +409,13 @@ class SupMultiviewShared(PyroModule):
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             a_sigma_lambda = pyro.param(Params.a_sigma_lambda_l.format(l=l),
-                                        torch.tensor(self.a_sigma_joint, device=self.device))
-            a_sigma_lambda = torch.nan_to_num(a_sigma_lambda, nan=self.a_sigma_joint, posinf=1e6, neginf=1e-6)
+                                        torch.full((self.k,), self.a_sigma_joint, device=self.device),
+                                        constraint=dist.constraints.positive)
             b_sigma_lambda = pyro.param(Params.b_sigma_lambda_l.format(l=l),
-                                        torch.tensor(self.b_sigma_joint, device=self.device))
-            b_sigma_lambda = torch.nan_to_num(b_sigma_lambda, nan=self.b_sigma_joint, posinf=1e6, neginf=1e-6)
+                                        torch.full((self.k,), self.b_sigma_joint, device=self.device),
+                                        constraint=dist.constraints.positive)
             pyro.sample(Sites.sigma2_lambda_l.format(l=l),
-                        dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).expand([self.k]).to_event(1))
+                        dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).to_event(1))
 
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), torch.zeros(p_l, self.k, device=self.device))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
@@ -444,31 +432,27 @@ class SupMultiviewShared(PyroModule):
         # Idiosyncratic error variance
         for l, p_l in enumerate(self.p_l_list):
             a_psi_l = pyro.param(Params.a_psi_l.format(l=l),
-                                 torch.tensor(self.a_psi, device=self.device),
+                                 torch.full((p_l,), self.a_psi, device=self.device),
                                  constraint=dist.constraints.positive)
-            a_psi_l = torch.nan_to_num(a_psi_l, nan=self.a_psi, posinf=1e6, neginf=1e-6)
             b_psi_l = pyro.param(Params.b_psi_l.format(l=l),
-                                 torch.tensor(self.b_psi, device=self.device),
+                                 torch.full((p_l,), self.b_psi, device=self.device),
                                  constraint=dist.constraints.positive)
-            b_psi_l = torch.nan_to_num(b_psi_l, nan=self.b_psi, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.psi_l.format(l=l),
-                        dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+                        dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
 
         # Outcome model coefficients
         a_sigma_beta = pyro.param(Params.a_sigma_beta,
-                                  torch.tensor(self.a_sigma_beta, device=self.device),
+                                  torch.full((self.k,), self.a_sigma_beta, device=self.device),
                                   constraint=dist.constraints.positive)
-        a_sigma_beta = torch.nan_to_num(a_sigma_beta, nan=self.a_sigma_beta, posinf=1e6, neginf=1e-6)
         b_sigma_beta = pyro.param(Params.b_sigma_beta,
-                                  torch.tensor(self.b_sigma_beta, device=self.device),
+                                  torch.full((self.k,), self.b_sigma_beta, device=self.device),
                                   constraint=dist.constraints.positive)
-        b_sigma_beta = torch.nan_to_num(b_sigma_beta, nan=self.b_sigma_beta, posinf=1e6, neginf=1e-6)
         pyro.sample(Sites.sigma2_beta,
-                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
         loc_beta = pyro.param(Params.loc_beta, torch.zeros(self.k, device=self.device))
         scale_beta = pyro.param(Params.scale_beta,
-                                torch.tensor(self.init_param, device=self.device).expand([self.k]),
+                                torch.full((self.k,), self.init_param, device=self.device),
                                 constraint=dist.constraints.positive)
         pyro.sample(Sites.beta,
                     dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
@@ -477,22 +461,18 @@ class SupMultiviewShared(PyroModule):
             a_sigma_y = pyro.param(Params.a_sigma_y,
                                    torch.tensor(self.a_sigma_y, device=self.device),
                                    constraint=dist.constraints.positive)
-            a_sigma_y = torch.nan_to_num(a_sigma_y, nan=self.a_sigma_y, posinf=1e6, neginf=1e-6)
             b_sigma_y = pyro.param(Params.b_sigma_y,
                                    torch.tensor(self.b_sigma_y, device=self.device),
                                    constraint=dist.constraints.positive)
-            b_sigma_y = torch.nan_to_num(b_sigma_y, nan=self.b_sigma_y, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.sigma2_y,
                         dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
         elif self.outcome == "censored":
             a_weibull_c = pyro.param(Params.a_weibull_concentration,
                                      torch.tensor(self.a_weibull, device=self.device),
                                      constraint=dist.constraints.positive)
-            a_weibull_c = torch.nan_to_num(a_weibull_c, nan=self.a_weibull, posinf=1e6, neginf=1e-6)
             b_weibull_c = pyro.param(Params.b_weibull_concentration,
                                      torch.tensor(self.b_weibull, device=self.device),
                                      constraint=dist.constraints.positive)
-            b_weibull_c = torch.nan_to_num(b_weibull_c, nan=self.b_weibull, posinf=1e6, neginf=1e-6)
             pyro.sample(Sites.weibull_concentration,
                         dist.Gamma(a_weibull_c, b_weibull_c))
         else:
@@ -544,7 +524,7 @@ class SupMultiviewShared(PyroModule):
             a_rho_lambda_l = self.params[Params.a_rho_lambda_l.format(l=l)]
             b_rho_lambda_l = self.params[Params.b_rho_lambda_l.format(l=l)]
             pyro.sample(Sites.rho_lambda_l.format(l=l),
-                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
+                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).to_event(2)).squeeze()
 
             loc_Lambda_l = self.params[Params.loc_Lambda_l.format(l=l)]
             scale_Lambda_l = self.params[Params.scale_Lambda_l.format(l=l)]
@@ -557,13 +537,13 @@ class SupMultiviewShared(PyroModule):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             psi_l = pyro.sample(Sites.psi_l.format(l=l),
-                                dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+                                dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
             psi_sqrt_l_list.append(torch.sqrt(psi_l))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
         b_sigma_beta = self.params[Params.b_sigma_beta]
         pyro.sample(Sites.sigma2_beta,
-                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
         loc_beta = self.params[Params.loc_beta]
         scale_beta = self.params[Params.scale_beta]
@@ -634,7 +614,7 @@ class SupMultiviewShared(PyroModule):
             a_rho_lambda_l = self.params[Params.a_rho_lambda_l.format(l=l)]
             b_rho_lambda_l = self.params[Params.b_rho_lambda_l.format(l=l)]
             pyro.sample(Sites.rho_lambda_l.format(l=l),
-                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).expand([p_l, self.k]).to_event(2)).squeeze()
+                        dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).to_event(2)).squeeze()
 
             loc_Lambda_l = self.params[Params.loc_Lambda_l.format(l=l)]
             scale_Lambda_l = self.params[Params.scale_Lambda_l.format(l=l)]
@@ -646,12 +626,12 @@ class SupMultiviewShared(PyroModule):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             pyro.sample(Sites.psi_l.format(l=l),
-                        dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+                        dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
         b_sigma_beta = self.params[Params.b_sigma_beta]
         pyro.sample(Sites.sigma2_beta,
-                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
         loc_beta = self.params[Params.loc_beta]
         scale_beta = self.params[Params.scale_beta]
@@ -711,13 +691,13 @@ class SupMultiviewShared(PyroModule):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             psi_l = pyro.sample(Sites.psi_l.format(l=l),
-                                dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+                                dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
             psi_sqrt_l_list.append(torch.sqrt(psi_l))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
         b_sigma_beta = self.params[Params.b_sigma_beta]
         pyro.sample(Sites.sigma2_beta,
-                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
         loc_beta = self.params[Params.loc_beta]
         scale_beta = self.params[Params.scale_beta]
@@ -794,12 +774,12 @@ class SupMultiviewShared(PyroModule):
             a_psi_l = self.params[Params.a_psi_l.format(l=l)]
             b_psi_l = self.params[Params.b_psi_l.format(l=l)]
             pyro.sample(Sites.psi_l.format(l=l),
-                        dist.InverseGamma(a_psi_l, b_psi_l).expand([p_l]).to_event(1))
+                        dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
 
         a_sigma_beta = self.params[Params.a_sigma_beta]
         b_sigma_beta = self.params[Params.b_sigma_beta]
         pyro.sample(Sites.sigma2_beta,
-                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).expand([self.k]).to_event(1))
+                    dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
         loc_beta = self.params[Params.loc_beta]
         scale_beta = self.params[Params.scale_beta]
