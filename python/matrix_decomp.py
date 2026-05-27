@@ -9,6 +9,7 @@ import pyro
 import pyro.distributions as dist
 
 from pyro.nn import PyroModule
+from pyro.poutine import mask
 
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -24,6 +25,7 @@ class MatrixDecomp(PyroModule):
                  supervised = False,
                  loading_target = None,
                  dense = False,
+                 outcome = "gaussian",
                  penalty_obj = None,
                  a_sigma=2.1, # Hyperparams: Conjugate prior per factor: IG
                  b_sigma=2.0,
@@ -32,6 +34,8 @@ class MatrixDecomp(PyroModule):
                  alpha=3.0,
                  a_psi=3.0, # Hyperparams: per-view error: IG
                  b_psi=1.0,
+                 a_weibull=2.0,
+                 b_weibull=1.0,
                  scores_init = None,
                  loadings_init = None):
         super().__init__()
@@ -69,11 +73,13 @@ class MatrixDecomp(PyroModule):
             self.alpha = alpha
         
         # With outcome model
-        self.outcome = "gaussian"
+        self.outcome = outcome
         self.a_sigma_y = 3.0
         self.b_sigma_y = 2.0
         self.a_sigma_beta = 2.1
         self.b_sigma_beta = 2.0
+        self.a_weibull = a_weibull
+        self.b_weibull = b_weibull
         
         self.inv_gamma_init_param = 2.1
         self.init_param = 0.1
@@ -97,43 +103,37 @@ class MatrixDecomp(PyroModule):
         self.local_var_param_convergence_history = []
         
         
-    def forward(self, 
-                X, 
+    def forward(self,
+                X,
                 batch_idx,
-                y = None):
+                y = None,
+                cens = None):
         """
         Should we run model with sparsity prior or not?
         """
         if self.dense:
-            return self.forward_dense(X, 
-                batch_idx,
-                y)
+            return self.forward_dense(X, batch_idx, y, cens)
         else:
-            return self.forward_mgp(X, 
-                batch_idx,
-                y)
-            
-    def guide(self, 
-            X, 
+            return self.forward_mgp(X, batch_idx, y, cens)
+
+    def guide(self,
+            X,
             batch_idx,
-            y = None):
+            y = None,
+            cens = None):
         """
         Should we run model with sparsity prior or not?
         """
         if self.dense:
-            return self.guide_dense(X, 
-                batch_idx,
-                y)
+            return self.guide_dense(X, batch_idx, y)
         else:
-            return self.guide_mgp(X, 
-                batch_idx,
-                y)
+            return self.guide_mgp(X, batch_idx, y)
             
     #######
     # SPARSE MODEL - MGP PRIOR ON LAMBDA
     #######
     
-    def forward_mgp(self, X, batch_idx, y = None):
+    def forward_mgp(self, X, batch_idx, y = None, cens = None):
         l = 0
         # m = len(batch_idx)
         if self.p is None:
@@ -184,36 +184,42 @@ class MatrixDecomp(PyroModule):
             sigma_beta = torch.sqrt(sigma2_beta)
             beta = pyro.sample(Sites.beta,
                             dist.Normal(torch.zeros(self.k), sigma_beta).to_event(1)).squeeze(0)
-            
-            # Outcome variances
-            sigma2_y = pyro.sample(Sites.sigma2_y,
-                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
-            sigma_y = torch.sqrt(sigma2_y)
-        
+
+            if self.outcome == "gaussian":
+                sigma2_y = pyro.sample(Sites.sigma2_y,
+                                    dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
+                sigma_y = torch.sqrt(sigma2_y)
+            elif self.outcome == "censored":
+                weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                    dist.Gamma(self.a_weibull, self.b_weibull))
+            else:
+                raise NotImplementedError
+
         # Local latent variables and observations
-        with pyro.plate("obs", self.n, subsample = batch_idx): # X is a minibatch, can pass directly into subsample
-            # Latent scores Z_i are local
-            # Z_batch = pyro.sample("Z", dist.Normal(torch.zeros(m, self.k), torch.ones(self.k)).to_event(1))
+        with pyro.plate("obs", self.n, subsample = batch_idx):
             Z_batch = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
-            
+
             # Compute structure
             structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.T))
-            
-            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
-            
+
+            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0])
+
             if self.supervised_model:
-                # Outcome model
                 outcome_structure = pyro.deterministic("outcome_structure",
                                                         torch.matmul(Z_batch, beta.squeeze(0)))
                 if self.outcome == "gaussian":
-                    pyro.sample("y", dist.Normal(outcome_structure, 
-                                                sigma_y),
-                                obs = y)
+                    pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y), obs=y)
+                elif self.outcome == "censored":
+                    scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                    with mask(mask=(cens == 1)):
+                        pyro.sample(Sites.y, dist.Weibull(scale, weibull_concentration), obs=y)
+                    log_surv = -torch.pow(y / scale, weibull_concentration)
+                    with mask(mask=(cens == 0)):
+                        pyro.factor(Sites.censored, log_surv)
                 else:
                     raise NotImplementedError
-        
-        
-          
+
+
     def guide_mgp(self, X, batch_idx, y = None):
         l = 0
         # m = len(batch_idx)
@@ -285,8 +291,6 @@ class MatrixDecomp(PyroModule):
             beta = pyro.sample(Sites.beta,
                             dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
 
-
-            # Outcome variances
             if self.outcome == "gaussian":
                 a_sigma_y = pyro.param(Params.a_sigma_y,
                                     torch.tensor(self.a_sigma_y),
@@ -296,6 +300,15 @@ class MatrixDecomp(PyroModule):
                                     constraint = dist.constraints.positive)
                 sigma2_y = pyro.sample(Sites.sigma2_y,
                                     dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            elif self.outcome == "censored":
+                a_weibull_c = pyro.param(Params.a_weibull_concentration,
+                                         torch.tensor(self.a_weibull),
+                                         constraint=dist.constraints.positive)
+                b_weibull_c = pyro.param(Params.b_weibull_concentration,
+                                         torch.tensor(self.b_weibull),
+                                         constraint=dist.constraints.positive)
+                pyro.sample(Sites.weibull_concentration,
+                            dist.Gamma(a_weibull_c, b_weibull_c))
 
         # Local latent variables Z: Variational params loc, scale
         Z_loc = pyro.param(Params.loc_Z, lambda: torch.zeros(self.n, self.k))
@@ -319,7 +332,7 @@ class MatrixDecomp(PyroModule):
     # DENSE MODEL - NORMAL-IG PRIOR ON LAMBDA
     ########################################################################################   
     
-    def forward_dense(self, X, batch_idx, y = None):
+    def forward_dense(self, X, batch_idx, y = None, cens = None):
         l = 0
         # m = len(batch_idx)
         if self.p is None:
@@ -360,33 +373,38 @@ class MatrixDecomp(PyroModule):
             sigma_beta = torch.sqrt(sigma2_beta)
             beta = pyro.sample(Sites.beta,
                             dist.Normal(torch.zeros(self.k), sigma_beta).to_event(1)).squeeze(0)
-                                # squeeze(0) #\
-            
-            # Outcome variances
-            sigma2_y = pyro.sample(Sites.sigma2_y,
-                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
-            sigma_y = torch.sqrt(sigma2_y)
-        
+
+            if self.outcome == "gaussian":
+                sigma2_y = pyro.sample(Sites.sigma2_y,
+                                    dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
+                sigma_y = torch.sqrt(sigma2_y)
+            elif self.outcome == "censored":
+                weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                    dist.Gamma(self.a_weibull, self.b_weibull))
+            else:
+                raise NotImplementedError
+
         # Local latent variables and observations
-        with pyro.plate("obs", self.n, subsample = batch_idx): # X is a minibatch, can pass directly into subsample
-            # Latent scores Z_i are local
-            # Z_batch = pyro.sample("Z", dist.Normal(torch.zeros(m, self.k), torch.ones(self.k)).to_event(1))
+        with pyro.plate("obs", self.n, subsample = batch_idx):
             Z_batch = pyro.sample("Z", dist.Normal(0., 1.).expand([self.k]).to_event(1))
-            
+
             # Compute structure
             structure = pyro.deterministic("structure", torch.matmul(Z_batch, Lambda.squeeze(0).T))
-            
-            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0]) # list of 1 element 
-            
+
+            pyro.sample("X", dist.Normal(structure, psi_sqrt).to_event(1), obs = X[0])
+
             if self.supervised_model:
-                # Outcome model
                 outcome_structure = pyro.deterministic("outcome_structure",
                                                         torch.matmul(Z_batch, beta.squeeze(0)))
                 if self.outcome == "gaussian":
-                    # with pyro.poutine.scale(scale=self.p):
-                    pyro.sample("y", dist.Normal(outcome_structure, 
-                                                sigma_y), #.to_event(1),
-                                obs = y)
+                    pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y), obs=y)
+                elif self.outcome == "censored":
+                    scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                    with mask(mask=(cens == 1)):
+                        pyro.sample(Sites.y, dist.Weibull(scale, weibull_concentration), obs=y)
+                    log_surv = -torch.pow(y / scale, weibull_concentration)
+                    with mask(mask=(cens == 0)):
+                        pyro.factor(Sites.censored, log_surv)
                 else:
                     raise NotImplementedError
             
@@ -455,24 +473,29 @@ class MatrixDecomp(PyroModule):
             loc_beta = pyro.param(Params.loc_beta,
                                   torch.zeros(self.k))
             scale_beta = pyro.param(Params.scale_beta,
-                                    # torch.ones(self.num_outcome_factors),
                                     torch.tensor(self.init_scale_param).expand([self.k]),
                                     constraint = dist.constraints.positive)
             beta = pyro.sample(Sites.beta,
-                            dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0) # .\
-                                # squeeze(0)
-                                
-                            
-            # Outcome variances
+                            dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
+
             if self.outcome == "gaussian":
-                a_sigma_y = pyro.param(Params.a_sigma_y, 
+                a_sigma_y = pyro.param(Params.a_sigma_y,
                                     torch.tensor(self.a_sigma_y),
                                     constraint = dist.constraints.positive)
-                b_sigma_y = pyro.param(Params.b_sigma_y, 
+                b_sigma_y = pyro.param(Params.b_sigma_y,
                                     torch.tensor(self.b_sigma_y),
                                     constraint = dist.constraints.positive)
                 sigma2_y = pyro.sample(Sites.sigma2_y,
                                     dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            elif self.outcome == "censored":
+                a_weibull_c = pyro.param(Params.a_weibull_concentration,
+                                         torch.tensor(self.a_weibull),
+                                         constraint=dist.constraints.positive)
+                b_weibull_c = pyro.param(Params.b_weibull_concentration,
+                                         torch.tensor(self.b_weibull),
+                                         constraint=dist.constraints.positive)
+                pyro.sample(Sites.weibull_concentration,
+                            dist.Gamma(a_weibull_c, b_weibull_c))
         
         # Local latent variables Z: Variational params loc, scale
         if self.scores_init is not None:
@@ -507,21 +530,21 @@ class MatrixDecomp(PyroModule):
     # prediction ELBO is driven entirely by the test-set observation likelihood and KL(q(Z_pred)||p(Z_pred)).
     ########################################################################################
 
-    def predict_forward(self, X, batch_idx, y=None):
+    def predict_forward(self, X, batch_idx, y=None, cens=None):
         assert self.params is not None, "self.params is None: run training inference first."
         if self.dense:
-            return self.predict_forward_dense(X, batch_idx, y)
+            return self.predict_forward_dense(X, batch_idx, y, cens)
         else:
-            return self.predict_forward_mgp(X, batch_idx, y)
+            return self.predict_forward_mgp(X, batch_idx, y, cens)
 
-    def predict_guide(self, X, batch_idx, y=None):
+    def predict_guide(self, X, batch_idx, y=None, cens=None):
         assert self.params is not None, "self.params is None: run training inference first."
         if self.dense:
             return self.predict_guide_dense(X, batch_idx, y)
         else:
             return self.predict_guide_mgp(X, batch_idx, y)
 
-    def predict_forward_mgp(self, X, batch_idx, y=None):
+    def predict_forward_mgp(self, X, batch_idx, y=None, cens=None):
         l = 0
         if self.p is None:
             self.p = X[0].shape[1]
@@ -562,11 +585,19 @@ class MatrixDecomp(PyroModule):
             beta = pyro.sample(Sites.beta,
                                dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
 
-            a_sigma_y = self.params[Params.a_sigma_y]
-            b_sigma_y = self.params[Params.b_sigma_y]
-            sigma2_y = pyro.sample(Sites.sigma2_y,
-                                   dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
-            sigma_y = torch.sqrt(sigma2_y)
+            if self.outcome == "gaussian":
+                a_sigma_y = self.params[Params.a_sigma_y]
+                b_sigma_y = self.params[Params.b_sigma_y]
+                sigma2_y = pyro.sample(Sites.sigma2_y,
+                                       dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+                sigma_y = torch.sqrt(sigma2_y)
+            elif self.outcome == "censored":
+                a_weibull_c = self.params[Params.a_weibull_concentration]
+                b_weibull_c = self.params[Params.b_weibull_concentration]
+                weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                    dist.Gamma(a_weibull_c, b_weibull_c))
+            else:
+                raise NotImplementedError
 
         with pyro.plate("obs_pred", self.n_predict, subsample=batch_idx):
             Z_batch = pyro.sample(Sites.Z_pred, dist.Normal(0., 1.).expand([self.k]).to_event(1))
@@ -579,12 +610,22 @@ class MatrixDecomp(PyroModule):
                         obs=X[0])
 
             if self.supervised_model:
-                pyro.deterministic(Sites.outcome_structure_pred,
-                                   torch.matmul(Z_batch, beta.squeeze(0)))
+                outcome_structure = pyro.deterministic(Sites.outcome_structure_pred,
+                                                       torch.matmul(Z_batch, beta.squeeze(0)))
                 if self.outcome == "gaussian":
                     pyro.sample(Sites.y_pred,
-                                dist.Normal(torch.matmul(Z_batch, beta.squeeze(0)), sigma_y),
+                                dist.Normal(outcome_structure, sigma_y),
                                 obs=y)
+                elif self.outcome == "censored":
+                    scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                    if cens is not None:
+                        with mask(mask=(cens == 1)):
+                            pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
+                        log_surv = -torch.pow(y / scale, weibull_concentration)
+                        with mask(mask=(cens == 0)):
+                            pyro.factor(Sites.censored, log_surv)
+                    else:
+                        pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
                 else:
                     raise NotImplementedError
 
@@ -628,10 +669,18 @@ class MatrixDecomp(PyroModule):
             beta = pyro.sample(Sites.beta,
                                dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
 
-            a_sigma_y = self.params[Params.a_sigma_y]
-            b_sigma_y = self.params[Params.b_sigma_y]
-            pyro.sample(Sites.sigma2_y,
-                        dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            if self.outcome == "gaussian":
+                a_sigma_y = self.params[Params.a_sigma_y]
+                b_sigma_y = self.params[Params.b_sigma_y]
+                pyro.sample(Sites.sigma2_y,
+                            dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            elif self.outcome == "censored":
+                a_weibull_c = self.params[Params.a_weibull_concentration]
+                b_weibull_c = self.params[Params.b_weibull_concentration]
+                pyro.sample(Sites.weibull_concentration,
+                            dist.Gamma(a_weibull_c, b_weibull_c))
+            else:
+                raise NotImplementedError
 
         # Local params — fresh variational parameters optimized during local inference
         loc_Z = pyro.param(Params.loc_Z_pred, torch.zeros(self.n_predict, self.k))
@@ -650,7 +699,7 @@ class MatrixDecomp(PyroModule):
                 pyro.deterministic(Sites.outcome_structure_pred,
                                    torch.matmul(Z_batch, beta.squeeze(0)))
 
-    def predict_forward_dense(self, X, batch_idx, y=None):
+    def predict_forward_dense(self, X, batch_idx, y=None, cens=None):
         l = 0
         if self.p is None:
             self.p = X[0].shape[1]
@@ -684,11 +733,19 @@ class MatrixDecomp(PyroModule):
             beta = pyro.sample(Sites.beta,
                                dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
 
-            a_sigma_y = self.params[Params.a_sigma_y]
-            b_sigma_y = self.params[Params.b_sigma_y]
-            sigma2_y = pyro.sample(Sites.sigma2_y,
-                                   dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
-            sigma_y = torch.sqrt(sigma2_y)
+            if self.outcome == "gaussian":
+                a_sigma_y = self.params[Params.a_sigma_y]
+                b_sigma_y = self.params[Params.b_sigma_y]
+                sigma2_y = pyro.sample(Sites.sigma2_y,
+                                       dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+                sigma_y = torch.sqrt(sigma2_y)
+            elif self.outcome == "censored":
+                a_weibull_c = self.params[Params.a_weibull_concentration]
+                b_weibull_c = self.params[Params.b_weibull_concentration]
+                weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                    dist.Gamma(a_weibull_c, b_weibull_c))
+            else:
+                raise NotImplementedError
 
         with pyro.plate("obs_pred", self.n_predict, subsample=batch_idx):
             Z_batch = pyro.sample(Sites.Z_pred, dist.Normal(0., 1.).expand([self.k]).to_event(1))
@@ -702,11 +759,21 @@ class MatrixDecomp(PyroModule):
 
             if self.supervised_model:
                 outcome_structure = pyro.deterministic(Sites.outcome_structure_pred,
-                                   torch.matmul(Z_batch, beta.squeeze(0)))
+                                                       torch.matmul(Z_batch, beta.squeeze(0)))
                 if self.outcome == "gaussian":
                     pyro.sample(Sites.y_pred,
                                 dist.Normal(outcome_structure, sigma_y),
                                 obs=y)
+                elif self.outcome == "censored":
+                    scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                    if cens is not None:
+                        with mask(mask=(cens == 1)):
+                            pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
+                        log_surv = -torch.pow(y / scale, weibull_concentration)
+                        with mask(mask=(cens == 0)):
+                            pyro.factor(Sites.censored, log_surv)
+                    else:
+                        pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
                 else:
                     raise NotImplementedError
 
@@ -742,10 +809,18 @@ class MatrixDecomp(PyroModule):
             beta = pyro.sample(Sites.beta,
                                dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
 
-            a_sigma_y = self.params[Params.a_sigma_y]
-            b_sigma_y = self.params[Params.b_sigma_y]
-            pyro.sample(Sites.sigma2_y,
-                        dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            if self.outcome == "gaussian":
+                a_sigma_y = self.params[Params.a_sigma_y]
+                b_sigma_y = self.params[Params.b_sigma_y]
+                pyro.sample(Sites.sigma2_y,
+                            dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
+            elif self.outcome == "censored":
+                a_weibull_c = self.params[Params.a_weibull_concentration]
+                b_weibull_c = self.params[Params.b_weibull_concentration]
+                pyro.sample(Sites.weibull_concentration,
+                            dist.Gamma(a_weibull_c, b_weibull_c))
+            else:
+                raise NotImplementedError
 
         # Local params — fresh variational parameters optimized during local inference
         loc_Z = pyro.param(Params.loc_Z_pred, torch.zeros(self.n_predict, self.k))

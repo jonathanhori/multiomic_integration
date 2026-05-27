@@ -44,6 +44,8 @@ class SupMultiviewDecomp(PyroModule):
                  b_sigma_y = 1.0,
                  a_sigma_beta = 2.0, # Hyperparams: outcome coefficients: IG
                  b_sigma_beta = 2.0,
+                 a_weibull = 2.0, # Hyperparams: Weibull shape prior: Gamma
+                 b_weibull = 1.0,
                  joint_scores_init = None,
                  joint_loadings_list_init = None,
                  view_scores_list_init = None,
@@ -86,6 +88,8 @@ class SupMultiviewDecomp(PyroModule):
         self.b_sigma_y = b_sigma_y
         self.a_sigma_beta = a_sigma_beta
         self.b_sigma_beta = b_sigma_beta
+        self.a_weibull = a_weibull
+        self.b_weibull = b_weibull
         
         # For testing: Can initialize location params of scores and loadings with given values
         self.joint_scores_init = joint_scores_init
@@ -113,37 +117,31 @@ class SupMultiviewDecomp(PyroModule):
         self.init_param = 0.1
     
         
-    def forward(self, 
-                X_list, 
+    def forward(self,
+                X_list,
                 batch_idx,
-                y = None):
+                y = None,
+                cens = None):
         """
         Should we run model with sparsity prior or not?
         """
         if self.dense:
-            return self.forward_dense(X_list, 
-                batch_idx,
-                y)
+            return self.forward_dense(X_list, batch_idx, y, cens)
         else:
-            return self.forward_mgp(X_list, 
+            return self.forward_mgp(X_list, batch_idx, y, cens)
+
+    def guide(self,
+                X_list,
                 batch_idx,
-                y)
-            
-    def guide(self, 
-                X_list, 
-                batch_idx,
-                y = None):
+                y = None,
+                cens = None):
         """
         Should we run model with sparsity prior or not?
         """
         if self.dense:
-            return self.guide_dense(X_list, 
-                batch_idx,
-                y)
+            return self.guide_dense(X_list, batch_idx, y, cens)
         else:
-            return self.guide_mgp(X_list, 
-                batch_idx,
-                y)
+            return self.guide_mgp(X_list, batch_idx, y, cens)
         
         
     def forward_mgp(self, 
@@ -260,10 +258,12 @@ class SupMultiviewDecomp(PyroModule):
                                 dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
             sigma_y = torch.sqrt(sigma2_y)
         # Right-censored: Weibull shape (Gamma)
+        elif self.outcome == "censored":
+            weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                dist.Gamma(self.a_weibull, self.b_weibull))
         else:
-            # outcome_concentration = pyro.sample("")
             raise NotImplementedError
-        
+
         # orthogonality_weight = pyro.sample("ortho_weight", dist.InverseGamma(1, 1))
         # orthogonality_weight = 100.
         
@@ -328,21 +328,21 @@ class SupMultiviewDecomp(PyroModule):
                 #             obs = y)
             
             if self.outcome == "gaussian":
-                y_pred = pyro.sample(Sites.y, dist.Normal(outcome_structure, 
-                                            sigma_y), #.to_event(1),
+                y_pred = pyro.sample(Sites.y, dist.Normal(outcome_structure,
+                                            sigma_y),
                             obs = y)
                 return y_pred
             elif self.outcome == "censored":
-                weibull = dist.Weibull(outcome_structure, outcome_concentration)
-                with mask(mask = (cens == 1)):
-                    pyro.sample(Sites.y, weibull, obs = y)
-                with mask(mask = (cens == 0)):
-                    survival_prob = 1 - weibull.cdf(y)
-                    pyro.sample(Sites.censored, dist.Bernoulli(survival_prob), obs = 1)
+                scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                with mask(mask=(cens == 1)):
+                    pyro.sample(Sites.y, dist.Weibull(scale, weibull_concentration), obs=y)
+                log_surv = -torch.pow(y / scale, weibull_concentration)
+                with mask(mask=(cens == 0)):
+                    pyro.factor(Sites.censored, log_surv)
             else:
                 raise NotImplementedError
-            
-    
+
+
     def predict_forward(self,
                         X_list, 
                         batch_idx,
@@ -473,15 +473,19 @@ class SupMultiviewDecomp(PyroModule):
         
         ## Outcome error distribution parameters:
         # Continuous: Normal variances
-        a_sigma_y = self.params[Params.a_sigma_y]
-        b_sigma_y = self.params[Params.b_sigma_y]
         if self.outcome == "gaussian":
+            a_sigma_y = self.params[Params.a_sigma_y]
+            b_sigma_y = self.params[Params.b_sigma_y]
             sigma2_y = pyro.sample(Sites.sigma2_y,
                                 dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
             sigma_y = torch.sqrt(sigma2_y)
         # Right-censored: Weibull shape (Gamma)
+        elif self.outcome == "censored":
+            a_weibull_c = self.params[Params.a_weibull_concentration]
+            b_weibull_c = self.params[Params.b_weibull_concentration]
+            weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                dist.Gamma(a_weibull_c, b_weibull_c))
         else:
-            # outcome_concentration = pyro.sample("")
             raise NotImplementedError
         
         # Local latent variables and observations
@@ -533,24 +537,28 @@ class SupMultiviewDecomp(PyroModule):
                 #             obs = y)
             
             if self.outcome == "gaussian":
-                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, 
-                                            sigma_y), #.to_event(1),
+                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, sigma_y),
                             obs = y)
                 return y_pred
             elif self.outcome == "censored":
-                weibull = dist.Weibull(outcome_structure, outcome_concentration)
-                with mask(mask = (cens == 1)):
-                    pyro.sample(Sites.y, weibull, obs = y)
-                with mask(mask = (cens == 0)):
-                    survival_prob = 1 - weibull.cdf(y)
-                    pyro.sample(Sites.censored, dist.Bernoulli(survival_prob), obs = 1)
+                scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                if cens is not None:
+                    with mask(mask=(cens == 1)):
+                        pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
+                    log_surv = -torch.pow(y / scale, weibull_concentration)
+                    with mask(mask=(cens == 0)):
+                        pyro.factor(Sites.censored, log_surv)
+                else:
+                    y_pred = pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
+                    return y_pred
             else:
                 raise NotImplementedError
-    
-    def forward_dense(self, 
-                X_list, 
+
+    def forward_dense(self,
+                X_list,
                 batch_idx,
-                y = None):
+                y = None,
+                cens = None):
         """
         X_l = Z @ Lambda_l^T + Phi_l @ Gamma_l^T + E,   l = 1, ... , L
         y = Z @ beta + e
@@ -634,9 +642,15 @@ class SupMultiviewDecomp(PyroModule):
                                squeeze(0)
         
         # Outcome variances
-        sigma2_y = pyro.sample(Sites.sigma2_y,
-                            dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
-        sigma_y = torch.sqrt(sigma2_y)
+        if self.outcome == "gaussian":
+            sigma2_y = pyro.sample(Sites.sigma2_y,
+                                dist.InverseGamma(self.a_sigma_y, self.b_sigma_y)).squeeze(0)
+            sigma_y = torch.sqrt(sigma2_y)
+        elif self.outcome == "censored":
+            weibull_concentration = pyro.sample(Sites.weibull_concentration,
+                                                dist.Gamma(self.a_weibull, self.b_weibull))
+        else:
+            raise NotImplementedError
         
         # Local latent variables and observations
         with pyro.plate("obs", self.n, subsample = batch_idx):
@@ -691,12 +705,17 @@ class SupMultiviewDecomp(PyroModule):
                 #                             sigma_y), #.to_event(1),
                 #             obs = y)
             if self.outcome == "gaussian":
-                pyro.sample("y", dist.Normal(outcome_structure, 
-                                            sigma_y), #.to_event(1),
-                            obs = y)
+                pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y), obs=y)
+            elif self.outcome == "censored":
+                scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                with mask(mask=(cens == 1)):
+                    pyro.sample(Sites.y, dist.Weibull(scale, weibull_concentration), obs=y)
+                log_surv = -torch.pow(y / scale, weibull_concentration)
+                with mask(mask=(cens == 0)):
+                    pyro.factor(Sites.censored, log_surv)
             else:
                 raise NotImplementedError
-            # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx), 
+            # pyro.sample("y", dist.Normal(outcome_structure.index_select(0, batch_idx),
             #                              sigma_y),
             #             obs = y.index_select(0, batch_idx))
             
@@ -885,13 +904,13 @@ class SupMultiviewDecomp(PyroModule):
         ## Outcome error distribution parameters:
         # Continuous: Normal variances
         if self.outcome == "gaussian":
-            a_sigma_y = pyro.param(Params.a_sigma_y, 
+            a_sigma_y = pyro.param(Params.a_sigma_y,
                                 #    torch.tensor(self.a_sigma_y),
                                    torch.tensor(self.inv_gamma_init_param),
                                 #    torch.tensor(2.1),
                                 #    torch.tensor(2.5),
                                    constraint = dist.constraints.positive)
-            b_sigma_y = pyro.param(Params.b_sigma_y, 
+            b_sigma_y = pyro.param(Params.b_sigma_y,
                                 #    torch.tensor(self.b_sigma_y),
                                 #    torch.tensor(0.1),
                                    torch.tensor(self.init_param),
@@ -900,10 +919,18 @@ class SupMultiviewDecomp(PyroModule):
                                 dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
             sigma_y = torch.sqrt(sigma2_y)
         # Right-censored: Weibull shape (Gamma)
+        elif self.outcome == "censored":
+            a_weibull_c = pyro.param(Params.a_weibull_concentration,
+                                     torch.tensor(self.a_weibull),
+                                     constraint=dist.constraints.positive)
+            b_weibull_c = pyro.param(Params.b_weibull_concentration,
+                                     torch.tensor(self.b_weibull),
+                                     constraint=dist.constraints.positive)
+            pyro.sample(Sites.weibull_concentration,
+                        dist.Gamma(a_weibull_c, b_weibull_c))
         else:
-            # outcome_concentration = pyro.sample("")
             raise NotImplementedError
-        
+
         # Local latent variables and observations
         if self.joint_scores_init is None:
             loc_Z = align_tensor_shapes(self.joint_scores_init,
@@ -1209,13 +1236,13 @@ class SupMultiviewDecomp(PyroModule):
         ## Outcome error distribution parameters:
         # Continuous: Normal variances
         if self.outcome == "gaussian":
-            a_sigma_y = pyro.param(Params.a_sigma_y, 
+            a_sigma_y = pyro.param(Params.a_sigma_y,
                                 #    torch.tensor(self.a_sigma_y),
                                    torch.tensor(self.inv_gamma_init_param),
                                 #    torch.tensor(2.1),
                                 #    torch.tensor(2.5),
                                    constraint = dist.constraints.positive)
-            b_sigma_y = pyro.param(Params.b_sigma_y, 
+            b_sigma_y = pyro.param(Params.b_sigma_y,
                                 #    torch.tensor(self.b_sigma_y),
                                 #    torch.tensor(0.1),
                                    torch.tensor(self.init_param),
@@ -1224,22 +1251,30 @@ class SupMultiviewDecomp(PyroModule):
                                 dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
             # sigma_y = torch.sqrt(sigma2_y)
         # Right-censored: Weibull shape (Gamma)
+        elif self.outcome == "censored":
+            a_weibull_c = pyro.param(Params.a_weibull_concentration,
+                                     torch.tensor(self.a_weibull),
+                                     constraint=dist.constraints.positive)
+            b_weibull_c = pyro.param(Params.b_weibull_concentration,
+                                     torch.tensor(self.b_weibull),
+                                     constraint=dist.constraints.positive)
+            pyro.sample(Sites.weibull_concentration,
+                        dist.Gamma(a_weibull_c, b_weibull_c))
         else:
-            # outcome_concentration = pyro.sample("")
             raise NotImplementedError
-        
+
         # Local latent variables and observations
         if self.joint_scores_init is None:
             loc_Z = align_tensor_shapes(self.joint_scores_init,
                                         additional = self.k - self.joint_scores_init)
-            loc_Z = pyro.param(Params.loc_Z, 
+            loc_Z = pyro.param(Params.loc_Z,
                                loc_Z
             )
         else:
             loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k))
         # scale_Z = pyro.param(Params.scale_Z, torch.ones(self.n, self.k),
         #                         constraint = dist.constraints.positive)
-        scale_Z = pyro.param(Params.scale_Z, 
+        scale_Z = pyro.param(Params.scale_Z,
                              torch.tensor(self.init_param).expand([self.n, self.k]),
                              constraint = dist.constraints.positive)
         loc_Phi_list = []
@@ -1248,18 +1283,18 @@ class SupMultiviewDecomp(PyroModule):
             if self.view_scores_list_init is None:
                 loc_Phi_l =  align_tensor_shapes(self.view_scores_list_init[l],
                                                 additional = k_l - self.view_scores_list_init[l])
-                loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), 
+                loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l),
                                       loc_Phi_l
                                        )
             else:
                 loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
-            scale_Phi_l = pyro.param(Params.scale_Phi_l.format(l = l), 
+            scale_Phi_l = pyro.param(Params.scale_Phi_l.format(l = l),
                                     #  torch.ones(self.n, k_l),
                                      torch.tensor(self.init_param).expand([self.n, k_l]),
                                      constraint = dist.constraints.greater_than_eq(0.0)) #dist.constraints.positive
             loc_Phi_list.append(loc_Phi_l)
             scale_Phi_list.append(scale_Phi_l)
-        
+
         # PROJECTION OF VIEW-SPECIFIC STRUCTURE THROUGH SCORES
         # print('loc_z at beginning')
         # print(loc_Z)
@@ -1545,10 +1580,10 @@ class SupMultiviewDecomp(PyroModule):
         ## Outcome error distribution parameters:
         # Continuous: Normal variances
         if self.outcome == "gaussian":
-            # a_sigma_y = pyro.param(Params.a_sigma_y, 
+            # a_sigma_y = pyro.param(Params.a_sigma_y,
             #                        torch.tensor(self.a_sigma_y),
             #                        constraint = dist.constraints.positive)
-            # b_sigma_y = pyro.param(Params.b_sigma_y, 
+            # b_sigma_y = pyro.param(Params.b_sigma_y,
             #                        torch.tensor(self.b_sigma_y),
             #                        constraint = dist.constraints.positive)
             a_sigma_y = self.params[Params.a_sigma_y]
@@ -1557,8 +1592,12 @@ class SupMultiviewDecomp(PyroModule):
                                 dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
             # sigma_y = torch.sqrt(sigma2_y)
         # Right-censored: Weibull shape (Gamma)
+        elif self.outcome == "censored":
+            a_weibull_c = self.params[Params.a_weibull_concentration]
+            b_weibull_c = self.params[Params.b_weibull_concentration]
+            pyro.sample(Sites.weibull_concentration,
+                        dist.Gamma(a_weibull_c, b_weibull_c))
         else:
-            # outcome_concentration = pyro.sample("")
             raise NotImplementedError
         
         # Local latent variables and observations

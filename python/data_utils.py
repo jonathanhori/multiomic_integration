@@ -444,7 +444,7 @@ def calc_all_structures_with_rescaling_shared(
         "post_pred_joint_data_struct": POST_joint_struct_l_list,
         "post_pred_joint_summaries": None,
         "sim_outcome": sim_outcome,
-        "post_pred_outcome": PRED_outcome_summary["mean"],
+        "post_pred_outcome": PRED_outcome_summary["mean"].squeeze(),
         "post_pred_outcome_summaries": PRED_outcome_summary,
     }
 
