@@ -23,6 +23,19 @@ import torch
 import pyro
 from sklearn.model_selection import train_test_split
 
+# ---------------------------------------------------------------------------
+# Device selection
+# ---------------------------------------------------------------------------
+# Set to "mps" for Apple Silicon GPU, "cuda" for NVIDIA GPU, "cpu" for CPU.
+# Falls back to CPU automatically if the requested device is unavailable.
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
+print(f"Using device: {DEVICE}")
+
 sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
 from data_utils import load_rds_rep
@@ -66,11 +79,15 @@ MIN_EPOCHS          = 200
 # MIN_EPOCHS_HIGH     = 500   # for n=50
 MIN_EPOCHS_LOCAL    = 200
 NUM_EPOCHS          = 1000
+NUM_PARTICLES       = 2
+CONVERGENCE_CRITERION = "elbo_snr"
+WINDOW = 20
+SNR_THRESHOLD = 0.1
 
 # AdagradRMSProp defaults (match single-view model)
 ETA   = 0.5
 DELTA = 1e-16
-T     = 1.0
+T     = 0.1
 
 TRAINING_SPLIT = False
 TRAINING_SIZE  = 0.8
@@ -154,10 +171,13 @@ if __name__ == "__main__":
                 "eta":           ETA,
                 "delta":         DELTA,
                 "t":             T,
-                "num_particles": 1,
+                "num_particles": NUM_PARTICLES,
                 "minibatch_size": MINIBATCH_SIZE,
                 "min_epochs":    MIN_EPOCHS,
                 "max_epochs":    NUM_EPOCHS,
+                "convergence_criterion": CONVERGENCE_CRITERION,
+                "window": WINDOW,
+                "snr_threshold": SNR_THRESHOLD,
             }
 
             try:
@@ -166,6 +186,7 @@ if __name__ == "__main__":
                     print(f"  rep {rep}: model found, re-running evaluation.")
                     factor_model, train_handler, global_state = load_model_shared(
                         model_out_filename, model_config, len(train_subset), train_config,
+                        device=DEVICE,
                     )
                 else:
                     # ------- global training -------
@@ -173,12 +194,14 @@ if __name__ == "__main__":
                     factor_model, train_handler, global_state = train_model_shared(
                         model_config, train_config, train_subset,
                         model_out_filename, opt="adagrad", verbose=False, write=True,
+                        device=DEVICE,
                     )
 
                 # ------- local inference on test set -------
                 local_config = {**train_config, "min_epochs": MIN_EPOCHS_LOCAL}
                 factor_model, test_handler, local_state = train_model_locally_shared(
                     factor_model, local_config, test_subset, opt="adagrad",
+                    device=DEVICE,
                 )
 
                 # ------- evaluation -------
@@ -187,7 +210,7 @@ if __name__ == "__main__":
                     "rep": rep, "sparsity": sparsity, "k_delta": k_delta,
                 }
 
-                eval_table, cov_table = evaluate_fitted_model_shared(
+                eval_table, cov_table, _, _ = evaluate_fitted_model_shared(
                     rep_config, data_package,
                     train_handler, test_handler,
                     global_state, local_state,

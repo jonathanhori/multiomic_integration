@@ -945,7 +945,8 @@ def process_data_shared(sim_data, sim_data_test, training_split, training_size, 
     }
 
 
-def load_model_shared(model_out_filename, model_config, n_train, train_config, opt="adagrad"):
+def load_model_shared(model_out_filename, model_config, n_train, train_config,
+                      opt="adagrad", device="cpu"):
     """Restore a saved SupMultiviewShared for prediction without retraining.
 
     Sets the two instance attributes that are not persisted to disk but are
@@ -956,9 +957,12 @@ def load_model_shared(model_out_filename, model_config, n_train, train_config, o
     from multiview_shared import SupMultiviewShared
 
     pyro.clear_param_store()
-    pyro.get_param_store().load(model_out_filename + "_paramstore.pth")
+    state = torch.load(model_out_filename + "_paramstore.pth",
+                       map_location=device, weights_only=False)
+    pyro.get_param_store().set_state(state)
 
-    factor_model = SupMultiviewShared(model_config["k"], dense=model_config["dense_model"])
+    factor_model = SupMultiviewShared(model_config["k"], dense=model_config["dense_model"],
+                                      device=device)
     factor_model.n = n_train
     factor_model.params = pyro.get_param_store()
 
@@ -969,7 +973,7 @@ def load_model_shared(model_out_filename, model_config, n_train, train_config, o
             "delta": train_config["delta"],
             "t":     train_config["t"],
         })
-        train_handler = ModelHandler("train", factor_model, opt=OPT, loss=LOSS)
+        train_handler = ModelHandler("train", factor_model, opt=OPT, loss=LOSS, device=device)
     else:
         scheduler = pyro.optim.StepLR({
             "optimizer":  torch.optim.Adam,
@@ -977,14 +981,16 @@ def load_model_shared(model_out_filename, model_config, n_train, train_config, o
             "step_size":  train_config["lr_step_size"],
             "gamma":      train_config["lr_decay_factor"],
         })
-        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler)
+        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler,
+                                     device=device)
 
     global_state = torch.load(model_out_filename + ".pth", weights_only=False)
     return factor_model, train_handler, global_state
 
 
 def train_model_shared(model_config, train_config, train_subset,
-                       model_out_filename, opt="adagrad", verbose=False, write=True):
+                       model_out_filename, opt="adagrad", verbose=False, write=True,
+                       device="cpu"):
     """Train SupMultiviewShared globally.
 
     Parameters
@@ -993,13 +999,15 @@ def train_model_shared(model_config, train_config, train_subset,
         "adagrad" uses AdagradRMSProp (requires eta/delta/t in train_config).
         "scheduled" uses StepLR with Adam (requires initial_lr/betas/
         lr_step_size/lr_decay_factor in train_config).
+    device : str or torch.device
+        Device to run on, e.g. "cpu", "mps", or "cuda".
     """
     from multiview_shared import SupMultiviewShared
 
     k     = model_config["k"]
     dense = model_config["dense_model"]
 
-    factor_model = SupMultiviewShared(k, dense=dense)
+    factor_model = SupMultiviewShared(k, dense=dense, device=device)
     LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
 
     if opt == "adagrad":
@@ -1009,7 +1017,7 @@ def train_model_shared(model_config, train_config, train_subset,
             "t":     train_config["t"],
         })
         train_handler = ModelHandler("train", factor_model,
-                                     opt=OPT, loss=LOSS, opt_scheduler=None)
+                                     opt=OPT, loss=LOSS, opt_scheduler=None, device=device)
     else:
         scheduler = pyro.optim.StepLR({
             "optimizer":  torch.optim.Adam,
@@ -1017,7 +1025,8 @@ def train_model_shared(model_config, train_config, train_subset,
             "step_size":  train_config["lr_step_size"],
             "gamma":      train_config["lr_decay_factor"],
         })
-        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler)
+        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler,
+                                     device=device)
 
     try:
         t0 = time.time()
@@ -1049,12 +1058,13 @@ def train_model_shared(model_config, train_config, train_subset,
             pyro.get_param_store().save(model_out_filename + "_paramstore.pth")
     except Exception as e:
         print(e)
+        raise
 
     return factor_model, train_handler, model_state_dict
 
 
 def train_model_locally_shared(factor_model, train_config, data_subset,
-                                opt="adagrad", verbose=False):
+                                opt="adagrad", verbose=False, device="cpu"):
     """Local inference for SupMultiviewShared: infers Z for test observations.
 
     Global variational parameters are frozen (loaded from factor_model).
@@ -1064,6 +1074,8 @@ def train_model_locally_shared(factor_model, train_config, data_subset,
     ----------
     opt : str
         "adagrad" uses AdagradRMSProp; "scheduled" uses StepLR with Adam.
+    device : str or torch.device
+        Device to run on, e.g. "cpu", "mps", or "cuda".
 
     Returns
     -------
@@ -1078,7 +1090,7 @@ def train_model_locally_shared(factor_model, train_config, data_subset,
             "t":     train_config["t"],
         })
         test_handler = ModelHandler("predict", factor_model,
-                                    opt=OPT, loss=LOSS, opt_scheduler=None)
+                                    opt=OPT, loss=LOSS, opt_scheduler=None, device=device)
     else:
         scheduler = pyro.optim.StepLR({
             "optimizer":  torch.optim.Adam,
@@ -1086,7 +1098,8 @@ def train_model_locally_shared(factor_model, train_config, data_subset,
             "step_size":  train_config["lr_step_size"],
             "gamma":      train_config["lr_decay_factor"],
         })
-        test_handler = ModelHandler("predict", factor_model, loss=LOSS, opt_scheduler=scheduler)
+        test_handler = ModelHandler("predict", factor_model, loss=LOSS, opt_scheduler=scheduler,
+                                    device=device)
 
     t0 = time.time()
     test_handler.do_inference(
@@ -1131,10 +1144,16 @@ def evaluate_fitted_model_shared(rep_config, data_package,
 
     sites = [Sites.Z, Sites.y, Sites.beta] + [Sites.Lambda_l.format(l=l) for l in range(L)]
     test_sites = [Sites.y_pred, Sites.Z_pred]
-    post_samples      = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, 
+    post_samples      = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES,
                                               sites)
     post_samples_test = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES,
                                              test_sites)
+    # Sim data from R (via rpy2) is always on CPU; move posterior samples to CPU so all
+    # downstream comparisons (eval_rse, numpy conversions, etc.) see consistent devices.
+    post_samples      = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                         for k, v in post_samples.items()}
+    post_samples_test = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                         for k, v in post_samples_test.items()}
 
     eval_structures = calc_all_structures_with_rescaling_shared(
         L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,

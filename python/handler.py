@@ -21,7 +21,8 @@ class ModelHandler:
                  orthogonal_projection = True,
                  inference_class = None,
                  opt_scheduler = None,
-                 local = False
+                 local = False,
+                 device = "cpu"
                  ):
         assert mode in ("train", "predict"), \
             "Argument 'mode' must be set to 'train' or 'predict'. If any new observations are present, set 'predict'."
@@ -56,7 +57,7 @@ class ModelHandler:
             self.opt = opt
         
         self.orthogonal_projection = orthogonal_projection
-        # self.opt_scheduler = opt_scheduler
+        self.device = torch.device(device) if isinstance(device, str) else device
         self.learning_rate_vec = []
         
     def get_param_values(self):
@@ -144,13 +145,22 @@ class ModelHandler:
                 batch_grad_norms = []
                 for batch in loader:
                     # batch is subsampled [idx, X_l_list, y]
-                    batch_idx = batch.pop(0)
+                    batch_idx = batch.pop(0).to(self.device)
                     if self.model.model_type == "MatrixDecomp":
-                        y_batch = batch.pop(-1).squeeze()
+                        y_batch = batch.pop(-1).squeeze().to(self.device)
+                        batch = [t.to(self.device) for t in batch]
                         loss = inference.step(batch, batch_idx, y_batch)
                     elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
-                        y_batch = batch.pop(-1).squeeze()
+                        y_batch = batch.pop(-1).squeeze().to(self.device)
+                        batch = [t.to(self.device) for t in batch]
                         loss = inference.step(batch, batch_idx, y_batch)
+                    if self.device.type != "cpu":
+                        for _p in pyro.get_param_store()._params.values():
+                            if torch.isnan(_p).any():
+                                _p.data.nan_to_num_(nan=0.0)
+                                for _opt in self.opt.optim_objs.values():
+                                    if _p in _opt.state:
+                                        _opt.state[_p] = {}
                     epoch_loss += loss
 
                     # Collect gradient norms after each SVI step (grads still populated).
@@ -316,7 +326,7 @@ class ModelHandler:
                                             dim = 1)
                         
                         P_Z = projection_by_qr(A) # TODO make below faster
-                        P_Z_perp = torch.sub(torch.eye(P_Z.shape[0]), P_Z)
+                        P_Z_perp = torch.sub(torch.eye(P_Z.shape[0], device=self.device), P_Z)
                         # Means
                         proj_locs_Phi_l_list = [torch.mm(P_Z_perp, Phi_l) \
                             for Phi_l in locs_Phi_l_list]
@@ -352,25 +362,24 @@ class ModelHandler:
                 X_list,
                 num_samples,
                 return_sites):
+        X_list_dev = [x.to(self.device) for x in X_list]
         if self.model.model_type == "MatrixDecomp":
-            # X_list is just a single matrix
-            n = X_list[0].shape[0]
-            # n = X_list.shape[0]
-            predictive = Predictive(self.forward, 
-                                    guide = self.guide, 
-                                    num_samples = num_samples,
-                                    return_sites = return_sites)
-            return predictive(
-                X_list,
-                torch.arange(n)
-                )
-        elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
-            n = X_list[0].shape[0]
+            n = X_list_dev[0].shape[0]
             predictive = Predictive(self.forward,
                                     guide = self.guide,
                                     num_samples = num_samples,
                                     return_sites = return_sites)
             return predictive(
-                X_list,
-                torch.arange(n)
+                X_list_dev,
+                torch.arange(n, device=self.device)
+                )
+        elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
+            n = X_list_dev[0].shape[0]
+            predictive = Predictive(self.forward,
+                                    guide = self.guide,
+                                    num_samples = num_samples,
+                                    return_sites = return_sites)
+            return predictive(
+                X_list_dev,
+                torch.arange(n, device=self.device)
                 )
