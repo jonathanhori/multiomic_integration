@@ -7,7 +7,7 @@ import torch
 import pyro
 import pyro.distributions as dist
 from pyro.nn import PyroModule
-from pyro.poutine import mask
+from pyro.poutine import mask, scale
 
 from constants import Sites, Params
 from data_utils import align_tensor_shapes
@@ -41,6 +41,7 @@ class SupMultiviewShared(PyroModule):
                  b_sigma_beta=1.0,
                  a_weibull=2.0,
                  b_weibull=1.0,
+                 outcome_weight=1.0,
                  joint_scores_init=None,
                  joint_loadings_list_init=None,
                  device="cpu"):
@@ -71,6 +72,14 @@ class SupMultiviewShared(PyroModule):
         self.b_sigma_beta = b_sigma_beta
         self.a_weibull = a_weibull
         self.b_weibull = b_weibull
+
+        # Up-weighting factor for the outcome log-likelihood. The reconstruction
+        # likelihood contributes L * p_l terms per observation while the outcome
+        # contributes a single term, so the shared scores Z are estimated almost
+        # entirely from X. Setting outcome_weight ~ L * p_l rebalances the ELBO so
+        # the outcome informs Z comparably to the views. outcome_weight=1.0
+        # recovers the original (reconstruction-dominated) objective.
+        self.outcome_weight = outcome_weight
 
         self.joint_scores_init = joint_scores_init
         self.joint_loadings_list_init = joint_loadings_list_init
@@ -132,13 +141,13 @@ class SupMultiviewShared(PyroModule):
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
             # tau - global shrinkage
-            delta_lambda = []
-            for m in range(self.k):
-                shape = self.a1_sigma_joint if m == 0 else self.a2_sigma_joint
-                delta_l_m = pyro.sample(Sites.delta_lambda_l_k.format(l=l, m=m),
-                                        dist.Gamma(self._t(shape), self._t(1.0)))
-                delta_lambda.append(delta_l_m)
-            tau_lambda_k_list = torch.cumprod(torch.stack(delta_lambda), dim=0).squeeze()
+            shape_vec = torch.cat([
+                torch.tensor([self.a1_sigma_joint], device=self.device),
+                torch.full((self.k - 1,), self.a2_sigma_joint, device=self.device)
+            ])
+            delta_lambda = pyro.sample(Sites.delta_lambda_l.format(l=l),
+                                       dist.Gamma(shape_vec, torch.ones(self.k, device=self.device)).to_event(1))
+            tau_lambda_k_list = torch.cumprod(delta_lambda, dim=-1)
 
             # rho - local shrinkage
             rho_lambda = pyro.sample(Sites.rho_lambda_l.format(l=l),
@@ -195,19 +204,21 @@ class SupMultiviewShared(PyroModule):
 
             outcome_structure = pyro.deterministic(Sites.outcome_structure,
                                                    torch.matmul(Z, beta))
-            if self.outcome == "gaussian":
-                y_pred = pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y),
-                                     obs=y)
-                return y_pred
-            elif self.outcome == "censored":
-                scale = torch.exp(outcome_structure).clamp(min=1e-10)
-                with mask(mask=(cens == 1)):
-                    pyro.sample(Sites.y, dist.Weibull(scale, weibull_concentration), obs=y)
-                log_surv = -torch.pow(y / scale, weibull_concentration)
-                with mask(mask=(cens == 0)):
-                    pyro.factor(Sites.censored, log_surv)
-            else:
-                raise NotImplementedError
+            # Up-weight the outcome likelihood so it informs Z comparably to the views.
+            with scale(scale=self.outcome_weight):
+                if self.outcome == "gaussian":
+                    y_pred = pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y),
+                                         obs=y)
+                    return y_pred
+                elif self.outcome == "censored":
+                    weibull_scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                    with mask(mask=(cens == 1)):
+                        pyro.sample(Sites.y, dist.Weibull(weibull_scale, weibull_concentration), obs=y)
+                    log_surv = -torch.pow(y / weibull_scale, weibull_concentration)
+                    with mask(mask=(cens == 0)):
+                        pyro.factor(Sites.censored, log_surv)
+                else:
+                    raise NotImplementedError
 
 
     def forward_dense(self, X_list, batch_idx, y=None, cens=None):
@@ -280,18 +291,20 @@ class SupMultiviewShared(PyroModule):
 
             outcome_structure = pyro.deterministic(Sites.outcome_structure,
                                                    torch.matmul(Z, beta))
-            if self.outcome == "gaussian":
-                pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y),
-                            obs=y)
-            elif self.outcome == "censored":
-                scale = torch.exp(outcome_structure).clamp(min=1e-10)
-                with mask(mask=(cens == 1)):
-                    pyro.sample(Sites.y, dist.Weibull(scale, weibull_concentration), obs=y)
-                log_surv = -torch.pow(y / scale, weibull_concentration)
-                with mask(mask=(cens == 0)):
-                    pyro.factor(Sites.censored, log_surv)
-            else:
-                raise NotImplementedError
+            # Up-weight the outcome likelihood so it informs Z comparably to the views.
+            with scale(scale=self.outcome_weight):
+                if self.outcome == "gaussian":
+                    pyro.sample(Sites.y, dist.Normal(outcome_structure, sigma_y),
+                                obs=y)
+                elif self.outcome == "censored":
+                    weibull_scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                    with mask(mask=(cens == 1)):
+                        pyro.sample(Sites.y, dist.Weibull(weibull_scale, weibull_concentration), obs=y)
+                    log_surv = -torch.pow(y / weibull_scale, weibull_concentration)
+                    with mask(mask=(cens == 0)):
+                        pyro.factor(Sites.censored, log_surv)
+                else:
+                    raise NotImplementedError
 
 
     def guide_mgp(self, X_list, batch_idx, y=None):
@@ -303,15 +316,14 @@ class SupMultiviewShared(PyroModule):
         ########################
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
-            for m in range(self.k):
-                a_delta_lambda_l_k = pyro.param(Params.a_delta_lambda_l_k.format(l=l, m=m),
-                                                torch.tensor(self.init_param, device=self.device),
-                                                constraint=dist.constraints.positive)
-                b_delta_lambda_l_k = pyro.param(Params.b_delta_lambda_l_k.format(l=l, m=m),
-                                                torch.tensor(self.init_param, device=self.device),
-                                                constraint=dist.constraints.positive)
-                pyro.sample(Sites.delta_lambda_l_k.format(l=l, m=m),
-                            dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
+            a_delta_lambda_l = pyro.param(Params.a_delta_lambda_l.format(l=l),
+                                          torch.full((self.k,), self.init_param, device=self.device),
+                                          constraint=dist.constraints.positive)
+            b_delta_lambda_l = pyro.param(Params.b_delta_lambda_l.format(l=l),
+                                          torch.full((self.k,), self.init_param, device=self.device),
+                                          constraint=dist.constraints.positive)
+            pyro.sample(Sites.delta_lambda_l.format(l=l),
+                        dist.Gamma(a_delta_lambda_l, b_delta_lambda_l).to_event(1))
 
             a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l=l),
                                         torch.full((p_l, self.k), self.init_param, device=self.device),
@@ -515,11 +527,10 @@ class SupMultiviewShared(PyroModule):
 
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
-            for m in range(self.k):
-                a_delta_lambda_l_k = self.params[Params.a_delta_lambda_l_k.format(l=l, m=m)]
-                b_delta_lambda_l_k = self.params[Params.b_delta_lambda_l_k.format(l=l, m=m)]
-                pyro.sample(Sites.delta_lambda_l_k.format(l=l, m=m),
-                            dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
+            a_delta_lambda_l = self.params[Params.a_delta_lambda_l.format(l=l)]
+            b_delta_lambda_l = self.params[Params.b_delta_lambda_l.format(l=l)]
+            pyro.sample(Sites.delta_lambda_l.format(l=l),
+                        dist.Gamma(a_delta_lambda_l, b_delta_lambda_l).to_event(1))
 
             a_rho_lambda_l = self.params[Params.a_rho_lambda_l.format(l=l)]
             b_rho_lambda_l = self.params[Params.b_rho_lambda_l.format(l=l)]
@@ -605,11 +616,10 @@ class SupMultiviewShared(PyroModule):
 
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
-            for m in range(self.k):
-                a_delta_lambda_l_k = self.params[Params.a_delta_lambda_l_k.format(l=l, m=m)]
-                b_delta_lambda_l_k = self.params[Params.b_delta_lambda_l_k.format(l=l, m=m)]
-                pyro.sample(Sites.delta_lambda_l_k.format(l=l, m=m),
-                            dist.Gamma(a_delta_lambda_l_k, b_delta_lambda_l_k))
+            a_delta_lambda_l = self.params[Params.a_delta_lambda_l.format(l=l)]
+            b_delta_lambda_l = self.params[Params.b_delta_lambda_l.format(l=l)]
+            pyro.sample(Sites.delta_lambda_l.format(l=l),
+                        dist.Gamma(a_delta_lambda_l, b_delta_lambda_l).to_event(1))
 
             a_rho_lambda_l = self.params[Params.a_rho_lambda_l.format(l=l)]
             b_rho_lambda_l = self.params[Params.b_rho_lambda_l.format(l=l)]
