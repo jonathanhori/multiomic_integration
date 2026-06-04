@@ -7,6 +7,7 @@ class Sites:
     sigma2_gamma_l = "sigma2_gamma_l{l}" # for dense model
     Gamma_l = "Gamma_l{l}"
     delta_lambda_l_k = "delta_lambda_l{l}_k{m}"
+    delta_lambda_l = "delta_lambda_l{l}"
     rho_lambda_l = 'rho_lambda_l{l}'
     sigma2_lambda_l = "sigma2_lambda_l{l}" # for dense model
     Lambda_l = "Lambda_l{l}"
@@ -44,6 +45,8 @@ class Params:
     scale_Gamma_l = "scale_Gamma_l{l}"
     a_delta_lambda_l_k = "a_delta_lambda_l{l}_k{m}"
     b_delta_lambda_l_k = "b_delta_lambda_l{l}_k{m}"
+    a_delta_lambda_l = "a_delta_lambda_l{l}"
+    b_delta_lambda_l = "b_delta_lambda_l{l}"
     a_rho_lambda_l = "a_rho_lambda_l{l}"
     b_rho_lambda_l = "b_rho_lambda_l{l}"
     a_sigma_lambda_l = "a_sigma_lambda_l{l}" # for dense guide
