@@ -1,3 +1,5 @@
+import gc
+import os
 import time
 import numpy as np
 
@@ -962,6 +964,7 @@ def load_model_shared(model_out_filename, model_config, n_train, train_config,
     pyro.get_param_store().set_state(state)
 
     factor_model = SupMultiviewShared(model_config["k"], dense=model_config["dense_model"],
+                                      outcome_weight=model_config.get("outcome_weight", 1.0),
                                       device=device)
     factor_model.n = n_train
     factor_model.params = pyro.get_param_store()
@@ -990,7 +993,7 @@ def load_model_shared(model_out_filename, model_config, n_train, train_config,
 
 def train_model_shared(model_config, train_config, train_subset,
                        model_out_filename, opt="adagrad", verbose=False, write=True,
-                       device="cpu"):
+                       device="cpu", optuna_trial=None, optuna_step_offset=0):
     """Train SupMultiviewShared globally.
 
     Parameters
@@ -1006,8 +1009,10 @@ def train_model_shared(model_config, train_config, train_subset,
 
     k     = model_config["k"]
     dense = model_config["dense_model"]
+    outcome_weight = model_config.get("outcome_weight", 1.0)
 
-    factor_model = SupMultiviewShared(k, dense=dense, device=device)
+    factor_model = SupMultiviewShared(k, dense=dense, outcome_weight=outcome_weight,
+                                      device=device)
     LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
 
     if opt == "adagrad":
@@ -1028,6 +1033,14 @@ def train_model_shared(model_config, train_config, train_subset,
         train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler,
                                      device=device)
 
+    n_train = len(train_subset)
+    if "minibatch_fraction" in train_config:
+        train_mb = max(1, int(n_train * train_config["minibatch_fraction"]))
+    else:
+        train_mb = int(train_config["minibatch_size"])
+    while train_mb > n_train:
+        train_mb //= 2
+
     try:
         t0 = time.time()
         train_handler.do_inference(
@@ -1035,12 +1048,14 @@ def train_model_shared(model_config, train_config, train_subset,
             min_epochs=train_config["min_epochs"],
             epochs=train_config["max_epochs"],
             minibatch_flag=True,
-            minibatch_size=train_config["minibatch_size"],
+            minibatch_size=train_mb,
             variational_diff_func=np.mean,
             verbose=verbose,
-            convergence_criterion = train_config["convergence_criterion"],
-            window = train_config["window"],
-            snr_threshold = train_config["snr_threshold"],
+            convergence_criterion=train_config["convergence_criterion"],
+            window=train_config["window"],
+            snr_threshold=train_config["snr_threshold"],
+            optuna_trial=optuna_trial,
+            optuna_step_offset=optuna_step_offset,
         )
         run_time = time.time() - t0
 
@@ -1101,18 +1116,26 @@ def train_model_locally_shared(factor_model, train_config, data_subset,
         test_handler = ModelHandler("predict", factor_model, loss=LOSS, opt_scheduler=scheduler,
                                     device=device)
 
+    n_local = len(data_subset)
+    if "minibatch_fraction" in train_config:
+        local_mb = max(1, int(n_local * train_config["minibatch_fraction"]))
+    else:
+        local_mb = int(train_config["minibatch_size"])
+    while local_mb > n_local:
+        local_mb //= 2
+
     t0 = time.time()
     test_handler.do_inference(
         train_dataset=data_subset,
         min_epochs=train_config["min_epochs"],
         epochs=train_config["max_epochs"],
         minibatch_flag=True,
-        minibatch_size=train_config["minibatch_size"],
+        minibatch_size=local_mb,
         variational_diff_func=np.mean,
         verbose=verbose,
-        convergence_criterion = train_config["convergence_criterion"],
-        window = train_config["window"],
-        snr_threshold = train_config["snr_threshold"],
+        convergence_criterion=train_config["convergence_criterion"],
+        window=train_config["window"],
+        snr_threshold=train_config["snr_threshold"],
     )
     runtime = time.time() - t0
 
@@ -1205,7 +1228,9 @@ def evaluate_fitted_model_shared(rep_config, data_package,
 
 def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
                                model_config, train_config,
-                               n_posterior_samples=100, opt="adagrad", verbose=False):
+                               n_posterior_samples=100, opt="adagrad", verbose=False,
+                               sim_decomp=None, column_filters=None,
+                               minibatch_grid=None):
     """Train SupMultiviewShared on one CV fold and evaluate on the held-out fold.
 
     Normalises each view independently using training-fold statistics only.
@@ -1216,11 +1241,35 @@ def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
     X_l_raw_list : list of (n, p_l) float tensors
         Pre-filtered (zero-variance columns removed) but NOT normalised.
     y_raw : (n,) float tensor
+    sim_decomp : dict, optional
+        Output of extract_sim_decomp_shared. When supplied alongside
+        column_filters, the fold additionally reports cov_frob, the mean
+        normalised Frobenius error of the reconstructed within- and
+        cross-view covariance matrices.
+    column_filters : list of bool tensors, optional
+        Per-view column filters matching X_l_raw_list, used to align
+        sim_decomp["SIM_Lambda_l_list"] with the fitted loadings.
+    minibatch_grid : list of int, optional
+        Original grid of minibatch sizes. If the requested minibatch_size
+        exceeds the fold training-set size, it is replaced with the largest
+        grid value that fits (falling back to the training-set size itself
+        if no grid value fits).
 
     Returns
     -------
-    dict with keys: outcome_mse, epochs, local_epochs
+    dict with keys: outcome_mse, epochs, local_epochs, minibatch_size
+    (and cov_frob when sim_decomp/column_filters are supplied).
     """
+    n_train = len(train_idx)
+
+    if train_config.get("minibatch_size") is not None and train_config["minibatch_size"] > n_train:
+        if minibatch_grid:
+            valid = sorted(m for m in minibatch_grid if m <= n_train)
+            new_mb = valid[-1] if valid else n_train
+        else:
+            new_mb = n_train
+        train_config = {**train_config, "minibatch_size": int(new_mb)}
+
     X_l_tr_raw = [X[train_idx] for X in X_l_raw_list]
     X_l_va_raw = [X[val_idx]   for X in X_l_raw_list]
     y_tr_raw   = y_raw[train_idx]
@@ -1245,11 +1294,12 @@ def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
 
     pyro.clear_param_store()
 
-    factor_model, train_handler, _ = train_model_shared(
+    factor_model, train_handler, global_state = train_model_shared(
         model_config, train_config, train_ds,
         model_out_filename="", opt=opt, verbose=verbose, write=False,
     )
-    factor_model, val_handler, _ = train_model_locally_shared(
+
+    factor_model, val_handler, local_state = train_model_locally_shared(
         factor_model, train_config, val_ds, opt=opt, verbose=verbose,
     )
 
@@ -1257,11 +1307,56 @@ def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
     pred_mean    = summarise_post_samples(post_val[Sites.y_pred])["mean"]
     outcome_mse  = float(torch.mean((pred_mean - y_va) ** 2).item())
 
-    return {
-        "outcome_mse":  outcome_mse,
-        "epochs":       factor_model.total_epochs,
-        "local_epochs": factor_model.local_epochs,
+    train_time = float(global_state["inference_time"])
+    local_time = float(local_state["inference_time"])
+    metrics = {
+        "outcome_mse":   outcome_mse,
+        "epochs":        factor_model.total_epochs,
+        "local_epochs":  factor_model.local_epochs,
+        "train_time":    train_time,
+        "local_time":    local_time,
+        "total_time":    train_time + local_time,
+        "effective_minibatch_size": int(train_config["minibatch_size"]),
     }
+
+    if sim_decomp is not None and column_filters is not None:
+        L = len(X_l_raw_list)
+        lambda_sites = [Sites.Lambda_l.format(l=l) for l in range(L)]
+        post_train = train_handler.predict(X_l_tr, n_posterior_samples, lambda_sites)
+        est_Lambda_list = [
+            post_train[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze().cpu()
+            for l in range(L)
+        ]
+        sim_Lambda_list = [
+            sim_decomp["SIM_Lambda_l_list"][l][column_filters[l]]
+            for l in range(L)
+        ]
+        est_cov = {}
+        sim_cov = {}
+        for l in range(L):
+            for m in range(l, L):
+                loading2_est = est_Lambda_list[m] if l != m else None
+                loading2_sim = sim_Lambda_list[m] if l != m else None
+                est_cov[(l, m)] = calc_cov(est_Lambda_list[l], loading2_est)
+                raw_cov = calc_cov(sim_Lambda_list[l], loading2_sim)
+                sim_cov[(l, m)] = scale_sim_cov(raw_cov, X_l_sd[l], X_l_sd[m])
+        cov_table = eval_cov_shared(est_cov, sim_cov, L)
+        metrics["cov_frob"] = float(cov_table["cov_frob"].mean())
+        del post_train, est_Lambda_list, sim_Lambda_list, est_cov, sim_cov, cov_table
+
+    # Free per-fold memory so long sequential runs (or loky workers that get
+    # reused across folds) don't accumulate Pyro/Torch tensors.
+    del factor_model, train_handler, val_handler, post_val, pred_mean
+    del X_l_tr, X_l_va, X_l_tr_raw, X_l_va_raw, train_ds, val_ds
+    del train_norms, val_norms, X_l_mean, X_l_sd
+    pyro.clear_param_store()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+    return metrics
 
 
 def _fold_worker_shared(args):
@@ -1274,7 +1369,10 @@ def _fold_worker_shared(args):
 
 def run_cv_grid_shared(X_l_raw_list, y_raw, model_config, train_grid, train_grid_names,
                        n_folds=5, seed=123, n_posterior_samples=100,
-                       opt="adagrad", n_workers=1, verbose=False):
+                       opt="adagrad", n_workers=1, verbose=False,
+                       sim_decomp=None, column_filters=None,
+                       minibatch_grid=None,
+                       checkpoint_path=None, resume=True):
     """Run k-fold CV over all configs in train_grid for SupMultiviewShared.
 
     Parameters
@@ -1284,29 +1382,64 @@ def run_cv_grid_shared(X_l_raw_list, y_raw, model_config, train_grid, train_grid
     y_raw : (n,) float tensor
     n_workers : int
         1 = sequential; >1 = parallel via joblib/loky (n_workers folds at once).
+    sim_decomp, column_filters : optional
+        Forwarded to train_eval_cv_fold_shared so that each fold also reports
+        cov_frob (mean Frobenius error of within- and cross-view covariance
+        reconstruction).
+    minibatch_grid : list of int, optional
+        Forwarded to train_eval_cv_fold_shared. If a config's minibatch_size
+        exceeds the fold training-set size, it is dropped down to the largest
+        grid value that fits.
+    checkpoint_path : str, optional
+        If set, the in-progress DataFrame is written to this CSV after every
+        config completes. Crash-safe for long sweeps.
+    resume : bool, default True
+        If True and `checkpoint_path` exists, load it and skip any
+        `config_idx` already recorded. Set to False to start fresh and
+        overwrite the file. Configs are identified by their index in
+        `train_grid`, so the grid order must be stable across resumes.
 
     Returns
     -------
     pd.DataFrame with columns: config_idx, fold, outcome_mse, epochs,
-    local_epochs, and one column per train_grid_names entry.
+    local_epochs, minibatch_size (effective), and one column per
+    train_grid_names entry. cov_frob and train_time/local_time/total_time
+    are included when sim_decomp is supplied / timings are recorded.
     """
     import pandas as pd
 
     n     = X_l_raw_list[0].shape[0]
     folds = make_cv_folds(n, n_folds=n_folds, seed=seed)
     rows  = []
+    done_config_ids = set()
+
+    if checkpoint_path is not None and resume and os.path.exists(checkpoint_path):
+        prior = pd.read_csv(checkpoint_path)
+        # Only treat configs with all folds present as "done"; partials get redone.
+        fold_counts     = prior.groupby("config_idx").size()
+        done_config_ids = set(int(c) for c, k in fold_counts.items() if k >= n_folds)
+        rows.extend(prior[prior["config_idx"].isin(done_config_ids)].to_dict("records"))
+        print(f"Resuming from {checkpoint_path}: {len(done_config_ids)} configs "
+              f"already complete, {len(train_grid) - len(done_config_ids)} to go.",
+              flush=True)
+
+    def _flush(rs):
+        if checkpoint_path is None:
+            return
+        os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+        pd.DataFrame(rs).to_csv(checkpoint_path, index=False)
 
     for i, train_params in enumerate(train_grid):
+        if i in done_config_ids:
+            continue
         train_config = dict(zip(train_grid_names, train_params))
-        config_str = (f"eta={train_config.get('eta')}  "
-                      f"delta={train_config.get('delta')}  "
-                      f"t={train_config.get('t')}  "
-                      f"bs={train_config.get('minibatch_size')}")
+        config_str = "  ".join(f"{k}={v}" for k, v in train_config.items())
         print(f"[{i+1}/{len(train_grid)}] {config_str}", flush=True)
 
         fold_args = [
             (X_l_raw_list, y_raw, tr_idx, va_idx, model_config, train_config,
-             n_posterior_samples, opt, verbose)
+             n_posterior_samples, opt, verbose,
+             sim_decomp, column_filters, minibatch_grid)
             for tr_idx, va_idx in folds
         ]
 
@@ -1330,6 +1463,22 @@ def run_cv_grid_shared(X_l_raw_list, y_raw, model_config, train_grid, train_grid
                 for k, v in train_config.items()
             })
             rows.append(row)
-            print(f"  fold {fold_idx}  outcome_mse={m['outcome_mse']:.4f}", flush=True)
+            cov_str  = (f"  cov_frob={m['cov_frob']:.4f}" if "cov_frob" in m else "")
+            time_str = (f"  train_time={m['train_time']:.1f}s"
+                        if "train_time" in m else "")
+            print(f"  fold {fold_idx}  outcome_mse={m['outcome_mse']:.4f}"
+                  f"{cov_str}{time_str}",
+                  flush=True)
+
+        # Drop the parallel fold-result list before flushing/next config so any
+        # Pyro/Torch state captured in worker exceptions doesn't accumulate.
+        del fold_results
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
+        _flush(rows)
 
     return pd.DataFrame(rows)
