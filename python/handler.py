@@ -85,9 +85,12 @@ class ModelHandler:
                     convergence_criterion = "elbo_min",
                     window = 50,
                     snr_threshold = 0.1,
+                    spike_tol = 0.1,
                     grad_norm_tol = 1e-3,
                     device = "cpu",
-                    verbose = False):
+                    verbose = False,
+                    optuna_trial = None,
+                    optuna_step_offset = 0):
         
         # min_epochs = 10
         
@@ -159,7 +162,11 @@ class ModelHandler:
                     elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
                         y_batch = batch.pop(-1).squeeze().to(self.device)
                         batch = [t.to(self.device) for t in batch]
-                        loss = inference.step(batch, batch_idx, y_batch)
+                        # In predict mode y is not available at inference time; only X informs Z.
+                        if self.mode == "predict":
+                            loss = inference.step(batch, batch_idx)
+                        else:
+                            loss = inference.step(batch, batch_idx, y_batch)
                     if self.device.type != "cpu":
                         for _p in pyro.get_param_store()._params.values():
                             if torch.isnan(_p).any():
@@ -222,6 +229,14 @@ class ModelHandler:
                     epoch_at_min_loss = epoch
 
                 _local_loss_history.append(epoch_loss)
+
+                if optuna_trial is not None:
+                    import optuna as _optuna
+                    optuna_trial.report(epoch_loss / self.model.n,
+                                        optuna_step_offset + epoch)
+                    if optuna_trial.should_prune():
+                        raise _optuna.TrialPruned()
+
                 if convergence_criterion == "grad_norm" and batch_grad_norms:
                     mean_grad_norm = np.mean(batch_grad_norms)
 
@@ -244,7 +259,12 @@ class ModelHandler:
                             loss_converged = True
                         else:
                             snr = abs(np.mean(recent) - np.mean(prev)) / std_recent
-                            loss_converged = snr < snr_threshold
+                            # Reject convergence if the current epoch is a spike: a single
+                            # outlier loss can both shrink the SNR (by inflating std) and
+                            # mislead us about whether we're actually at an optimum.
+                            median_recent = np.median(recent)
+                            no_spike = epoch_loss <= median_recent * (1.0 + spike_tol)
+                            loss_converged = (snr < snr_threshold) and no_spike
 
                 elif convergence_criterion == "grad_norm":
                     loss_converged = mean_grad_norm < grad_norm_tol
@@ -266,6 +286,11 @@ class ModelHandler:
                         std_r  = np.std(recent)
                         snr_val = abs(np.mean(recent) - np.mean(prev)) / std_r if std_r > 0 else 0.0
                         print(f"ELBO SNR: {snr_val:.4f} (threshold {snr_threshold})")
+                        med_r = np.median(recent)
+                        if snr_val < snr_threshold and epoch_loss > med_r * (1.0 + spike_tol):
+                            print(f"Spike guard: epoch loss {epoch_loss:.2f} exceeds "
+                                  f"{(1.0 + spike_tol):.2f}x recent median ({med_r:.2f}) — "
+                                  f"convergence held off.")
                     elif convergence_criterion == "grad_norm":
                         print(f"Mean gradient norm: {mean_grad_norm:.6f} (threshold {grad_norm_tol})")
                     print(f"Loss converged? {str(loss_converged)}")
@@ -274,7 +299,7 @@ class ModelHandler:
                         print(f"Ortho penalty: {self.model.penalty_obj.weight}")
                     else:
                         print(f"Ortho penalty: {self.model.ortho_penalty}")
-                
+
                 # Converged?
                 all_converged = past_min_epochs and loss_converged and params_converged \
                     and params_epoch_last is not None
