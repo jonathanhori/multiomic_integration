@@ -991,9 +991,50 @@ def load_model_shared(model_out_filename, model_config, n_train, train_config,
     return factor_model, train_handler, global_state
 
 
+def svd_init_shared(X_l_list, k):
+    """Top-k SVD of horizontally stacked views for guide initialisation.
+
+    Returns (Z_init, Lambda_l_init_list) scaled so that Z columns have
+    unit variance and Lambda entries are O(1), consistent with the model priors.
+
+    The factorisation used is X_concat ≈ (sqrt(N)*U_k) @ (s_k/sqrt(N)*V_k)^T,
+    which keeps Z ~ N(0,I) and Lambda entries ~ O(sqrt(P/p_l)).
+
+    Parameters
+    ----------
+    X_l_list : list of (N, p_l) float tensors
+        Normalised training views.
+    k : int
+        Number of factors to extract.
+
+    Returns
+    -------
+    Z_init : (N, k) tensor
+    Lambda_l_init_list : list of (p_l, k) tensors
+    """
+    X_concat = torch.cat(X_l_list, dim=1).float()
+    n = X_concat.shape[0]
+    U, s, Vt = torch.linalg.svd(X_concat, full_matrices=False)
+
+    Z_init = U[:, :k] * (n ** 0.5)          # (N, k), each column has var ≈ 1
+
+    Lambda_l_init_list = []
+    col = 0
+    for X_l in X_l_list:
+        p_l = X_l.shape[1]
+        # (p_l, k): rows of Vt scaled by singular values, normalised by sqrt(N)
+        Lambda_l_init_list.append(
+            (Vt[:k, col:col + p_l].T * s[:k].unsqueeze(0)) / (n ** 0.5)
+        )
+        col += p_l
+
+    return Z_init, Lambda_l_init_list
+
+
 def train_model_shared(model_config, train_config, train_subset,
                        model_out_filename, opt="adagrad", verbose=False, write=True,
-                       device="cpu", optuna_trial=None, optuna_step_offset=0):
+                       device="cpu", optuna_trial=None, optuna_step_offset=0,
+                       svd_init=False):
     """Train SupMultiviewShared globally.
 
     Parameters
@@ -1004,15 +1045,35 @@ def train_model_shared(model_config, train_config, train_subset,
         lr_step_size/lr_decay_factor in train_config).
     device : str or torch.device
         Device to run on, e.g. "cpu", "mps", or "cuda".
+    svd_init : bool
+        If True, initialise loc_Z and loc_Lambda_l from the top-k SVD of the
+        stacked training views before starting SVI.
     """
     from multiview_shared import SupMultiviewShared
 
     k     = model_config["k"]
     dense = model_config["dense_model"]
     outcome_weight = model_config.get("outcome_weight", 1.0)
-
-    factor_model = SupMultiviewShared(k, dense=dense, outcome_weight=outcome_weight,
-                                      device=device)
+    
+    
+    
+    
+    if svd_init:
+        svd_time0 = time.time()
+        # train_subset is TensorDataset(idx, X_1, ..., X_L, y); views are [1:-1]
+        X_l_list = [t.to(device) for t in train_subset.tensors[1:-1]]
+        Z_init, Lambda_l_init_list = svd_init_shared(X_l_list, k)
+        svd_time1 = time.time()
+        
+        t0 = time.time()
+        factor_model = SupMultiviewShared(k, dense=dense, outcome_weight=outcome_weight,
+                                          device=device,
+                                          joint_scores_init=Z_init,
+                                          joint_loadings_list_init=Lambda_l_init_list)
+    else:
+        t0 = time.time()
+        factor_model = SupMultiviewShared(k, dense=dense, outcome_weight=outcome_weight,
+                                          device=device)
     LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
 
     if opt == "adagrad":
@@ -1042,7 +1103,7 @@ def train_model_shared(model_config, train_config, train_subset,
         train_mb //= 2
 
     try:
-        t0 = time.time()
+        
         train_handler.do_inference(
             train_dataset=train_subset,
             min_epochs=train_config["min_epochs"],
@@ -1060,6 +1121,7 @@ def train_model_shared(model_config, train_config, train_subset,
         run_time = time.time() - t0
 
         model_state_dict = {
+            "svd_time":                  svd_time1 - svd_time0 if svd_init else 0,
             "inference_time":            run_time,
             "epochs":                    factor_model.total_epochs,
             "model_state_dict":          pyro.get_param_store().get_state(),
@@ -1201,6 +1263,7 @@ def evaluate_fitted_model_shared(rep_config, data_package,
         k_delta=rep_config["k_delta"],
         runtime=global_train_state["inference_time"],
         predict_runtime=local_train_state["inference_time"],
+        svd_time = global_train_state["svd_time"]
     )
 
     # Performance table (structure RSE, coverage, outcome MSE, test reconstruction RSE)
