@@ -334,7 +334,12 @@ class SupMultiviewShared(PyroModule):
             pyro.sample(Sites.rho_lambda_l.format(l=l),
                         dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).to_event(2)).squeeze()
 
-            loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), torch.zeros(p_l, self.k, device=self.device))
+            _Lambda_default = (
+                self.joint_loadings_list_init[l].to(self.device)
+                if self.joint_loadings_list_init is not None
+                else torch.zeros(p_l, self.k, device=self.device)
+            )
+            loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), _Lambda_default)
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
                                         torch.ones(p_l, self.k, device=self.device),
                                         constraint=dist.constraints.positive)
@@ -396,7 +401,12 @@ class SupMultiviewShared(PyroModule):
             raise NotImplementedError
 
         # Local scores Z
-        loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k, device=self.device))
+        _Z_default = (
+            self.joint_scores_init.to(self.device)
+            if self.joint_scores_init is not None
+            else torch.zeros(self.n, self.k, device=self.device)
+        )
+        loc_Z = pyro.param(Params.loc_Z, _Z_default)
         scale_Z = pyro.param(Params.scale_Z,
                              torch.ones(self.n, self.k, device=self.device),
                              constraint=dist.constraints.positive)
@@ -429,7 +439,12 @@ class SupMultiviewShared(PyroModule):
             pyro.sample(Sites.sigma2_lambda_l.format(l=l),
                         dist.InverseGamma(a_sigma_lambda, b_sigma_lambda).to_event(1))
 
-            loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), torch.zeros(p_l, self.k, device=self.device))
+            _Lambda_default = (
+                self.joint_loadings_list_init[l].to(self.device)
+                if self.joint_loadings_list_init is not None
+                else torch.zeros(p_l, self.k, device=self.device)
+            )
+            loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), _Lambda_default)
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
                                         torch.ones(p_l, self.k, device=self.device),
                                         constraint=dist.constraints.positive)
@@ -491,7 +506,12 @@ class SupMultiviewShared(PyroModule):
             raise NotImplementedError
 
         # Local scores Z
-        loc_Z = pyro.param(Params.loc_Z, torch.zeros(self.n, self.k, device=self.device))
+        _Z_default = (
+            self.joint_scores_init.to(self.device)
+            if self.joint_scores_init is not None
+            else torch.zeros(self.n, self.k, device=self.device)
+        )
+        loc_Z = pyro.param(Params.loc_Z, _Z_default)
         scale_Z = pyro.param(Params.scale_Z,
                              torch.ones(self.n, self.k, device=self.device),
                              constraint=dist.constraints.positive)
@@ -509,9 +529,9 @@ class SupMultiviewShared(PyroModule):
     def predict_forward(self, X_list, batch_idx, y=None, cens=None):
         assert self.params is not None, "Param dict is None: has training inference been run first?"
         if self.dense:
-            return self.predict_forward_dense(X_list, batch_idx, y, cens)
+            return self.predict_forward_dense(X_list, batch_idx)
         else:
-            return self.predict_forward_mgp(X_list, batch_idx, y, cens)
+            return self.predict_forward_mgp(X_list, batch_idx)
 
     def predict_guide(self, X_list, batch_idx, y=None, cens=None):
         assert self.params is not None, "Param dict is None: has training inference been run first?"
@@ -521,7 +541,7 @@ class SupMultiviewShared(PyroModule):
             return self.predict_guide_mgp(X_list, batch_idx, y)
 
 
-    def predict_forward_mgp(self, X_list, batch_idx, y=None, cens=None):
+    def predict_forward_mgp(self, X_list, batch_idx):
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
 
@@ -578,34 +598,22 @@ class SupMultiviewShared(PyroModule):
         with pyro.plate("obs_pred", self.n_predict, subsample=batch_idx):
             Z = pyro.sample(Sites.Z_pred, dist.Normal(self._t(0.), self._t(1.)).expand([self.k]).to_event(1))
 
-            # for l in range(len(X_list)):
-            #     joint_structure_l = pyro.deterministic(Sites.joint_structure_l_pred.format(l=l),
-            #                                            torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
-            #     X_l = pyro.sample(Sites.X_l_pred.format(l=l),
-            #                       dist.Normal(joint_structure_l, psi_sqrt_l_list[l]).to_event(1),
-            #                       obs=X_list[l])
-                # if torch.isnan(X_l).any():
-                #     print("NaN values found in X_l_tensor!")
-                # if torch.isinf(X_l).any():
-                #     print("Inf values found in X_l_tensor!")
+            for l in range(len(X_list)):
+                joint_structure_l = pyro.deterministic(Sites.joint_structure_l_pred.format(l=l),
+                                                       torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
+                pyro.sample(Sites.X_l_pred.format(l=l),
+                            dist.Normal(joint_structure_l, psi_sqrt_l_list[l]).to_event(1),
+                            obs=X_list[l])
 
             outcome_structure = pyro.deterministic(Sites.outcome_structure_pred,
                                                    torch.matmul(Z, beta))
             if self.outcome == "gaussian":
-                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, sigma_y),
-                                     obs=y)
+                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, sigma_y))
                 return y_pred
             elif self.outcome == "censored":
-                scale = torch.exp(outcome_structure).clamp(min=1e-10)
-                if cens is not None:
-                    with mask(mask=(cens == 1)):
-                        pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
-                    log_surv = -torch.pow(y / scale, weibull_concentration)
-                    with mask(mask=(cens == 0)):
-                        pyro.factor(Sites.censored, log_surv)
-                else:
-                    y_pred = pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
-                    return y_pred
+                weibull_scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                y_pred = pyro.sample(Sites.y_pred, dist.Weibull(weibull_scale, weibull_concentration))
+                return y_pred
             else:
                 raise NotImplementedError
 
@@ -679,7 +687,7 @@ class SupMultiviewShared(PyroModule):
             #                    torch.matmul(Z, loc_beta.squeeze(0)))
 
 
-    def predict_forward_dense(self, X_list, batch_idx, y=None, cens=None):
+    def predict_forward_dense(self, X_list, batch_idx):
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
 
@@ -731,34 +739,22 @@ class SupMultiviewShared(PyroModule):
         with pyro.plate("obs_pred", self.n_predict, subsample=batch_idx):
             Z = pyro.sample(Sites.Z_pred, dist.Normal(self._t(0.), self._t(1.)).expand([self.k]).to_event(1))
 
-            # for l in range(len(X_list)):
-            #     joint_structure_l = pyro.deterministic(Sites.joint_structure_l_pred.format(l=l),
-            #                                            torch.matmul(Z, Lambda_l_list[l].T))
-            #     X_l = pyro.sample(Sites.X_l_pred.format(l=l),
-            #                       dist.Normal(joint_structure_l, psi_sqrt_l_list[l]).to_event(1),
-            #                       obs=X_list[l])
-            #     if torch.isnan(X_l).any():
-            #         print("NaN values found in X_l_tensor!")
-            #     if torch.isinf(X_l).any():
-            #         print("Inf values found in X_l_tensor!")
+            for l in range(len(X_list)):
+                joint_structure_l = pyro.deterministic(Sites.joint_structure_l_pred.format(l=l),
+                                                       torch.matmul(Z, Lambda_l_list[l].T))
+                pyro.sample(Sites.X_l_pred.format(l=l),
+                            dist.Normal(joint_structure_l, psi_sqrt_l_list[l]).to_event(1),
+                            obs=X_list[l])
 
             outcome_structure = pyro.deterministic(Sites.outcome_structure_pred,
                                                    torch.matmul(Z, beta))
             if self.outcome == "gaussian":
-                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, sigma_y),
-                                     obs=y)
+                y_pred = pyro.sample(Sites.y_pred, dist.Normal(outcome_structure, sigma_y))
                 return y_pred
             elif self.outcome == "censored":
-                scale = torch.exp(outcome_structure).clamp(min=1e-10)
-                if cens is not None:
-                    with mask(mask=(cens == 1)):
-                        pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
-                    log_surv = -torch.pow(y / scale, weibull_concentration)
-                    with mask(mask=(cens == 0)):
-                        pyro.factor(Sites.censored, log_surv)
-                else:
-                    y_pred = pyro.sample(Sites.y_pred, dist.Weibull(scale, weibull_concentration), obs=y)
-                    return y_pred
+                weibull_scale = torch.exp(outcome_structure).clamp(min=1e-10)
+                y_pred = pyro.sample(Sites.y_pred, dist.Weibull(weibull_scale, weibull_concentration))
+                return y_pred
             else:
                 raise NotImplementedError
 
