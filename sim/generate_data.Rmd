@@ -699,10 +699,10 @@ test_n   <- 100
 L <- 3
 K <- 5
 
-n_array                <- c(100, 500, 1000, 5000)
-p_array                <- c(50, 100, 1000, 5000)
-snr_x_array            <- c(2)
-snr_y_array            <- c(2)
+n_array                <- c(100, 500, 1000)
+p_array                <- c(50, 100, 500, 1000, 5000)
+snr_x_array            <- c(2, 0.5)
+snr_y_array            <- c(2, 0.5)
 loading_sparsity_array <- c(0.25)
 
 data_name_base <- "sim_data_shared_rep%s.rds"
@@ -767,6 +767,113 @@ sim_grid_shared$p_l,
 sim_grid_shared$snr_x,
 sim_grid_shared$snr_y,
 sim_grid_shared$loading_sparsity)
+```
+
+
+#--------------------
+# Asymmetric variance / beta-alignment scenarios (Scenario 1)
+
+Four alignment conditions at K=5 shared factors:
+ symmetric         — all factors equally variable and equally outcome-relevant
+ mild_misalignment — top-2 factors drive X but not y
+ strong_misalignment — top-3 factors drive X but not y
+ anti_aligned      — the single outcome-relevant factor has the lowest X-variance
+
+factor_scale[k] multiplies loading column k across all views, controlling
+factor k's variance contribution to X.  beta_weights[k] = 0 zeros out
+factor k's regression coefficient, concentrating outcome relevance on the
+remaining factors.
+
+```{r}
+set.seed(456)
+
+reps   <- 10
+test_n <- 100
+L      <- 3
+K      <- 5
+
+# Grid over n and p; SNR and sparsity fixed for clean comparison of alignment
+n_array_asym  <- c(100, 500, 1000)
+p_array_asym  <- c(50, 100, 500, 1000)
+snr_x_asym    <- 2.0
+snr_y_asym    <- 2.0
+sparsity_asym <- 0.25
+
+alignment_scenarios <- list(
+  symmetric           = list(factor_scale = c(1,   1,   1,    1,    1),
+                              beta_weights = c(1,   1,   1,    1,    1)),
+  mild_misalignment   = list(factor_scale = c(2,   2,   1,    1,    1),
+                              beta_weights = c(0,   0,   1,    1,    1)),
+  strong_misalignment = list(factor_scale = c(3,   2,   1,    0.5,  0.25),
+                              beta_weights = c(0,   0,   0,    1,    1)),
+  anti_aligned        = list(factor_scale = c(3,   2,   1,    0.5,  0.25),
+                              beta_weights = c(0,   0,   0,    0,    1))
+)
+
+data_name_base_asym <- "sim_data_shared_rep%s.rds"
+
+sim_grid_asym <- expand.grid(
+  n           = n_array_asym,
+  p_l         = p_array_asym,
+  align_label = names(alignment_scenarios),
+  stringsAsFactors = FALSE
+)
+
+mapply(function(n, p_l, align_label) {
+  scenario     <- alignment_scenarios[[align_label]]
+  factor_scale <- scenario$factor_scale
+  beta_weights <- scenario$beta_weights
+
+  cond_dir <- sprintf("n%sp%s_snr%s.%s_sparse%s_align_%s",
+                      n, p_l, snr_x_asym, snr_y_asym, sparsity_asym, align_label)
+
+  out_path_train <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data", "multi_view_shared_misaligned", "k.5", "train", cond_dir
+  )
+  out_path_test <- file.path(
+    "/Users/jonathanhori/multiomic_integration/sim",
+    "data", "multi_view_shared_misaligned", "k.5", "test", cond_dir
+  )
+
+  dir.create(out_path_train, showWarnings = FALSE, recursive = TRUE)
+  dir.create(out_path_test,  showWarnings = FALSE, recursive = TRUE)
+
+  for (rep in 1:reps) {
+    test_file <- file.path(out_path_test, sprintf(data_name_base_asym, rep))
+    if (file.exists(test_file)) next
+
+    train_data <- generate_factor_data_shared_asymmetric(
+      L            = L,
+      N            = n,
+      p_l_vec      = rep(p_l, L),
+      K            = K,
+      snr_x_vec    = rep(snr_x_asym, L),
+      sparsity_vec = rep(sparsity_asym, L),
+      snr_y        = snr_y_asym,
+      factor_scale = factor_scale,
+      beta_weights = beta_weights
+    )
+
+    test_data <- generate_factor_data_shared_asymmetric_testing(
+      L                 = L,
+      N                 = test_n,
+      p_l_vec           = rep(p_l, L),
+      K                 = K,
+      snr_x_vec         = rep(snr_x_asym, L),
+      sparsity_vec      = rep(sparsity_asym, L),
+      snr_y             = snr_y_asym,
+      training_loadings = train_data$Lambda_l,
+      training_beta     = train_data$beta
+    )
+
+    saveRDS(train_data, file.path(out_path_train, sprintf(data_name_base_asym, rep)))
+    saveRDS(test_data,  test_file)
+  }
+},
+sim_grid_asym$n,
+sim_grid_asym$p_l,
+sim_grid_asym$align_label)
 ```
 
 
@@ -1022,5 +1129,193 @@ test_data <- readRDS('~/Library/Mobile Documents/com~apple~CloudDocs/Projects/mu
 
 ```{r}
 test_data$X_l
+```
+
+
+#--------------------
+# Generate Weibull survival outcomes for existing simulation data
+# Reuses saved Z and beta; saves only the new outcome per replicate.
+
+```{r}
+set.seed(789)
+
+weibull_alpha_array  <- c(1.0, 2.0)   # Weibull shape (concentration)
+censoring_rate_array <- c(0.3, 0.5)   # target censoring fractions
+reps <- 10
+
+weibull_grid <- expand.grid(
+  alpha          = weibull_alpha_array,
+  censoring_rate = censoring_rate_array,
+  stringsAsFactors = FALSE
+)
+
+data_path_base <- "n%sp%s_snr%s.%s_sparse%s"
+
+weibull_name <- function(alpha, censoring_rate, rep)
+  sprintf("weibull_a%.1f_c%.2f_rep%s.rds", alpha, censoring_rate, rep)
+```
+
+
+## Multiview with view-specific factors (data_ortho / k.9_kl.3)
+
+```{r}
+mv_n_array              <- c(500)
+mv_p_array              <- c(100)
+mv_snr_x_array          <- c(2)
+mv_snr_y_array          <- c(2)
+mv_loading_sparsity_array <- c(0.25)
+
+mv_source_name <- "sim_data_ywithview_rep%s.rds"
+
+sim_grid_mv <- expand.grid(
+  n                = mv_n_array,
+  p_l              = mv_p_array,
+  snr_x            = mv_snr_x_array,
+  snr_y            = mv_snr_y_array,
+  loading_sparsity = mv_loading_sparsity_array,
+  stringsAsFactors = FALSE
+)
+
+for (wi in seq_len(nrow(weibull_grid))) {
+  alpha          <- weibull_grid$alpha[wi]
+  censoring_rate <- weibull_grid$censoring_rate[wi]
+
+  mapply(function(n, p_l, snr_x, snr_y, loading_sparsity) {
+    cond_dir <- sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+
+    for (split in c("train", "test")) {
+      data_dir    <- file.path(
+        "/Users/jonathanhori/multiomic_integration/sim",
+        "data_ortho", "k.9_kl.3", split, cond_dir
+      )
+      weibull_dir <- file.path(data_dir, "weibull")
+      dir.create(weibull_dir, showWarnings = FALSE, recursive = TRUE)
+
+      for (rep in seq_len(reps)) {
+        src_file <- file.path(data_dir,    sprintf(mv_source_name, rep))
+        out_file <- file.path(weibull_dir, weibull_name(alpha, censoring_rate, rep))
+
+        if (!file.exists(src_file) || file.exists(out_file)) next
+
+        dat     <- readRDS(src_file)
+        # beta is concatenated [shared (K), view-specific (L*K_l)]; extract shared portion
+        beta_shared <- dat$beta[seq_len(dat$K)]
+        outcome <- simulate_weibull_outcome(dat$Z, beta_shared, alpha, censoring_rate)
+        saveRDS(outcome, out_file)
+      }
+    }
+  },
+  sim_grid_mv$n, sim_grid_mv$p_l, sim_grid_mv$snr_x,
+  sim_grid_mv$snr_y, sim_grid_mv$loading_sparsity)
+}
+```
+
+
+## Single view (MatrixDecomp)
+
+```{r}
+sv_n_array           <- c(100, 500, 1000, 5000)
+sv_p_array           <- c(50, 100, 500, 1000, 5000)
+sv_K_array           <- c(5)
+sv_snr_x_array       <- c(2)
+sv_snr_y_array       <- c(2)
+sv_loading_sparsity  <- 0.25
+
+sv_source_name <- "sim_data_rep%s.rds"
+
+sim_grid_sv <- expand.grid(
+  n                = sv_n_array,
+  p_l              = sv_p_array,
+  K                = sv_K_array,
+  snr_x            = sv_snr_x_array,
+  snr_y            = sv_snr_y_array,
+  loading_sparsity = sv_loading_sparsity,
+  stringsAsFactors = FALSE
+)
+
+for (wi in seq_len(nrow(weibull_grid))) {
+  alpha          <- weibull_grid$alpha[wi]
+  censoring_rate <- weibull_grid$censoring_rate[wi]
+
+  mapply(function(n, p_l, K, snr_x, snr_y, loading_sparsity) {
+    cond_dir <- sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+    k_dir    <- sprintf("k.%s", K)
+
+    for (split in c("train", "test")) {
+      data_dir    <- file.path(
+        "/Users/jonathanhori/multiomic_integration/sim",
+        "data", "single_view", k_dir, split, cond_dir
+      )
+      weibull_dir <- file.path(data_dir, "weibull")
+      dir.create(weibull_dir, showWarnings = FALSE, recursive = TRUE)
+
+      for (rep in seq_len(reps)) {
+        src_file <- file.path(data_dir,    sprintf(sv_source_name, rep))
+        out_file <- file.path(weibull_dir, weibull_name(alpha, censoring_rate, rep))
+
+        if (!file.exists(src_file) || file.exists(out_file)) next
+
+        dat     <- readRDS(src_file)
+        outcome <- simulate_weibull_outcome(dat$Z, dat$beta, alpha, censoring_rate)
+        saveRDS(outcome, out_file)
+      }
+    }
+  },
+  sim_grid_sv$n, sim_grid_sv$p_l, sim_grid_sv$K,
+  sim_grid_sv$snr_x, sim_grid_sv$snr_y, sim_grid_sv$loading_sparsity)
+}
+```
+
+
+## Shared multiview (SupMultiviewShared)
+
+```{r}
+sh_n_array              <- c(100, 500, 1000, 5000)
+sh_p_array              <- c(50, 100, 1000, 5000)
+sh_snr_x_array          <- c(2)
+sh_snr_y_array          <- c(2)
+sh_loading_sparsity_array <- c(0.25)
+
+sh_source_name <- "sim_data_shared_rep%s.rds"
+
+sim_grid_shared <- expand.grid(
+  n                = sh_n_array,
+  p_l              = sh_p_array,
+  snr_x            = sh_snr_x_array,
+  snr_y            = sh_snr_y_array,
+  loading_sparsity = sh_loading_sparsity_array,
+  stringsAsFactors = FALSE
+)
+
+for (wi in seq_len(nrow(weibull_grid))) {
+  alpha          <- weibull_grid$alpha[wi]
+  censoring_rate <- weibull_grid$censoring_rate[wi]
+
+  mapply(function(n, p_l, snr_x, snr_y, loading_sparsity) {
+    cond_dir <- sprintf(data_path_base, n, p_l, snr_x, snr_y, loading_sparsity)
+
+    for (split in c("train", "test")) {
+      data_dir    <- file.path(
+        "/Users/jonathanhori/multiomic_integration/sim",
+        "data", "multi_view_shared", "k.5", split, cond_dir
+      )
+      weibull_dir <- file.path(data_dir, "weibull")
+      dir.create(weibull_dir, showWarnings = FALSE, recursive = TRUE)
+
+      for (rep in seq_len(reps)) {
+        src_file <- file.path(data_dir,    sprintf(sh_source_name, rep))
+        out_file <- file.path(weibull_dir, weibull_name(alpha, censoring_rate, rep))
+
+        if (!file.exists(src_file) || file.exists(out_file)) next
+
+        dat     <- readRDS(src_file)
+        outcome <- simulate_weibull_outcome(dat$Z, dat$beta, alpha, censoring_rate)
+        saveRDS(outcome, out_file)
+      }
+    }
+  },
+  sim_grid_shared$n, sim_grid_shared$p_l, sim_grid_shared$snr_x,
+  sim_grid_shared$snr_y, sim_grid_shared$loading_sparsity)
+}
 ```
 
