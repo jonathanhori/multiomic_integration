@@ -70,8 +70,8 @@ from data_utils import r_to_torch, normalize_tensor_by_col, \
 
 ```{python}
 #| label: Load model objects
-# importlib.reload(sys.modules["matrix_decomp"])
-# importlib.reload(sys.modules["handler"])
+importlib.reload(sys.modules["matrix_decomp"])
+importlib.reload(sys.modules["handler"])
 
 from matrix_decomp import MatrixDecomp
 from handler import ModelHandler
@@ -413,6 +413,8 @@ t0 = time.time()
 svi = train_handler.do_inference(
     train_dataset = train_subset,
     inference_type = "svi",
+    convergence_criterion = "elbo_snr",
+    snr_threshold = 1,
     tol = 0.5, # tolerance is epoch loss per datum
     variational_tol = 0.2,
     min_epochs = 200,
@@ -1111,9 +1113,343 @@ p = sns.scatterplot(#x = pyro.param('y_loc').detach().tolist(),
 p.set(xlabel = "Predicted y", ylabel = "Simulated y")
 p.set_title("Predicted vs. actual outcome")
 p.axline((0, 0), slope = 1, color = "black", ls = "--")
-sns.regplot(x = test_y_pred.detach().tolist(), #pyro.param('y_loc').detach().tolist(), 
+sns.regplot(x = test_y_pred.detach().tolist(), #pyro.param('y_loc').detach().tolist(),
             y = test_y_clean.squeeze().tolist(), scatter = False, ax = p)
 ```
+
+# Factor Interpretation
+
+```{python}
+import matplotlib.pyplot as plt
+importlib.reload(sys.modules["factor_interpretation"])
+
+from factor_interpretation import (
+    plot_pve, plot_r2, plot_factor_loadings,
+    plot_factor_scores_2d, plot_factor_outcome, summarize_factors,
+)
+```
+
+## Loadings and scores
+
+```{python}
+# Variational posterior means
+lambda_est = [pyro.param(Params.loc_Lambda_l.format(l=l)).detach() for l in range(1)]  # (p, K)
+Z_est      = pyro.param(Params.loc_Z).detach()                     # (n_train, K)
+```
+
+## Factor summary
+
+```{python}
+beta_est = pyro.param(Params.loc_beta).detach()
+
+factor_summary = summarize_factors(
+    [train_X_clean], Z_est, lambda_est,
+    beta=beta_est,
+    y=train_y_clean,
+    plot=True,
+    verbose=True,
+)
+R_varimax = factor_summary["R"]
+top_factors_fac = factor_summary["post"]["per_factor"]["factor"].values - 1
+top_factors_fac = top_factors_fac.tolist()
+```
+
+## ESS vs SSL: evaluating the PVE attribution method
+
+Two natural choices for attributing variance to factor $k$:
+
+- **ESS** (energy of signal): $\text{ESS}_k = \|z_k\|^2 \|\lambda_k\|^2$ — accounts for
+  actual score magnitudes from the posterior
+- **SSL** (sum of squared loadings): $\text{SSL}_k = \|\lambda_k\|^2$ — loading-only,
+  equivalent to treating $\|z_k\|^2 = 1$ for all $k$
+
+The ESS decomposition is exact (i.e. $\sum_k \text{ESS}_k = \|\hat{X}\|_F^2 = \text{TSS} - \text{RSS}$)
+when the score columns are mutually orthogonal. The handler enforces this via QR
+projection at convergence; after varimax rotation the property may not hold.
+
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+
+Z_np           = Z_est.detach().numpy()   # (n, K)
+Lambda_list_np = [L.detach().numpy() for L in lambda_est]
+X_list_np      = [
+    x.detach().numpy() if hasattr(x, 'detach') else np.asarray(x)
+    for x in [train_X_clean]
+]
+K_fit_ = Z_np.shape[1]
+z_sq   = np.sum(Z_np ** 2, axis=0)       # ||z_k||²  (K,)
+
+# Multi-view sums — reduce to scalars / (K,) vectors across all views
+TSS      = sum(float(np.sum(X ** 2))                              for X       in X_list_np)
+RSS      = sum(float(np.sum((X - Z_np @ L.T) ** 2))              for X, L    in zip(X_list_np, Lambda_list_np))
+ssl_k    = sum(np.sum(L ** 2, axis=0)                             for L       in Lambda_list_np)
+ess_k    = z_sq * ssl_k
+model_var = TSS - RSS
+```
+
+### Z orthogonality check
+
+The ESS decomposition is exact iff $Z^\top Z$ is diagonal.
+
+```{python}
+ZtZ = Z_np.T @ Z_np  # (K, K)
+
+# How large are off-diagonal entries relative to diagonal?
+diag_mask = np.eye(K_fit_, dtype=bool)
+diag_rms  = np.sqrt(np.mean(ZtZ[diag_mask]  ** 2))
+offdiag_rms = np.sqrt(np.mean(ZtZ[~diag_mask] ** 2)) if K_fit_ > 1 else 0.0
+
+print(f"Z^T Z  — diagonal RMS  : {diag_rms:.4f}")
+print(f"       — off-diag RMS  : {offdiag_rms:.4f}  ({100*offdiag_rms/diag_rms:.1f}% of diagonal)")
+
+# Exact cross-term contribution to ||X_hat||_F²
+signal_exact    = sum(float(np.sum((Z_np @ L.T) ** 2)) for L in Lambda_list_np)
+signal_diagonal = float(np.sum(ess_k))        # Σ_k ESS_k
+cross_terms     = signal_exact - signal_diagonal
+
+print(f"\n||X_hat||_F²  (exact)   : {signal_exact:.4f}")
+print(f"Σ_k ESS_k    (diagonal) : {signal_diagonal:.4f}")
+print(f"Cross terms             : {cross_terms:.4f}  ({100*cross_terms/signal_exact:.2f}% of signal)")
+```
+
+### Decomposition accuracy
+
+```{python}
+Z_rot          = Z_np @ R_varimax
+L_rot_list     = [L @ R_varimax for L in Lambda_list_np]
+z_sq_rot       = np.sum(Z_rot ** 2, axis=0)
+ssl_rot        = sum(np.sum(L ** 2, axis=0) for L in L_rot_list)
+ess_rot        = z_sq_rot * ssl_rot
+RSS_rot        = sum(float(np.sum((X - Z_rot @ L.T) ** 2))
+                     for X, L in zip(X_list_np, L_rot_list))
+
+rows = [
+    ("Unrotated",        model_var,     float(np.sum(ess_k)),   float(np.sum(ssl_k))),
+    ("Varimax-rotated",  TSS - RSS_rot, float(np.sum(ess_rot)), float(np.sum(ssl_rot))),
+]
+print(f"{'':20s}  {'TSS-RSS':>10}  {'Σ ESS':>10}  {'ESS err%':>9}  {'Σ SSL':>10}")
+print("-" * 65)
+for label, mv, esum, ssum in rows:
+    print(f"{label:20s}  {mv:>10.3f}  {esum:>10.3f}  {100*(esum-mv)/mv:>8.2f}%  {ssum:>10.3f}")
+```
+
+### Factor rankings: ESS vs SSL
+
+```{python}
+pve_ess     = ess_k   / ess_k.sum()
+pve_ssl     = ssl_k   / ssl_k.sum()
+pve_ess_rot = ess_rot / ess_rot.sum()
+pve_ssl_rot = ssl_rot / ssl_rot.sum()
+
+rho_pre,  p_pre  = spearmanr(pve_ess,     pve_ssl)
+rho_post, p_post = spearmanr(pve_ess_rot, pve_ssl_rot)
+print(f"Spearman rank correlation (ESS vs SSL) — unrotated      : {rho_pre:.3f}  (p={p_pre:.3f})")
+print(f"                                       — varimax-rotated: {rho_post:.3f}  (p={p_post:.3f})")
+
+factors = np.arange(1, K_fit_ + 1)
+sort_pre  = np.argsort(pve_ess)[::-1]
+sort_post = np.argsort(pve_ess_rot)[::-1]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for ax, sort, ess_v, ssl_v, title in [
+    (axes[0], sort_pre,  pve_ess,     pve_ssl,     "Unrotated"),
+    (axes[1], sort_post, pve_ess_rot, pve_ssl_rot, "Varimax-rotated"),
+]:
+    w = 0.35
+    ax.bar(factors - w/2, ess_v[sort], w, label="ESS-based", alpha=0.8)
+    ax.bar(factors + w/2, ssl_v[sort], w, label="SSL-based", alpha=0.8)
+    ax.set_xlabel("Factor rank (by ESS PVE)")
+    ax.set_ylabel("PVE")
+    ax.set_title(title)
+    ax.legend()
+fig.suptitle("PVE per factor: ESS-based vs SSL-based (factors ordered by ESS rank)")
+plt.tight_layout()
+plt.show()
+```
+
+### Column norm variation
+
+SSL implicitly assumes $\|z_k\|^2$ is constant across factors.
+Plotting the actual norms shows when that assumption is violated.
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+for ax, z_s, title in [
+    (axes[0], z_sq,     "Unrotated"),
+    (axes[1], z_sq_rot, "Varimax-rotated"),
+]:
+    ax.bar(np.arange(1, K_fit_ + 1), z_s)
+    ax.axhline(z_s.mean(), color="red", ls="--", lw=1, label=f"mean = {z_s.mean():.1f}")
+    ax.set_xlabel("Factor")
+    ax.set_ylabel("||z_k||²")
+    ax.set_title(title)
+    ax.legend()
+fig.suptitle("Score column norms — SSL is equivalent to ESS only when these are equal")
+plt.tight_layout()
+plt.show()
+```
+
+## Proportion of variance explained
+
+```{python}
+pve = plot_pve(lambda_est, title="PVE per factor — MatrixDecomp (unrotated)")
+```
+
+```{python}
+pve_rot = plot_pve(
+    lambda_est, rotate=True,
+    title="PVE per factor — MatrixDecomp (varimax-rotated)",
+)
+```
+
+## R² per factor
+
+```{python}
+r2 = plot_r2(
+    [train_X_clean], Z_est, lambda_est,
+    title="R² per factor — MatrixDecomp",
+)
+```
+
+## Factor loadings
+
+```{python}
+plot_factor_loadings(
+    lambda_est, rotate=True,
+    title="Factor loadings — MatrixDecomp (varimax-rotated)",
+)
+```
+
+## Factor score scatter plots
+
+```{python}
+plot_factor_scores_2d(
+    Z_est, y=train_y_clean,
+    top_factors=top_factors_fac,
+    n_factors=5,
+    y_label="outcome",
+    title="Factor score scatterplot matrix (coloured by outcome)\nTop active factors",
+)
+```
+
+## Outcome vs. factor score
+
+```{python}
+plot_factor_outcome(
+    Z_est, train_y_clean,
+    top_factors=top_factors_fac,
+    n_factors_show=6,
+    outcome_label="outcome",
+    title="Outcome along samples ranked by factor score — top active factors",
+)
+```
+
+
+```{python}
+eval_samples = train_handler.predict(
+    [train_X_clean], 
+    N_SAMPLES,
+    return_sites=['psi_l0']
+)
+```
+
+```{python}
+S_est = train_X_clean.T @ train_X_clean / train_X_clean.shape[0]
+```
+
+```{python}
+Cov_est = lambda_est[0] @ lambda_est[0].T + torch.diag(eval_samples['psi_l0'].mean(dim = 0).squeeze())
+```
+
+```{python}
+Cov_est
+```
+
+```{python}
+torch.trace(Cov_est) / torch.trace(S_est)
+```
+
+```{python}
+torch.diag(lambda_est @ lambda_est.T)
+```
+
+```{python}
+((lambda_est ** 2).sum(dim = 0).sum() +  torch.trace(torch.diag(eval_samples['psi_l0'].mean(dim = 0).squeeze())) ) / torch.trace(S_est)
+```
+
+
+```{python}
+((lambda_est ** 2).sum(dim = 0).sum() +  torch.trace(torch.diag(eval_samples['psi_l0'].mean(dim = 0).squeeze())) ) / torch.trace(Cov_est)
+```
+
+
+```{python}
+torch.trace(S_est)
+```
+```{python}
+torch.trace(torch.diag(eval_samples['psi_l0'].mean(dim = 0).squeeze()))
+```
+
+
+Use regular factor analysis
+
+```{python}
+from sklearn.decomposition import FactorAnalysis
+```
+
+
+```{python}
+n_factors = 10
+fa = FactorAnalysis(n_components=n_factors, random_state=42)
+fa.fit(train_X_clean)
+
+# Extract components
+Lambda_fa = fa.components_.T        # Loadings matrix (p x k)
+Psi_fa    = np.diag(fa.noise_variance_)  # Diagonal noise covariance
+
+# Reconstruct implied covariance: Sigma = Lambda @ Lambda.T + Psi
+Sigma_hat = Lambda_fa @ Lambda_fa.T + Psi_fa
+```
+
+```{python}
+(((torch.tensor(Lambda_fa) ** 2).sum(dim = 0).sum() + torch.trace(torch.tensor(Psi_fa))) ) / torch.trace(torch.tensor(Sigma_hat))
+```
+
+```{python}
+(((torch.tensor(Lambda_fa) ** 2).sum(dim = 0).sum() + torch.trace(torch.tensor(Psi_fa))) ) / torch.trace(torch.tensor(S_est))
+```
+
+```{python}
+# (torch.trace(torch.tensor(Lambda_fa @ Lambda_fa.T)) / torch.trace(torch.tensor(Sigma_hat))).sum()
+
+torch.diag(torch.tensor(Psi_fa))
+```
+```{python}
+torch.trace(torch.tensor(Sigma_hat))
+```
+
+## Global shrinkage (MGP prior)
+
+Applies when the model was trained with `dense=False`. Large τ_k indicates
+that factor k is shrunk towards zero by the multiplicative gamma process prior.
+
+```{python}
+delta_sites = [Sites.delta_lambda_l_k.format(l=0, m=m) for m in range(k_upper)]
+delta_post  = train_handler.predict([train_X_clean], 100, delta_sites)
+delta_means = [np.mean(delta_post[s].squeeze().tolist()) for s in delta_sites]
+tau         = np.cumprod(delta_means)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.scatter(range(1, len(tau) + 1), tau)
+ax.set_xlabel("Factor k")
+ax.set_ylabel("Mean τ (cumulative product of δ)")
+ax.set_title("Global shrinkage over factor dimension (MGP prior)")
+plt.tight_layout()
+plt.show()
+```
+
 
 ### FactorModel
 
@@ -2634,3 +2970,4 @@ print(f"\nDone. Combined metrics written to {concat_path}")
 ```{python}
 
 ```
+
