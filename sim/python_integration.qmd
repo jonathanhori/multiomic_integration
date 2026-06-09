@@ -2768,6 +2768,7 @@ for _mod in ("multiview_shared", "run_methods", "handler", "data_utils", "consta
     if _mod in sys.modules:
         importlib.reload(sys.modules[_mod])
 
+import math
 import pyro
 import torch
 import numpy as np
@@ -2782,6 +2783,7 @@ from run_methods import (
     train_model_shared,
     train_model_locally_shared,
     evaluate_fitted_model_shared,
+    svd_init_shared,
 )
 
 from data_utils import r_to_torch, varimax
@@ -2812,17 +2814,48 @@ import matplotlib.pyplot as plt
 conversion.set_conversion(default_converter)
 readRDS = robjects.r['readRDS']
 
-rep_config = {
-    "n": 500, "p_l": 1000, "snr_x": 2, "snr_y": 2,
-    "rep": 1, "sparsity": 0.25
-}
+# Set USE_MISALIGNED=True to load the asymmetric variance/outcome data, where the
+# outcome-relevant factor is not a top-variance direction in X (see
+# docs/mofa_comparison_simulations.md). ALIGN_LABEL selects the degree of
+# misalignment; it is ignored when USE_MISALIGNED=False.
+#   "symmetric"           — beta aligned with top-variance factors (baseline)
+#   "mild_misalignment"
+#   "strong_misalignment"
+#   "anti_aligned"        — beta on the lowest-variance factor
+USE_MISALIGNED = True
+ALIGN_LABEL    = "anti_aligned"
 
-train_rds = readRDS(
-    f"~/multiomic_integration/sim/data/multi_view_shared/k.5/train/n{rep_config['n']}p{rep_config['p_l']}_snr{rep_config['snr_x']}.{rep_config['snr_y']}_sparse{rep_config['sparsity']}/sim_data_shared_rep{rep_config['rep']}.rds"
+# rep_config = {
+#     "n": 500, "p_l": 1000, "snr_x": 2, "snr_y": 2,
+#     "rep": 1, "sparsity": 0.25, "k_delta": 10
+# }
+rep_config = {
+    "n": 100, "p_l": 100, "snr_x": 2, "snr_y": 2,
+    "rep": 2, "sparsity": 0.25, "k_delta": 10
+}
+if USE_MISALIGNED:
+    rep_config["align_label"] = ALIGN_LABEL
+
+# Aligned data lives under multi_view_shared/; misaligned under
+# multi_view_shared_misaligned/ with an "_align_{label}" suffix on the condition dir.
+data_root = "multi_view_shared_misaligned" if USE_MISALIGNED else "multi_view_shared"
+cond_dir = (
+    f"n{rep_config['n']}p{rep_config['p_l']}"
+    f"_snr{rep_config['snr_x']}.{rep_config['snr_y']}"
+    f"_sparse{rep_config['sparsity']}"
 )
-test_rds = readRDS(
-    f"~/multiomic_integration/sim/data/multi_view_shared/k.5/test/n{rep_config['n']}p{rep_config['p_l']}_snr{rep_config['snr_x']}.{rep_config['snr_y']}_sparse{rep_config['sparsity']}/sim_data_shared_rep{rep_config['rep']}.rds"
-)
+if USE_MISALIGNED:
+    cond_dir += f"_align_{ALIGN_LABEL}"
+
+def _shared_rds_path(split):
+    return (
+        f"~/multiomic_integration/sim/data/{data_root}/k.5/{split}/"
+        f"{cond_dir}/sim_data_shared_rep{rep_config['rep']}.rds"
+    )
+
+print("Loading:", _shared_rds_path("train"))
+train_rds = readRDS(_shared_rds_path("train"))
+test_rds  = readRDS(_shared_rds_path("test"))
 ```
 
 ```{python}
@@ -2919,23 +2952,37 @@ K_FIT   = K_TRUE + K_DELTA
 
 
 NUM_EPOCHS = 500
-MIN_EPOCHS = 100
+MIN_EPOCHS = 200
 
-model_config = {"k": K_FIT, "dense_model": False}
+# num_features = sum([train_subset.tensors[i].shape[1] for i in range(1, len(train_subset.tensors)-1)])
+num_features = 1
+
+model_config = {
+    "k": K_FIT, 
+    "dense_model": False,
+    "outcome_weight": float(num_features)}
+
+# BASE_SNR_THRESHOLD = 0.15
+# N_REF = 500  # condition Optuna was tuned on
+# snr_threshold = BASE_SNR_THRESHOLD * math.sqrt(N_REF / rep_config['n'])
+
 train_config = {
     "eta":           0.25,
     "delta":         1e-16,
-    "t":             0.75, #0.5,
+    "t":             0.1, #0.5,
     "num_particles": 1,
-    "minibatch_size": 128,
+    # "minibatch_size": 128,
+    "minibatch_fraction": 0.15,
     "min_epochs":    MIN_EPOCHS,
     "max_epochs":    NUM_EPOCHS,
     "convergence_criterion": "elbo_snr",
     "window": 50,
-    "snr_threshold": 1,
+    "snr_threshold": 5,
 }
 
+```
 
+```{python}
 pyro.clear_param_store()
 factor_model, train_handler, global_state = train_model_shared(
     model_config, train_config, train_subset,
@@ -2944,6 +2991,7 @@ factor_model, train_handler, global_state = train_model_shared(
     verbose=True,
     write=False,
     device=DEVICE,
+    svd_init=True
 )
 print(f"Global training: {factor_model.total_epochs} epochs")
 ```
@@ -2961,7 +3009,7 @@ p.fig.suptitle("Minibatch loss per epoch")
 
 ```{python}
 p = sns.relplot(
-    data = np.diff(factor_model.loss_history)[10:],
+    data = np.diff(factor_model.loss_history)[1:],
     kind = "line"
 )
 p.set_axis_labels("Epochs", "Negative ELBO")
@@ -2971,7 +3019,7 @@ p.fig.suptitle("Minibatch loss per epoch")
 
 ```{python}
 p = sns.relplot(
-    data = factor_model.var_param_convergence_history[10:],
+    data = factor_model.var_param_convergence_history[1:],
     kind = "line"
 )
 p.set_axis_labels("Epochs", "Norm difference")
@@ -2982,7 +3030,7 @@ p.fig.suptitle("Variational parameter convergence per epoch")
 ## Local inference on test set
 
 ```{python}
-local_config = {**train_config, "minibatch_size": 64} #, "min_epochs": 100, 4}
+local_config = {**train_config} #, "minibatch_size": 64} #, "min_epochs": 100, 4}
 
 factor_model, test_handler, local_state = train_model_locally_shared(
     factor_model, local_config, test_subset,
@@ -2997,7 +3045,7 @@ print(f"Local training: {factor_model.local_epochs} epochs")
 
 ```{python}
 eval_table, cov_table, post_samples, post_samples_test = evaluate_fitted_model_shared(
-    rep_config, data_package,
+    {**rep_config, 'k_delta': 10}, data_package,
     train_handler, test_handler,
     global_state, local_state,
     N_POSTERIOR_SAMPLES=300,
@@ -3072,6 +3120,297 @@ for ax, pred, true, title in [
     ax.set_title(f"Outcome predictions — {title}")
 plt.tight_layout()
 plt.show()
+```
+
+
+## Train: Outcome up-weighting (`outcome_weight`)
+
+The shared scores `Z` are informed by two likelihood terms: the reconstruction
+of the views (`X_l = Z @ Lambda_l^T + E_l`) and the outcome (`y = Z @ beta + e`).
+Per observation the reconstruction contributes `sum_l p_l` Gaussian terms while
+the outcome contributes a single term, so the ELBO is dominated by reconstruction
+by a factor of `sum_l p_l` (here in the hundreds–thousands). When the
+outcome-relevant factor is *not* a high-variance direction in `X` (the misaligned
+regime), the reconstruction gradient barely registers it and whether a given run
+recovers it is left to SVI noise — producing large run-to-run variance in
+outcome MSE.
+
+`SupMultiviewShared` now accepts `outcome_weight`, which up-weights the outcome
+log-likelihood via `pyro.poutine.scale` so it informs `Z` comparably to the
+views. `outcome_weight=1.0` is the original objective. A natural scale is the
+per-observation count of reconstruction terms, `sum_l p_l`; the cell below sweeps
+a few values and compares held-out outcome MSE. Tune it by cross-validation for a
+real analysis.
+
+```{python}
+# Per-observation reconstruction term count — the imbalance the outcome fights.
+X_views_train = data_package["train_X_l_list_clean"]
+L_views   = len(X_views_train)
+total_p   = sum(int(x.shape[1]) for x in X_views_train)
+print(f"L = {L_views} views, total features sum_l p_l = {total_p}")
+
+# Candidate weights: baseline, one-view's worth, and full rebalance.
+outcome_weight_grid = [1.0, float(total_p // L_views), float(total_p)]
+print("outcome_weight grid:", outcome_weight_grid)
+```
+
+```{python}
+ow_results = []
+fractions = [0.2] #[0.1, 0.2, 0.3, 0.4, 0.5]
+
+for frac in fractions:
+    for ow in outcome_weight_grid:
+        pyro.clear_param_store()
+
+        ow_model_config = {**model_config, "outcome_weight": ow}
+        ow_train_config = {**train_config, "minibatch_fraction": frac}
+
+        fm_ow, train_handler_ow, global_state_ow = train_model_shared(
+            ow_model_config, ow_train_config, train_subset,
+            model_out_filename=f"/tmp/shared_ow{ow:.0f}_rep1",
+            opt="adagrad", verbose=False, write=False, device=DEVICE,
+        )
+
+        # Local inference for test Z uses X only — outcome_weight does not leak in.
+        fm_ow, test_handler_ow, local_state_ow = train_model_locally_shared(
+            fm_ow, {**ow_train_config}, test_subset,
+            opt="adagrad", verbose=False, device=DEVICE,
+        )
+
+        eval_table_ow, _, _, _ = evaluate_fitted_model_shared(
+            {**rep_config, "k_delta": K_DELTA}, data_package,
+            train_handler_ow, test_handler_ow,
+            global_state_ow, local_state_ow,
+            N_POSTERIOR_SAMPLES=300,
+            metric_out_filename=f"/tmp/shared_ow{ow:.0f}_metrics_rep1",
+        )
+
+        ow_results.append({
+            "outcome_weight":  ow,
+            "minibatch_fraction": frac,
+            "outcome_mse":     float(eval_table_ow["outcome_mse"].iloc[0]),
+            "mean_joint_rse":  float(eval_table_ow["joint_rse"].mean()),
+            "global_epochs":   int(fm_ow.total_epochs),
+        })
+        print(f"outcome_weight={ow:>8.1f}  "
+            f"minibatch_fraction={frac}  "
+            f"outcome_mse={ow_results[-1]['outcome_mse']:.4f}  "
+            f"mean_joint_rse={ow_results[-1]['mean_joint_rse']:.4f}")
+
+ow_df = pd.DataFrame(ow_results)
+ow_df
+```
+
+```{python}
+# Outcome MSE vs outcome_weight. The Bayes floor for snr_y is 1 / (1 + snr_y).
+snr_y_used = float(rep_config["snr_y"])
+bayes_floor = 1.0 / (1.0 + snr_y_used)
+
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(ow_df["outcome_weight"], ow_df["outcome_mse"], marker="o")
+ax.axhline(bayes_floor, color="black", ls="--",
+           label=f"Bayes floor 1/(1+snr_y) = {bayes_floor:.2f}")
+ax.set_xscale("log")
+ax.set_xlabel("outcome_weight (log scale)")
+ax.set_ylabel("Test outcome MSE")
+ax.set_title("Effect of outcome up-weighting on held-out prediction")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+
+## Outcome up-weighting across misaligned scenarios
+
+Sweep `outcome_weight` × `minibatch_fraction` (the two grids from the section
+above) for all four alignment regimes, at three `(n, p)` cells:
+`(100, 100)`, `(500, 100)`, `(500, 1000)`. This shows where up-weighting the
+outcome and/or a larger minibatch recovers prediction in the misaligned regime,
+and how that interacts with sample size and dimensionality.
+
+`outcome_weight` is dimension-dependent, so each cell rebuilds the grid with the
+same *recipe* as `outcome_weight_grid` above — `[1.0, sum_l p_l / L, sum_l p_l]`
+— labelled `1x` / `per-view` / `full` so heatmaps are comparable across `p`.
+
+> **Cost.** This is `len(cells) × 4 labels × SWEEP_REPS × len(outcome_weight_grid)
+> × len(fractions)` full train + local-inference + evaluate runs
+> (= 3 × 4 × 1 × 3 × 5 = 180 at the defaults). Results are checkpointed to CSV
+> after every run and already-completed rows are skipped, so the cell is safe to
+> interrupt and resume. Increase `SWEEP_REPS` to quantify the run-to-run variance
+> that up-weighting is meant to reduce.
+
+```{python}
+# --- sweep configuration -------------------------------------------------------
+sweep_cells   = [(100, 100), (500, 100), (500, 1000)]   # (n, p_l)
+sweep_labels  = ["symmetric", "mild_misalignment",
+                 "strong_misalignment", "anti_aligned"]
+SWEEP_REPS    = 3                 # reps per (cell, label); >1 reveals variance
+SWEEP_N_POST  = 100               # posterior samples for evaluation
+SWEEP_CSV     = "/tmp/shared_misaligned_owframe_sweep.csv"
+
+# Reuses `fractions` and the `outcome_weight_grid` recipe from the section above.
+weight_kinds = ["1x", "per-view", "full"]   # labels for the 3 recipe entries
+
+
+def _load_shared_cell(n, p_l, align_label, rep, snr_x=2, snr_y=2, sparsity=0.25):
+    """Load + process one misaligned shared condition into model-ready subsets."""
+    conversion.set_conversion(default_converter)
+    cond = (f"n{n}p{p_l}_snr{snr_x}.{snr_y}_sparse{sparsity}"
+            f"_align_{align_label}")
+    root = "~/multiomic_integration/sim/data/multi_view_shared_misaligned/k.5"
+    tr = readRDS(f"{root}/train/{cond}/sim_data_shared_rep{rep}.rds")
+    te = readRDS(f"{root}/test/{cond}/sim_data_shared_rep{rep}.rds")
+    sd      = {nm: r_to_torch(tr.rx2(nm)) for nm in tr.names}
+    sd_test = {nm: r_to_torch(te.rx2(nm)) for nm in te.names}
+    return process_data_shared(sd, sd_test, training_split=False,
+                               training_size=0.8, seed=123)
+
+
+def _weight_grid_for(dp):
+    """Same recipe as outcome_weight_grid, recomputed for this cell's p."""
+    views = dp["train_X_l_list_clean"]
+    L = len(views)
+    tot = sum(int(x.shape[1]) for x in views)
+    return [1.0, float(tot // L), float(tot)]
+```
+
+
+```{python}
+os.getcwd()
+```
+
+```{python}
+import os
+
+# Resume from any existing checkpoint.
+if os.path.exists(SWEEP_CSV):
+    sweep_df = pd.read_csv(SWEEP_CSV)
+    done = set(map(tuple, sweep_df[
+        ["n", "p_l", "align_label", "rep", "weight_kind", "minibatch_fraction"]
+    ].values))
+    print(f"Resuming: {len(sweep_df)} rows already done.")
+else:
+    sweep_df = pd.DataFrame()
+    done = set()
+
+for (n_cell, p_cell) in sweep_cells:
+    for label in sweep_labels:
+        for rep in range(1, SWEEP_REPS + 1):
+            dp_subsets = None   # lazy-load only if work remains for this cell
+
+            # Build per-cell weight grid lazily (needs the data dims).
+            for frac in fractions:
+                for kind in weight_kinds:
+                    key = (n_cell, p_cell, label, rep, kind, frac)
+                    if key in done:
+                        continue
+                    if dp_subsets is None:
+                        train_sub, test_sub, dp_subsets = _load_shared_cell(
+                            n_cell, p_cell, label, rep)
+                        cell_weights = dict(zip(weight_kinds,
+                                                _weight_grid_for(dp_subsets)))
+                    ow = cell_weights[kind]
+
+                    pyro.clear_param_store()
+                    ow_cfg = {**model_config, "outcome_weight": ow}
+                    tr_cfg = {**train_config, "minibatch_fraction": frac}
+
+                    fm, th, gs = train_model_shared(
+                        ow_cfg, tr_cfg, train_sub,
+                        model_out_filename="/tmp/sweep_model",
+                        opt="adagrad", verbose=False, write=False, device=DEVICE,
+                    )
+                    fm, teh, ls = train_model_locally_shared(
+                        fm, {**tr_cfg}, test_sub,
+                        opt="adagrad", verbose=False, device=DEVICE,
+                    )
+                    et, _, _, _ = evaluate_fitted_model_shared(
+                        {**rep_config, "n": n_cell, "p_l": p_cell,
+                         "align_label": label, "rep": rep, "k_delta": K_DELTA},
+                        dp_subsets, th, teh, gs, ls,
+                        N_POSTERIOR_SAMPLES=SWEEP_N_POST,
+                        metric_out_filename="/tmp/sweep_metrics",
+                    )
+
+                    row = {
+                        "n": n_cell, "p_l": p_cell, "align_label": label,
+                        "rep": rep, "weight_kind": kind, "outcome_weight": ow,
+                        "minibatch_fraction": frac,
+                        "outcome_mse": float(et["outcome_mse"].iloc[0]),
+                        "mean_joint_rse": float(et["joint_rse"].mean()),
+                        "global_epochs": int(fm.total_epochs),
+                    }
+                    sweep_df = pd.concat([sweep_df, pd.DataFrame([row])],
+                                         ignore_index=True)
+                    sweep_df.to_csv(SWEEP_CSV, index=False)
+                    done.add(key)
+                    print(f"n={n_cell} p={p_cell} {label:<20} rep{rep} "
+                          f"{kind:<8} frac={frac} -> "
+                          f"mse={row['outcome_mse']:.4f}")
+
+print(f"\nDone. {len(sweep_df)} rows in {SWEEP_CSV}")
+sweep_df
+```
+
+```{python}
+# Mean outcome MSE over reps, as a heatmap grid:
+#   rows = alignment regime, cols = (n, p) cell; axes = weight_kind × minibatch_fraction.
+import seaborn as sns
+
+agg = (sweep_df
+       .groupby(["n", "p_l", "align_label", "weight_kind", "minibatch_fraction"])
+       ["outcome_mse"].mean().reset_index())
+
+bayes_floor = 1.0 / (1.0 + float(rep_config["snr_y"]))
+vmin = agg["outcome_mse"].min()
+vmax = agg["outcome_mse"].max()
+
+n_rows, n_cols = len(sweep_labels), len(sweep_cells)
+fig, axes = plt.subplots(n_rows, n_cols,
+                         figsize=(4 * n_cols, 3.2 * n_rows), squeeze=False)
+
+for i, label in enumerate(sweep_labels):
+    for j, (n_cell, p_cell) in enumerate(sweep_cells):
+        ax = axes[i][j]
+        sub = agg[(agg["align_label"] == label) &
+                  (agg["n"] == n_cell) & (agg["p_l"] == p_cell)]
+        if sub.empty:
+            ax.set_visible(False)
+            continue
+        pivot = (sub.pivot(index="weight_kind", columns="minibatch_fraction",
+                           values="outcome_mse")
+                    .reindex(weight_kinds))
+        sns.heatmap(pivot, ax=ax, vmin=vmin, vmax=vmax, cmap="viridis_r",
+                    annot=True, fmt=".2f", cbar=(j == n_cols - 1),
+                    cbar_kws={"label": "outcome MSE"})
+        if i == 0:
+            ax.set_title(f"n={n_cell}, p={p_cell}")
+        if j == 0:
+            ax.set_ylabel(f"{label}\noutcome_weight")
+        else:
+            ax.set_ylabel("")
+        ax.set_xlabel("minibatch_fraction" if i == n_rows - 1 else "")
+
+fig.suptitle(f"Test outcome MSE by outcome_weight × minibatch_fraction "
+             f"(Bayes floor = {bayes_floor:.2f})", y=1.002)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Per-cell best configuration (lowest mean outcome MSE) and the no-up-weight baseline.
+best = (agg.loc[agg.groupby(["n", "p_l", "align_label"])["outcome_mse"].idxmin()]
+           .rename(columns={"weight_kind": "best_weight_kind",
+                            "minibatch_fraction": "best_minibatch_fraction",
+                            "outcome_mse": "best_mse"}))
+baseline = (agg[(agg["weight_kind"] == "1x") & (agg["minibatch_fraction"] == 0.1)]
+            .rename(columns={"outcome_mse": "baseline_mse_1x_frac0.1"})
+            [["n", "p_l", "align_label", "baseline_mse_1x_frac0.1"]])
+summary = best.merge(baseline, on=["n", "p_l", "align_label"], how="left")
+summary["improvement"] = summary["baseline_mse_1x_frac0.1"] - summary["best_mse"]
+summary[["n", "p_l", "align_label", "best_weight_kind",
+         "best_minibatch_fraction", "best_mse",
+         "baseline_mse_1x_frac0.1", "improvement"]]
 ```
 
 
@@ -3372,6 +3711,11 @@ factor_summary = summarize_factors(
     plot=True,
     verbose=True,
 )
+
+R_varimax = factor_summary["R"]
+top_factors_interp = factor_summary["post"]["per_factor"]["factor"].values - 1
+top_factors_interp = top_factors_interp.tolist()
+
 ```
 
 ```{python}
@@ -3382,9 +3726,7 @@ factor_summary = summarize_factors(
 #     verbose=True,
 # )
 # Rotation matrix for downstream use (e.g. rotating beta)
-R_varimax = factor_summary["R"]
-top_factors_interp = factor_summary["post"]["per_factor"]["factor"].values - 1
-top_factors_interp = top_factors_interp.tolist()
+
 ```
 
 ### Proportion of variance explained
@@ -3769,6 +4111,92 @@ plt.tight_layout()
 plt.show()
 ```
 
+## SVD initialisation
+
+Compare zero initialisation against SVD-based initialisation, holding
+`train_config` and data fixed. Using `k=K_TRUE` (no over-specification) to
+isolate the effect of initialisation from k_delta instability.
+
+
+
+```{python}
+X_l_list = [t for t in train_subset.tensors[1:-1]]
+svd_init_shared(X_l_list, 15)
+```
+
+```{python}
+#| label: svd-init-config
+
+model_config_svd = {**model_config, "k": K_FIT, "dense_model": False}
+```
+
+```{python}
+#| label: svd-init-default
+pyro.clear_param_store()
+t0 = time.time()
+m_default, h_default, gs_default = train_model_shared(
+    model_config_svd, train_config, train_subset,
+    model_out_filename="", opt="adagrad", verbose=False, write=False,
+    device=DEVICE, svd_init=False,
+)
+t_default = time.time() - t0
+print(f"Default init — epochs: {m_default.total_epochs}  time: {t_default:.1f}s")
+```
+
+```{python}
+#| label: svd-init-svd
+pyro.clear_param_store()
+t0 = time.time()
+m_svd, h_svd, gs_svd = train_model_shared(
+    model_config_svd, train_config, train_subset,
+    model_out_filename="", opt="adagrad", verbose=False, write=False,
+    device=DEVICE, svd_init=True,
+)
+t_svd = time.time() - t0
+print(f"SVD init     — epochs: {m_svd.total_epochs}  time: {t_svd:.1f}s")
+```
+
+```{python}
+#| label: svd-init-eval
+def _eval(m, h_train, gs_train):
+    _, h_test, ls_test = train_model_locally_shared(
+        m, train_config, test_subset, opt="adagrad", verbose=False, device=DEVICE,
+    )
+    tbl, _, _, _ = evaluate_fitted_model_shared(
+        {**rep_config, "k_delta": 0}, data_package,
+        h_train, h_test, gs_train, ls_test,
+        N_POSTERIOR_SAMPLES=300, metric_out_filename="",
+    )
+    return tbl[["outcome_mse", "joint_rse", "test_rse"]]
+
+metrics_default_svd = _eval(m_default, h_default, gs_default)
+metrics_svd_svd     = _eval(m_svd,     h_svd,     gs_svd)
+```
+
+```{python}
+#| label: svd-init-summary
+n_train = len(train_subset)
+pd.DataFrame([
+    {"init": "default", "epochs": m_default.total_epochs, "time_s": round(t_default, 1),
+     **metrics_default_svd.iloc[0].to_dict()},
+    {"init": "svd",     "epochs": m_svd.total_epochs,     "time_s": round(t_svd, 1),
+     **metrics_svd_svd.iloc[0].to_dict()},
+])
+```
+
+```{python}
+#| label: svd-init-loss
+fig, ax = plt.subplots(figsize=(7, 3))
+ax.plot([l / n_train for l in m_default.loss_history], label="default", alpha=0.8)
+ax.plot([l / n_train for l in m_svd.loss_history],     label="SVD",     alpha=0.8)
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Neg-ELBO per datum")
+ax.legend()
+ax.set_title(f"SVD vs default init  (N={rep_config['n']}, P={rep_config['p_l']}, K={K_TRUE})")
+plt.tight_layout()
+plt.show()
+```
+
 ## Cross-validation for hyperparameter selection
 
 ```{python}
@@ -3807,38 +4235,35 @@ N_CV_POSTERIOR_SAMPLES = 10
 # ---------------------------------------------------------------------------
 # AdagradRMSProp hyperparameter grid
 # ---------------------------------------------------------------------------
-eta_cv_array       = [0.1, 0.25, 0.5, 0.75, 1.0]
-delta_cv_array     = [1e-16]
-t_cv_array         = [0.1, 0.25, 0.5, 0.75, 1.0]
-particle_cv_array  = [1, 2]
-minibatch_cv_array_full = [128, 256, 512] #[32, 64, 128, 256, 512]
-min_epoch_cv_array = [100]
-max_epoch_cv_array = [500]
+eta_cv_array              = [0.1, 0.25, 0.5, 0.75, 1.0]
+delta_cv_array            = [1e-16]
+t_cv_array                = [0.1, 0.25, 0.5, 0.75, 1.0]
+particle_cv_array         = [1, 2]
+# Minibatch as a fraction of the fold training size. Each fold converts this
+# to an absolute count, so comparisons are valid across different n.
+minibatch_fraction_cv_array = [0.05, 0.1, 0.2, 0.5]
+min_epoch_cv_array        = [100]
+max_epoch_cv_array        = [500]
 convergence_criterion_array = "elbo_snr",
-window_array = [50]
-snr_threshold_array = [1]
+window_array              = [50]
+snr_threshold_array       = [1]
 
-# Cap the minibatch grid so it never exceeds the size of a CV training fold.
-# (Any config that requested a larger minibatch would otherwise be silently
-# clamped by Pyro/DataLoader to the dataset size, biasing comparisons.)
-n_obs_cv          = X_l_cv_raw[0].shape[0]
-n_train_per_fold  = int(n_obs_cv * (N_CV_FOLDS - 1) / N_CV_FOLDS)
-minibatch_cv_array = [m for m in minibatch_cv_array_full if m <= n_train_per_fold]
-if not minibatch_cv_array:
-    minibatch_cv_array = [min(minibatch_cv_array_full)]
-print(f"Per-fold training size: {n_train_per_fold}  -> "
-      f"minibatch grid: {minibatch_cv_array}")
-
+n_obs_cv         = X_l_cv_raw[0].shape[0]
+n_train_per_fold = int(n_obs_cv * (N_CV_FOLDS - 1) / N_CV_FOLDS)
+print(f"Per-fold training size: {n_train_per_fold}")
+print(f"Minibatch fraction grid: {minibatch_fraction_cv_array}")
+print(f"  -> absolute sizes at fold scale: "
+      f"{[max(1, int(n_train_per_fold * f)) for f in minibatch_fraction_cv_array]}")
 
 cv_train_grid_names = (
     "eta", "delta", "t",
-    "num_particles", "minibatch_size", "min_epochs", "max_epochs", "convergence_criterion",
-    "window", "snr_threshold"
+    "num_particles", "minibatch_fraction", "min_epochs", "max_epochs",
+    "convergence_criterion", "window", "snr_threshold"
 )
 
 cv_train_grid = list(itertools.product(
     eta_cv_array, delta_cv_array, t_cv_array,
-    particle_cv_array, minibatch_cv_array, min_epoch_cv_array, max_epoch_cv_array,
+    particle_cv_array, minibatch_fraction_cv_array, min_epoch_cv_array, max_epoch_cv_array,
     convergence_criterion_array, window_array, snr_threshold_array
 ))
 print(f"{len(cv_train_grid)} hyperparameter configurations")
@@ -3893,7 +4318,6 @@ cv_results_shared = run_cv_grid_shared(
     n_workers=N_CV_WORKERS,
     sim_decomp=cv_sim_decomp,
     column_filters=cv_col_filters,
-    minibatch_grid=minibatch_cv_array_full,
     checkpoint_path=CV_CHECKPOINT_PATH,
     resume=True,
 )
@@ -4071,7 +4495,7 @@ top_cv = cv_results_shared[cv_results_shared["config_idx"].isin(top_config_ids)]
 top_cv["config_label"] = (
     "eta="   + top_cv["eta"].astype(str)
     + " t="  + top_cv["t"].astype(str)
-    + " bs=" + top_cv["minibatch_size"].astype(str)
+    + " mbf=" + top_cv["minibatch_fraction"].astype(str)
 )
 label_order = (
     top_cv.groupby("config_label")["outcome_mse"].mean()
@@ -4103,22 +4527,66 @@ cv_results_shared.loc[cv_results_shared.config_idx == 7]
 ## Hyperparam selection with Optuna
 
 ```{python}
+
+for _mod in ("optuna_cv",):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
 from optuna_cv import run_optuna_study, pareto_dataframe
 
+```
+
+```{python}
+optuna_param_space = {
+    # --- tuned (continuous, log scale) ---
+    "eta":                {"type": "float",  "low": 0.001, "high": 1.0,  "log": True},
+    "t":                  {"type": "float",  "low": 0.01,  "high": 1.0,  "log": True},
+    "snr_threshold":      {"type": "float",  "low": 0.1,  "high": 10.0,  "log": True},
+    # fraction of fold training size; converted to abs count inside each fold
+    "minibatch_fraction": {"type": "float",  "low": 0.05, "high": 0.5,  "log": True},
+    # --- tuned (discrete) ---
+    # --- fixed ---
+    "num_particles":      {"type": "fixed",  "value": 1},
+    "delta":              {"type": "fixed",  "value": 1e-16},
+    "min_epochs":         {"type": "fixed",  "value": 200},
+    "max_epochs":         {"type": "fixed",  "value": 500},
+    "convergence_criterion": {"type": "fixed", "value": "elbo_snr"},
+    "window":             {"type": "fixed",  "value": 50},
+}
 ```
 
 ```{python}
 study, labels = run_optuna_study(
     X_l_cv_raw, y_cv_raw,
     model_config=cv_model_config,
+    param_space=optuna_param_space,
     sim_decomp=cv_sim_decomp,
     column_filters=cv_col_filters,
-    minibatch_choices=minibatch_cv_array_full,
-    n_trials=100,
+    n_trials=50,
+    n_folds=N_CV_FOLDS,
+    seed=CV_SEED,
+    n_posterior_samples=N_CV_POSTERIOR_SAMPLES,
     storage="sqlite:///optuna_cv_shared.db",
-    study_name="shared_cv_run1",
+    study_name="shared_cv_run2",
 )
 pareto_dataframe(study, labels)
+```
+
+
+```{python}
+pareto_df = pareto_dataframe(study, labels)
+for col in ["outcome_mse", "cov_frob", "train_time"]:
+    pareto_df[f"{col}_norm"] = (pareto_df[col] - pareto_df[col].min()) / (pareto_df[col].max() - pareto_df[col].min())
+
+norm_cols = [c for c in pareto_df.columns if c.endswith("_norm")]
+pareto_df["dist_from_ideal"] = pareto_df[norm_cols].pow(2).sum(axis=1).pow(0.5)
+best = pareto_df.sort_values("dist_from_ideal").iloc[0]
+
+```
+
+
+```{python}
+pareto_df.sort_values("dist_from_ideal")#.iloc[0:5]
 ```
 
 # Convergence criterion comparison
@@ -4328,5 +4796,4 @@ ax.set_title("Variational parameter convergence history")
 ax.legend()
 plt.tight_layout()
 plt.show()
-```
 ```
