@@ -9,8 +9,8 @@ and saved as:
 where <cond_dir> follows the pattern n{n}p{p}_snr{snr_x}.{snr_y}_sparse{sparsity}.
 """
 
+import argparse
 import os
-import sys
 import itertools
 from pathlib import Path
 import time
@@ -35,8 +35,6 @@ elif torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 print(f"Using device: {DEVICE}")
-
-sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
 
 from data_utils import load_rds_rep
 from run_methods import (
@@ -65,29 +63,28 @@ reps                 = 10
 loading_sparsity     = [0.25]
 k_deltas             = [0, 10]       # over-specification of k at inference time
 
-sim_grid = itertools.product(
+sim_grid = list(itertools.product(
     n_array, p_array, snr_x_array, snr_y_array, loading_sparsity, k_deltas
-)
+))
 
 # ---------------------------------------------------------------------------
 # Training hyperparameters
 # ---------------------------------------------------------------------------
-N_POSTERIOR_SAMPLES = 200
-MINIBATCH_SIZE      = 32
-# MINIBATCH_SIZE_LOW  = 16
-MIN_EPOCHS          = 200
+N_POSTERIOR_SAMPLES  = 200
+MINIBATCH_FRACTION   = 0.1   # fraction of training set size; converted per run
+MIN_EPOCHS           = 100
 # MIN_EPOCHS_HIGH     = 500   # for n=50
-MIN_EPOCHS_LOCAL    = 200
+MIN_EPOCHS_LOCAL    = 100
 NUM_EPOCHS          = 1000
-NUM_PARTICLES       = 2
+NUM_PARTICLES       = 1
 CONVERGENCE_CRITERION = "elbo_snr"
-WINDOW = 20
-SNR_THRESHOLD = 0.1
+WINDOW = 50
+SNR_THRESHOLD = 1
 
 # AdagradRMSProp defaults (match single-view model)
-ETA   = 0.5
+ETA   = 0.25
 DELTA = 1e-16
-T     = 0.1
+T     = 0.75
 
 TRAINING_SPLIT = False
 TRAINING_SIZE  = 0.8
@@ -115,6 +112,17 @@ metric_list = []
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--task-id", type=int, default=None,
+        help="SGE array task ID (1-indexed). Selects one grid element; omit to run all.",
+    )
+    args = parser.parse_args()
+
+    grid_to_run = (
+        [sim_grid[args.task_id - 1]] if args.task_id is not None else sim_grid
+    )
+
     # Build filename dicts once per data root
     def _build_filename_dict(path):
         expanded = os.path.expanduser(path)
@@ -126,7 +134,7 @@ if __name__ == "__main__":
     filename_dict      = _build_filename_dict(train_sim_data_path)
     test_filename_dict = _build_filename_dict(test_sim_data_path)
 
-    for n, p, snr_x, snr_y, sparsity, k_delta in sim_grid:
+    for n, p, snr_x, snr_y, sparsity, k_delta in grid_to_run:
         pyro.clear_param_store()
 
         cond_str = file_dir_base.format(n, p, snr_x, snr_y, sparsity)
@@ -172,7 +180,7 @@ if __name__ == "__main__":
                 "delta":         DELTA,
                 "t":             T,
                 "num_particles": NUM_PARTICLES,
-                "minibatch_size": MINIBATCH_SIZE,
+                "minibatch_fraction": MINIBATCH_FRACTION,
                 "min_epochs":    MIN_EPOCHS,
                 "max_epochs":    NUM_EPOCHS,
                 "convergence_criterion": CONVERGENCE_CRITERION,
