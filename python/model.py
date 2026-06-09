@@ -790,7 +790,7 @@ class SupMultiviewDecomp(PyroModule):
                 loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), torch.zeros(p_l, k_l))
             scale_Gamma_l = pyro.param(Params.scale_Gamma_l.format(l = l), 
                                     #    torch.ones(p_l, k_l),
-                                       torch.tensor(self.init_param).expand([p_l, k_l]),
+                                       torch.full((p_l, k_l), self.init_param),
                                        constraint = dist.constraints.positive)
             Gamma_l = pyro.sample(Sites.Gamma_l.format(l = l), 
                                   dist.Normal(loc_Gamma_l, scale_Gamma_l).to_event(2))
@@ -847,7 +847,7 @@ class SupMultiviewDecomp(PyroModule):
                 loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l = l), 
                                         # torch.ones(p_l, self.k),
-                                        torch.tensor(self.init_param).expand([p_l, self.k]),
+                                        torch.full((p_l, self.k), self.init_param),
                                         constraint = dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l = l), 
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -895,7 +895,7 @@ class SupMultiviewDecomp(PyroModule):
         loc_beta = pyro.param(Params.loc_beta, torch.zeros(self.num_outcome_factors))
         scale_beta = pyro.param(Params.scale_beta, 
                                 # torch.ones(self.num_outcome_factors),
-                                torch.tensor(self.init_param).expand([self.num_outcome_factors]),
+                                torch.full((self.num_outcome_factors,), self.init_param),
                                 constraint = dist.constraints.positive)
         beta = pyro.sample(Sites.beta,
                            dist.Normal(loc_beta, scale_beta).to_event(1)).\
@@ -943,7 +943,7 @@ class SupMultiviewDecomp(PyroModule):
         # scale_Z = pyro.param(Params.scale_Z, torch.ones(self.n, self.k),
         #                         constraint = dist.constraints.positive)
         scale_Z = pyro.param(Params.scale_Z, 
-                             torch.tensor(self.init_param).expand([self.n, self.k]),
+                             torch.full((self.n, self.k), self.init_param),
                              constraint = dist.constraints.positive)
         loc_Phi_list = []
         scale_Phi_list = []
@@ -958,7 +958,7 @@ class SupMultiviewDecomp(PyroModule):
                 loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
             scale_Phi_l = pyro.param(Params.scale_Phi_l.format(l = l), 
                                     #  torch.ones(self.n, k_l),
-                                     torch.tensor(self.init_param).expand([self.n, k_l]),
+                                     torch.full((self.n, k_l), self.init_param),
                                      constraint = dist.constraints.greater_than_eq(0.0)) #dist.constraints.positive
             loc_Phi_list.append(loc_Phi_l)
             scale_Phi_list.append(scale_Phi_l)
@@ -1151,7 +1151,7 @@ class SupMultiviewDecomp(PyroModule):
                 loc_Gamma_l = pyro.param(Params.loc_Gamma_l.format(l = l), torch.zeros(p_l, k_l))
             scale_Gamma_l = pyro.param(Params.scale_Gamma_l.format(l = l), 
                                     #    torch.ones(p_l, k_l),
-                                       torch.tensor(self.init_param).expand([p_l, k_l]),
+                                       torch.full((p_l, k_l), self.init_param),
                                        constraint = dist.constraints.positive)
             Gamma_l = pyro.sample(Sites.Gamma_l.format(l = l), 
                                   dist.Normal(loc_Gamma_l, scale_Gamma_l).to_event(2))
@@ -1179,7 +1179,7 @@ class SupMultiviewDecomp(PyroModule):
                 loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l = l), torch.zeros(p_l, self.k))
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l = l), 
                                         # torch.ones(p_l, self.k),
-                                        torch.tensor(self.init_param).expand([p_l, self.k]),
+                                        torch.full((p_l, self.k), self.init_param),
                                         constraint = dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l = l), 
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -1227,7 +1227,7 @@ class SupMultiviewDecomp(PyroModule):
         loc_beta = pyro.param(Params.loc_beta, torch.zeros(self.num_outcome_factors))
         scale_beta = pyro.param(Params.scale_beta, 
                                 # torch.ones(self.num_outcome_factors),
-                                torch.tensor(self.init_param).expand([self.num_outcome_factors]),
+                                torch.full((self.num_outcome_factors,), self.init_param),
                                 constraint = dist.constraints.positive)
         beta = pyro.sample(Sites.beta,
                            dist.Normal(loc_beta, scale_beta).to_event(1)).\
@@ -1275,7 +1275,7 @@ class SupMultiviewDecomp(PyroModule):
         # scale_Z = pyro.param(Params.scale_Z, torch.ones(self.n, self.k),
         #                         constraint = dist.constraints.positive)
         scale_Z = pyro.param(Params.scale_Z,
-                             torch.tensor(self.init_param).expand([self.n, self.k]),
+                             torch.full((self.n, self.k), self.init_param),
                              constraint = dist.constraints.positive)
         loc_Phi_list = []
         scale_Phi_list = []
@@ -1290,7 +1290,7 @@ class SupMultiviewDecomp(PyroModule):
                 loc_Phi_l = pyro.param(Params.loc_Phi_l.format(l = l), torch.zeros(self.n, k_l))
             scale_Phi_l = pyro.param(Params.scale_Phi_l.format(l = l),
                                     #  torch.ones(self.n, k_l),
-                                     torch.tensor(self.init_param).expand([self.n, k_l]),
+                                     torch.full((self.n, k_l), self.init_param),
                                      constraint = dist.constraints.greater_than_eq(0.0)) #dist.constraints.positive
             loc_Phi_list.append(loc_Phi_l)
             scale_Phi_list.append(scale_Phi_l)
