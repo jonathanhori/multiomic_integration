@@ -59,10 +59,14 @@ fit_outcome_mofa <- function(mofa_obj, y_train) {
 
 
 # Predict outcome for test observations given their projected factors.
-predict_outcome_mofa <- function(lm_fit, Z_test) {
-  # coef names are "Z_trainFactor1" etc — use matrix multiply to stay generic
-  beta <- stats::coef(lm_fit)
-  as.numeric(Z_test %*% beta)
+#
+# Returns a matrix with columns fit / lwr / upr when interval != "none",
+# or a plain numeric vector when interval = "none".
+predict_outcome_mofa <- function(lm_fit, Z_test, interval = "none", level = 0.95) {
+  stats::predict(lm_fit,
+                 newdata  = list(Z_train = Z_test),
+                 interval = interval,
+                 level    = level)
 }
 
 
@@ -113,17 +117,21 @@ eval_mofa_shared <- function(mofa_obj,
     norm(diff, "F")^2 / norm(X_l_test_std[[l]], "F")^2
   })
 
-  # Outcome
-  y_pred      <- predict_outcome_mofa(lm_fit, Z_test)
+  # Outcome — prediction intervals from OLS (conditional on Z_test as fixed)
+  pred_int    <- predict_outcome_mofa(lm_fit, Z_test,
+                                      interval = "prediction", level = 0.95)
+  y_pred      <- pred_int[, "fit"]
   outcome_mse <- mean((y_pred - y_test_std)^2)
+  outcome_95p_coverage <- mean(y_test_std >= pred_int[, "lwr"] &
+                                y_test_std <= pred_int[, "upr"])
 
   data.frame(
     view                 = seq_len(L) - 1L,  # 0-indexed to match Python
     joint_rse            = joint_rse,
     test_rse             = test_rse,
-    joint_95p_coverage   = NA_real_,          # point estimate — no uncertainty
+    joint_95p_coverage   = NA_real_,
     outcome_mse          = outcome_mse,
-    outcome_95p_coverage = NA_real_
+    outcome_95p_coverage = outcome_95p_coverage
   )
 }
 
@@ -180,12 +188,21 @@ run_and_eval_mofa_shared <- function(n, p, snr_x, snr_y, sparsity, k_delta,
                                       train_data_root,
                                       test_data_root,
                                       metric_out_path,
-                                      K_true     = 9,
-                                      seed       = 123) {
-  cond_dir    <- sprintf("n%sp%s_snr%s.%s_sparse%s", n, p, snr_x, snr_y, sparsity)
+                                      K_true      = 5,
+                                      seed        = 123,
+                                      align_label = NULL) {
+  # cond_dir and out_name differ between standard and asymmetric modes.
+  if (is.null(align_label)) {
+    cond_dir <- sprintf("n%sp%s_snr%s.%s_sparse%s", n, p, snr_x, snr_y, sparsity)
+    out_name <- sprintf("mofa_n%sp%s_snr%s.%s_sparse%s_deltak%s_rep%s",
+                        n, p, snr_x, snr_y, sparsity, k_delta, rep)
+  } else {
+    cond_dir <- sprintf("n%sp%s_snr%s.%s_sparse%s_align_%s",
+                        n, p, snr_x, snr_y, sparsity, align_label)
+    out_name <- sprintf("mofa_asym_n%sp%s_align%s_deltak%s_rep%s",
+                        n, p, align_label, k_delta, rep)
+  }
   file_name   <- sprintf("sim_data_shared_rep%s.rds", rep)
-  out_name    <- sprintf("mofa_n%sp%s_snr%s.%s_sparse%s_deltak%s_rep%s",
-                          n, p, snr_x, snr_y, sparsity, k_delta, rep)
   metric_file <- file.path(metric_out_path, paste0(out_name, ".rds"))
 
   message("  rep ", rep, ": metric_file=", metric_file)
@@ -261,14 +278,15 @@ run_and_eval_mofa_shared <- function(n, p, snr_x, snr_y, sparsity, k_delta,
       X_l_test_std = X_l_test_std
     ) |>
       mutate(
-        n         = n,
-        p         = p,
-        snr_x     = snr_x,
-        snr_y     = snr_y,
-        rep       = rep,
-        sparsity  = sparsity,
-        k_delta   = k_delta,
-        runtime   = as.numeric(difftime(tok, tik, units = "secs"))
+        n           = n,
+        p           = p,
+        snr_x       = snr_x,
+        snr_y       = snr_y,
+        rep         = rep,
+        sparsity    = sparsity,
+        k_delta     = k_delta,
+        runtime     = as.numeric(difftime(tok, tik, units = "secs")),
+        align_label = if (is.null(align_label)) NA_character_ else align_label
       )
     message("  rep ", rep, ": eval_tbl done, nrow=", nrow(eval_tbl))
 
@@ -276,13 +294,14 @@ run_and_eval_mofa_shared <- function(n, p, snr_x, snr_y, sparsity, k_delta,
     W_list  <- get_weights(mofa_obj)
     cov_tbl <- eval_cov_mofa(W_list, train_data, X_l_sds, col_filters) |>
       mutate(
-        n        = n,
-        p        = p,
-        snr_x    = snr_x,
-        snr_y    = snr_y,
-        rep      = rep,
-        sparsity = sparsity,
-        k_delta  = k_delta
+        n           = n,
+        p           = p,
+        snr_x       = snr_x,
+        snr_y       = snr_y,
+        rep         = rep,
+        sparsity    = sparsity,
+        k_delta     = k_delta,
+        align_label = if (is.null(align_label)) NA_character_ else align_label
       )
     message("  rep ", rep, ": cov_tbl done, nrow=", nrow(cov_tbl))
 
@@ -309,49 +328,82 @@ run_and_eval_mofa_shared <- function(n, p, snr_x, snr_y, sparsity, k_delta,
 # ---------------------------------------------------------------------------
 
 if (!interactive()) {
-  K_TRUE     <- 9
-  REPS       <- 10
-  TRAIN_ROOT <- "~/multiomic_integration/sim/data/multi_view_shared/k.5/train"
-  TEST_ROOT  <- "~/multiomic_integration/sim/data/multi_view_shared/k.5/test"
-  METRIC_OUT <- "~/multiomic_integration/sim/results/integration_shared/metrics_mofa"
+  K_TRUE <- 5
+  REPS   <- 10
 
-  n_array                <- c(100, 500)
-  p_array                <- c(50, 100, 1000)
-  snr_x_array            <- c(2)
-  snr_y_array            <- c(2)
-  loading_sparsity_array <- c(0.25)
-  k_deltas               <- c(0, 10)
+  # ---------------------------------------------------------------------------
+  # Rscript mofa_run.R [mode] [task_id]
+  #   mode    : "standard" (default) or "asymmetric"
+  #   task_id : optional integer row index; omit to run all rows
+  # ---------------------------------------------------------------------------
+  cli_args <- commandArgs(trailingOnly = TRUE)
+  mode     <- if (length(cli_args) >= 1) cli_args[1] else "standard"
+  task_id  <- if (length(cli_args) >= 2) as.integer(cli_args[2]) else NULL
 
-  sim_grid <- expand.grid(
-    n        = n_array,
-    p        = p_array,
-    snr_x    = snr_x_array,
-    snr_y    = snr_y_array,
-    sparsity = loading_sparsity_array,
-    k_delta  = k_deltas,
-    stringsAsFactors = FALSE
-  )
+  if (mode == "standard") {
+    TRAIN_ROOT <- "~/multiomic_integration/sim/data/multi_view_shared/k.5/train"
+    TEST_ROOT  <- "~/multiomic_integration/sim/data/multi_view_shared/k.5/test"
+    METRIC_OUT <- "~/multiomic_integration/sim/results/integration_shared/metrics_mofa"
 
-  for (i in seq_len(nrow(sim_grid))) {
-    row <- sim_grid[i, ]
-    message("\n=== Condition: n=", row$n, " p=", row$p,
+    sim_grid <- expand.grid(
+      n           = c(100, 500, 1000),
+      p           = c(100, 500, 1000),
+      snr_x       = c(2),
+      snr_y       = c(2),
+      sparsity    = c(0.25),
+      k_delta     = c(0, 10),
+      align_label = NA_character_,
+      stringsAsFactors = FALSE
+    )
+
+  } else if (mode == "asymmetric") {
+    TRAIN_ROOT <- "~/multiomic_integration/sim/data/multi_view_shared_misaligned/k.5/train"
+    TEST_ROOT  <- "~/multiomic_integration/sim/data/multi_view_shared_misaligned/k.5/test"
+    METRIC_OUT <- "~/multiomic_integration/sim/results/integration_shared_misaligned/metrics_mofa"
+
+    sim_grid <- expand.grid(
+      n           = c(100, 500, 1000),
+      p           = c(50, 100, 500, 1000),
+      snr_x       = 2,
+      snr_y       = 2,
+      sparsity    = 0.25,
+      k_delta     = c(0, 10),
+      align_label = c("symmetric", "mild_misalignment",
+                      "strong_misalignment", "anti_aligned"),
+      stringsAsFactors = FALSE
+    )
+
+  } else {
+    stop("Unknown mode '", mode, "'. Use 'standard' or 'asymmetric'.")
+  }
+
+  dir.create(path.expand(METRIC_OUT), recursive = TRUE, showWarnings = FALSE)
+
+  rows_to_run <- if (!is.null(task_id)) task_id else seq_len(nrow(sim_grid))
+
+  for (i in rows_to_run) {
+    row   <- sim_grid[i, ]
+    al    <- if (is.na(row$align_label)) NULL else row$align_label
+    label <- if (is.null(al)) "" else paste0(" align=", al)
+    message("\n=== n=", row$n, " p=", row$p,
             " snr=", row$snr_x, ".", row$snr_y,
             " sparse=", row$sparsity,
-            " k_delta=", row$k_delta, " ===")
+            " k_delta=", row$k_delta, label, " ===")
 
     for (rep in seq_len(REPS)) {
       run_and_eval_mofa_shared(
-        n        = row$n,
-        p        = row$p,
-        snr_x    = row$snr_x,
-        snr_y    = row$snr_y,
-        sparsity = row$sparsity,
-        k_delta  = row$k_delta,
-        rep      = rep,
+        n               = row$n,
+        p               = row$p,
+        snr_x           = row$snr_x,
+        snr_y           = row$snr_y,
+        sparsity        = row$sparsity,
+        k_delta         = row$k_delta,
+        rep             = rep,
         train_data_root = TRAIN_ROOT,
         test_data_root  = TEST_ROOT,
         metric_out_path = METRIC_OUT,
-        K_true   = K_TRUE
+        K_true          = K_TRUE,
+        align_label     = al
       )
     }
   }
