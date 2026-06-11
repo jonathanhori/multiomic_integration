@@ -155,16 +155,18 @@ class ModelHandler:
                 for batch in loader:
                     # batch is subsampled [idx, X_l_list, y]
                     batch_idx = batch.pop(0).to(self.device)
-                    if self.model.model_type == "MatrixDecomp":
+                    if self.model.model_type in ("MatrixDecomp", "SupMultiviewDecomp", "SupMultiviewShared"):
+                        # Expected batch order: [idx, X_1, ..., X_L, y]
+                        # For censored outcome:  [idx, X_1, ..., X_L, cens, y]
                         y_batch = batch.pop(-1).squeeze().to(self.device)
+                        if getattr(self.model, 'outcome', 'gaussian') == "censored":
+                            cens_batch = batch.pop(-1).squeeze().to(self.device)
                         batch = [t.to(self.device) for t in batch]
-                        loss = inference.step(batch, batch_idx, y_batch)
-                    elif self.model.model_type in ("SupMultiviewDecomp", "SupMultiviewShared"):
-                        y_batch = batch.pop(-1).squeeze().to(self.device)
-                        batch = [t.to(self.device) for t in batch]
-                        # In predict mode y is not available at inference time; only X informs Z.
+                        # In predict mode only X informs Z; y is not observed.
                         if self.mode == "predict":
                             loss = inference.step(batch, batch_idx)
+                        elif getattr(self.model, 'outcome', 'gaussian') == "censored":
+                            loss = inference.step(batch, batch_idx, y_batch, cens_batch)
                         else:
                             loss = inference.step(batch, batch_idx, y_batch)
                     if self.device.type != "cpu":

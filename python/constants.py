@@ -3,6 +3,7 @@
 class Sites:
     """For sparse model only"""
     delta_gamma_l_k = "delta_gamma_l{l}_k{m}"
+    delta_gamma_l = "delta_gamma_l{l}"
     rho_gamma_l = "rho_gamma_l{l}"
     sigma2_gamma_l = "sigma2_gamma_l{l}" # for dense model
     Gamma_l = "Gamma_l{l}"
@@ -37,6 +38,8 @@ class Params:
     """For sparse model"""
     a_delta_gamma_l_k = "a_delta_gamma_l{l}_k{m}"
     b_delta_gamma_l_k = "b_delta_gamma_l{l}_k{m}"
+    a_delta_gamma_l = "a_delta_gamma_l{l}"
+    b_delta_gamma_l = "b_delta_gamma_l{l}"
     a_rho_gamma_l = "a_rho_gamma_l{l}"
     b_rho_gamma_l = "b_rho_gamma_l{l}"
     a_sigma_gamma_l = "a_sigma_gamma_l{l}" # for dense guide
