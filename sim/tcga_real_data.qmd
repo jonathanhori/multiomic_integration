@@ -372,29 +372,92 @@ cmap="coolwarm"
 ```
 
 
-```{python}
-# working_Lambda = lambda_est # est_Lambda0_varimax
 
-Lambda_colsums = np.sum(lambda_est ** 2, axis = 0)
-# Lambda_colsums = np.sum(Lambda_est.detach().numpy() ** 2, axis = 0)
-Lambda_totalsum = np.sum(Lambda_colsums)
-sns.relplot(
-    Lambda_colsums / Lambda_totalsum,
-    # np.sum(Lambda_est_rotated ** 2, axis = 0),
-    kind="line"
-    )
+```{python}
+# Variational posterior means
+# lambda_est = [pyro.param(Params.loc_Lambda_l.format(l=l)).detach() for l in range(1)]  # (p, K)
+# Z_est      = pyro.param(Params.loc_Z).detach()                     # (n_train, K)
+```
+
+## Factor summary
+
+```{python}
+importlib.reload(sys.modules["factor_interpretation"])
+from factor_interpretation import (
+    compute_pve, compute_r2_per_factor,
+    plot_pve, plot_r2,
+    plot_factor_loadings, plot_factor_scores_2d, plot_factor_outcome,
+    tabulate_top_features,
+    summarize_factors
+)
+```
+
+Need X, Z, Lambda, beta, y
+
+```{python}
+Z_est      = pyro.param(Params.loc_Z).detach()
+lambda_est = summarise_post_samples(post_train['Lambda_l0'])['mean'].squeeze().detach().numpy()
+beta_est   = pyro.param(Params.loc_beta).detach()
+
+# Sample beta from the variational posterior, then rotate and take quantiles
+# inside summarize_factors for correct credible intervals.
+post_beta     = train_handler.predict([tmb_data_package['X_train']], 200,
+                                      return_sites=[Sites.beta])
+beta_samp     = post_beta[Sites.beta].squeeze()   # (S, K)
+
+factor_summary = summarize_factors(
+    [tmb_data_package['X_train']],
+    Z_est,
+    [lambda_est],
+    beta=beta_est,
+    beta_samples=beta_samp,
+    y=tmb_data_package['y_train'],
+    plot=True,
+    verbose=True,
+)
+R_varimax = factor_summary["R"]
+top_factors_fac = factor_summary["post"]["per_factor"]["factor"].values - 1
+top_factors_fac = top_factors_fac.tolist()
 ```
 
 ```{python}
-Lambda_rot_colsums = np.sum(lambda_est_rotated ** 2, axis = 0)
-# Lambda_colsums = np.sum(Lambda_est.detach().numpy() ** 2, axis = 0)
-Lambda_rot_totalsum = np.sum(Lambda_rot_colsums)
+lambda_est_rotated = lambda_est
+```
 
-sns.relplot(
-    Lambda_rot_colsums / Lambda_rot_totalsum,
-    # np.sum(Lambda_est_rotated ** 2, axis = 0),
-    kind="line"
-    )
+```{python}
+plot_factor_loadings(
+    [lambda_est], rotate=True,
+    title="Factor loadings — MatrixDecomp (varimax-rotated)",
+)
+```
+
+## Factor score scatter plots
+
+```{python}
+plot_factor_scores_2d(
+    Z_est, y=tmb_data_package['y_train'],
+    top_factors=top_factors_fac,
+    n_factors=5,
+    y_label="outcome",
+    title="Factor score scatterplot matrix (coloured by outcome)\nTop active factors",
+)
+```
+
+```{python}
+plot_factor_outcome(
+    factor_summary["Z_rot"], tmb_data_package['y_train'],
+    top_factors=top_factors_fac,
+    n_factors_show=6,
+    outcome_label="outcome",
+    title="Outcome along samples ranked by factor score — top active factors",
+    factor_summary=factor_summary,
+)
+```
+
+
+```{python}
+pve = plot_pve([lambda_est], title="PVE per factor (unrotated)")
+pve_rot = plot_pve([lambda_est_rotated], title="PVE per factor (varimax-rotated)")
 ```
 
 When does tau become large?
@@ -416,6 +479,10 @@ p.set(xlabel = "Factor k", ylabel = "Mean Tau (global shrinkage)")
 Directional effects of factors
 ```{python}
 pyro.param('loc_beta') / pyro.param('scale_beta')
+```
+
+```{python}
+pyro.param('sigma2_y')
 ```
 
 ```{python}
@@ -844,30 +911,23 @@ log(1 + TMB).
 # Factor scores: variational posterior mean of Z for all training observations
 Z_scores   = pyro.param(Params.loc_Z).detach().numpy()   # (n_train, k)
 y_train_np = tmb_data_package["y_train"].numpy()
+```
 
-N_PAIRS = 5   # show N_PAIRS consecutive pairs from the top active factors
-# top_k   = top_factors[:N_PAIRS + 1]
-top_k   = list(range(len(top_factors)))[:N_PAIRS + 1]
-
-fig, axes = plt.subplots(1, N_PAIRS, figsize=(5 * N_PAIRS, 4))
-for i, ax in enumerate(axes):
-    f1, f2 = top_k[i], top_k[i + 1]
-    sc = ax.scatter(
-        Z_scores[:, f1], Z_scores[:, f2],
-        c=y_train_np, cmap="viridis", s=18, alpha=0.7
-    )
-    ax.set_xlabel(f"Factor {f1+1} score")
-    ax.set_ylabel(f"Factor {f2+1} score")
-    ax.set_title(f"F{f1+1} vs F{f2+1}")
-    plt.colorbar(sc, ax=ax, label="log(1+TMB)")
-
-fig.suptitle(
-    "Factor score scatter plots (coloured by log TMB)\n"
-    "Top active factors — consecutive pairs",
-    fontsize=12
+```{python}
+plot_factor_scores_2d(
+    Z_scores, y=y_train_np,
+    top_factors=list(range(len(top_factors))),
+    n_factors=5,
+    y_label="log(1+TMB)",
+    title="Factor score scatterplot matrix (coloured by log TMB)\nTop active factors",
 )
-plt.tight_layout()
-plt.show()
+```
+
+```{python}
+r2 = plot_r2(
+    [tmb_data_package["X_train"]], Z_scores, [lambda_est_rotated],
+    title="R² per factor — MatrixDecomp (varimax-rotated loadings)",
+)
 ```
 
 ### 3. Implied vs observed covariance matrix
@@ -1038,96 +1098,13 @@ score on each of the most active factors, revealing whether the
 score–outcome relationship is monotone or non-linear.
 
 ```{python}
-# Factor scores and outcome for the training set
-# Z_scores and y_train_np were computed in §2
-TOP_BOT_N = 50   # samples per group
-
-n_factors_tmb = len(top_factors)   # use all factors; filter by significance in plot
-
-# ── Part 1: mean TMB — top-50 vs bottom-50 per factor ───────────────────────
-top_means, bot_means, diffs = [], [], []
-for f_idx in top_factors:
-    scores = Z_scores[:, f_idx]
-    ranked = np.argsort(scores)
-    top_mean = y_train_np[ranked[-TOP_BOT_N:]].mean()
-    bot_mean = y_train_np[ranked[:TOP_BOT_N]].mean()
-    top_means.append(top_mean)
-    bot_means.append(bot_mean)
-    diffs.append(top_mean - bot_mean)
-
-tmb_diff_df = pd.DataFrame({
-    "Factor":   [f"F{f+1}" for f in top_factors],
-    "Top 50":   top_means,
-    "Bottom 50": bot_means,
-    "Diff (top − bot)": diffs,
-})
-```
-
-```{python}
-fig, axes = plt.subplots(1, 2, figsize=(18, 5))
-
-# Left: mean TMB per group, one pair of bars per factor
-tmb_long = tmb_diff_df.melt(
-    id_vars="Factor", value_vars=["Top 50", "Bottom 50"],
-    var_name="Group", value_name="Mean log(1+TMB)"
+plot_factor_outcome(
+    Z_scores, y_train_np,
+    top_factors=top_factors.tolist(),
+    n_factors_show=6,
+    outcome_label="log(1+TMB)",
+    title="TMB values along samples ranked by factor score\n(top active factors; colour = score, black = rolling mean)",
 )
-factor_order = tmb_diff_df["Factor"].tolist()
-sns.barplot(
-    data=tmb_long, x="Factor", y="Mean log(1+TMB)",
-    hue="Group", order=factor_order, ax=axes[0],
-    palette={"Top 50": "#d73027", "Bottom 50": "#4575b4"},
-)
-axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=60, ha="right", fontsize=7)
-axes[0].set_title(f"Mean log(1+TMB): top-{TOP_BOT_N} vs bottom-{TOP_BOT_N} samples per factor")
-axes[0].set_xlabel("")
-
-# Right: difference (top − bottom) sorted by magnitude
-diff_sorted = tmb_diff_df.sort_values("Diff (top − bot)")
-colors_diff = ["#d73027" if v >= 0 else "#4575b4" for v in diff_sorted["Diff (top − bot)"]]
-axes[1].barh(diff_sorted["Factor"], diff_sorted["Diff (top − bot)"], color=colors_diff)
-axes[1].axvline(0, color="black", lw=0.8)
-axes[1].set_xlabel("Mean log(1+TMB): top − bottom")
-axes[1].set_title("TMB difference by factor (top-50 minus bottom-50 scores)")
-
-plt.tight_layout()
-plt.show()
-```
-
-```{python}
-# ── Part 2: TMB along ranked scores — top active factors ────────────────────
-N_FACTORS_TMB_SHOW = 6
-
-fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-axes = axes.flatten()
-
-for plot_i, f_idx in enumerate(top_factors[:N_FACTORS_TMB_SHOW]):
-    ax     = axes[plot_i]
-    scores = Z_scores[:, f_idx]
-    order  = np.argsort(scores)   # ascending rank
-
-    ax.scatter(
-        np.arange(len(order)), y_train_np[order],
-        c=scores[order], cmap="coolwarm", s=14, alpha=0.7
-    )
-
-    # Smoothed trend via rolling mean
-    window = max(1, len(order) // 10)
-    smoothed = pd.Series(y_train_np[order]).rolling(window, center=True, min_periods=1).mean()
-    ax.plot(np.arange(len(order)), smoothed, color="black", lw=1.5, label=f"Rolling mean (w={window})")
-
-    pct_var = factor_var[f_idx] / factor_var.sum() * 100
-    ax.set_xlabel(f"Sample rank by Factor {f_idx+1} score")
-    ax.set_ylabel("log(1+TMB)")
-    ax.set_title(f"Factor {f_idx+1}  ({pct_var:.1f}% var.)\n(colour = score value)")
-    ax.legend(fontsize=7)
-
-fig.suptitle(
-    "TMB values along samples ranked by factor score\n"
-    "(top active factors; colour = score, black = rolling mean)",
-    fontsize=12
-)
-plt.tight_layout()
-plt.show()
 ```
 
 ### 6. WGCNA comparison
@@ -1271,6 +1248,87 @@ ax.set_xlabel("MatrixDecomp factor")
 ax.set_ylabel("WGCNA module")
 plt.tight_layout()
 plt.show()
+```
+
+
+### Factor enrichment
+
+```{python}
+from gsea import load_gmt, run_pcgse, plot_gsea
+import pyreadr
+```
+
+```{python}
+import mygene
+```
+
+```{python}
+# gene_sets = pyreadr.read_r("/Users/jonathanhori/multiomic_integration/data/tcga/MSigDB_v6.0_C2_human.RData")['MSigDB_v6.0_C2_human']  # or your .gmt path
+
+gene_sets = pyreadr.read_r("/Users/jonathanhori/multiomic_integration/data/tcga/reactomeGS.rda")['reactomeGS']  # or your .gmt path
+```
+
+```{python}
+gene_sets
+```
+
+```{python}
+mg = mygene.MyGeneInfo()
+```
+
+```{python}
+gene_names = genes.columns.to_list()
+```
+
+```{python}
+gene_conversion = mg.querymany(gene_names, scopes = 'symbol', as_dataframe=True)
+```
+
+```{python}
+len(gene_names)
+```
+
+```{python}
+converted_names = gene_conversion.loc[gene_conversion['_id'].str.contains('ENSG')]['_id'].to_list()
+```
+
+```{python}
+len(set(converted_names + gene_sets.columns.tolist()))
+```
+
+```{python}
+len(set(converted_names)) + len(set(gene_sets.columns.tolist()))
+```
+
+```{python}
+gene_conversion.loc[gene_conversion[]]
+```
+
+```{python}
+gene_sets.columns.tolist() #['ENSETEG00000012177']
+
+gene_sets['ENSGGOG00000004378']
+```
+
+```{python}
+
+# Single-view (MatrixDecomp) — wrap in lists
+results = run_pcgse(
+    Lambda_list=[lambda_est_rotated],        # (p, k)
+    gene_sets=gene_sets,
+    feature_names_list=[list(gene_names)],
+    X_list=[tmb_data_package["X_train"].numpy()],  # for ρ̄ estimation
+    method="mean_diff",   # or "rank_sum"
+    min_genes=10,
+    max_genes=300,
+)
+
+# Multi-view — pass one entry per view
+# results = run_pcgse(Lambda_list=[Lambda_1, Lambda_2], ...)
+
+fig, ax = plot_gsea(results, view=0, top_n_sets=25,
+                    factor_labels=[f"F{i+1}" for i in top_factors])
+
 ```
 
 ## Cross-validation for hyperparameter selection
