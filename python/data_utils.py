@@ -324,6 +324,10 @@ def eval_post_coverage(sim_struct, lower, upper):
             torch.less_equal(lower, sim_struct),
             torch.greater_equal(upper, sim_struct)
         )) / torch.numel(sim_struct)
+
+def eval_post_width(lower, upper):
+    """Mean width of a credible interval across all entries."""
+    return (upper - lower).mean().item()
     
 def eval_credible_interval(sim_structure_list, summary_list, region = '95'):
     """
@@ -493,13 +497,17 @@ def eval_performance_shared(
         post_pred_outcome_summaries["q2.5"],
         post_pred_outcome_summaries["q97.5"]
     ).item()
+    outcome_width = eval_post_width(
+        post_pred_outcome_summaries["q2.5"],
+        post_pred_outcome_summaries["q97.5"]
+    )
 
     return pd.DataFrame({
         "view": range(len(joint_rse)),
         "joint_rse": joint_rse,
-        "joint_95p_coverage": float("nan"),
         "outcome_mse": outcome_mse,
         "outcome_95p_coverage": outcome_coverage,
+        "outcome_95p_width": outcome_width,
     })
 
 
