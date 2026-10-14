@@ -1,5 +1,5 @@
 ---
-title: "MatrixDecomp on TCGA COAD"
+title: "MatrixDecomp and Multiview Model on TCGA COAD/READ"
 format: html
 jupyter: python3
 ---
@@ -21,7 +21,9 @@ sys.path.insert(0, os.path.expanduser("~/multiomic_integration/python"))
 
 from run_methods import train_model_single_view, train_model_locally_single_view
 from data_utils import summarise_post_samples
+```
 
+```{python}
 PROJECT_ROOT = os.path.expanduser("~/multiomic_integration")
 DATA_DIR     = os.path.join(PROJECT_ROOT, "data/tcga/processed")
 OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "sim/results/matrixdecomp/tcga")
@@ -129,4 +131,355 @@ metrics_df.to_csv(os.path.join(OUTPUT_DIR, "all_metrics.csv"), index=False)
 
 print(f"Saved to {OUTPUT_DIR}")
 metrics_df
+```
+
+---
+
+# Multiview Model: Expression + Methylation (COAD/READ)
+
+Uses the locally downloaded `coadread_tcga_pan_can_atlas_2018` dataset with
+`SupMultiviewShared` to jointly model gene expression and DNA methylation for
+TMB prediction.
+
+## Configuration
+
+```{python}
+#| label: mv-config
+import pyro
+import torch
+from torch.utils.data import TensorDataset
+from pathlib import Path
+
+from coadread_data import load_coadread, make_view_list, make_feature_names
+from data_utils import normalize_tensor_by_col, zero_variance_col_filter
+from run_methods import train_model_shared, train_model_locally_shared
+from constants import Sites
+```
+
+```{python}
+PROJECT_ROOT = os.path.expanduser("~/multiomic_integration")
+MV_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "sim/results/integration_shared/coadread")
+Path(MV_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# Views to use — change to ["expr", "meth_body"] or all three as desired
+VIEWS = ["expr", "meth_tss200"]
+
+MV_K                   = 20
+MV_N_POSTERIOR_SAMPLES = 200
+MV_RANDOM_SEED         = 42
+
+MV_MODEL_CONFIG = {
+    "k":             MV_K,
+    "dense_model":   False,
+    "outcome_weight": 1.0,
+}
+MV_TRAIN_CONFIG = {
+    "eta":           0.25,
+    "delta":         1e-16,
+    "t":             0.1,
+    "num_particles": 1,
+    "minibatch_fraction": 0.15,
+    # "minibatch_size": 32,
+    "min_epochs":    200,
+    "max_epochs":    1000,
+    "convergence_criterion": "elbo_snr",
+    "window":        50,
+    "snr_threshold": 5,
+}
+MV_LOCAL_CONFIG = MV_TRAIN_CONFIG #{**MV_TRAIN_CONFIG, "min_epochs": 200}
+```
+
+## Load data
+
+```{python}
+#| label: mv-load
+data = load_coadread(
+    top_rna_genes=2000,   # keep 2 000 most-variable RNA genes
+    top_meth_genes=1000,  # keep 1 000 most-variable methylation genes per view
+    log1p_tmb=True,
+    train_frac=0.8,
+    random_seed=MV_RANDOM_SEED,
+)
+
+print("Overlap summary:")
+for k, v in data["overlap_summary"].items():
+    print(f"  {k}: {v}")
+
+X_train_views = make_view_list(data, VIEWS, split="train")
+X_test_views  = make_view_list(data, VIEWS, split="test")
+y_train_raw   = data["y"]
+y_test_raw    = data["y_test"]
+
+print(f"\nViews: {VIEWS}")
+for v, X in zip(VIEWS, X_train_views):
+    print(f"  {v}: train {tuple(X.shape)}  test {tuple(make_view_list(data, [v], 'test')[0].shape)}")
+print(f"  y train: {y_train_raw.shape}  test: {y_test_raw.shape}")
+```
+
+
+```{python}
+data['X_expr'].shape
+```
+
+## Preprocess
+
+```{python}
+#| label: mv-preprocess
+# Zero-variance filter and normalise each view using training statistics
+col_filters = [zero_variance_col_filter(X) for X in X_train_views]
+
+X_train_filtered = [X[:, f] for X, f in zip(X_train_views, col_filters)]
+X_test_filtered  = [X[:, f] for X, f in zip(X_test_views,  col_filters)]
+
+norm_stats = [normalize_tensor_by_col(X) for X in X_train_filtered]
+X_train_clean = [d["data_clean"] for d in norm_stats]
+X_l_mean_list = [d["means"]      for d in norm_stats]
+X_l_sd_list   = [d["sds"]        for d in norm_stats]
+
+X_test_clean = [
+    normalize_tensor_by_col(X, m, s)["data_clean"]
+    for X, m, s in zip(X_test_filtered, X_l_mean_list, X_l_sd_list)
+]
+
+# Standardise y (model expects zero-mean unit-variance outcome)
+y_mean = y_train_raw.mean()
+y_std  = y_train_raw.std()
+y_train_clean = (y_train_raw - y_mean) / y_std
+y_test_clean  = (y_test_raw  - y_mean) / y_std
+
+n_train = X_train_clean[0].shape[0]
+train_subset = TensorDataset(torch.arange(n_train), *X_train_clean, y_train_clean)
+
+n_test = X_test_clean[0].shape[0]
+test_subset = TensorDataset(torch.arange(n_test), *X_test_clean, y_test_clean)
+
+print("Train subset tensors:", [tuple(t.shape) for t in train_subset.tensors])
+print("Test subset tensors: ", [tuple(t.shape) for t in test_subset.tensors])
+```
+
+## Train SupMultiviewShared
+
+```{python}
+#| label: mv-train
+views_tag = "_".join(VIEWS)
+model_out = os.path.join(MV_OUTPUT_DIR, f"model_{views_tag}_k{MV_K}")
+
+pyro.clear_param_store()
+pyro.set_rng_seed(MV_RANDOM_SEED)
+
+factor_model, train_handler, global_state = train_model_shared(
+    MV_MODEL_CONFIG, MV_TRAIN_CONFIG, train_subset,
+    model_out_filename=model_out,
+    opt="adagrad",
+    verbose=True,
+    write=True,
+    svd_init=True
+)
+
+print(f"\nGlobal training: {global_state['inference_time']:.1f}s, "
+      f"{factor_model.total_epochs} epochs")
+```
+
+## Local inference on test set
+
+```{python}
+#| label: mv-local
+factor_model, test_handler, local_state = train_model_locally_shared(
+    factor_model, MV_LOCAL_CONFIG, test_subset,
+    opt="adagrad", verbose=True,
+)
+print(f"Local inference: {local_state['inference_time']:.1f}s, "
+      f"{factor_model.local_epochs} epochs")
+```
+
+## Evaluate
+
+```{python}
+#| label: mv-eval
+import matplotlib.pyplot as plt
+from data_utils import summarise_post_samples, eval_mse, eval_post_coverage
+
+L = len(VIEWS)
+test_sites = [Sites.y_pred, Sites.Z_pred]
+
+post_test = test_handler.predict(X_test_clean, MV_N_POSTERIOR_SAMPLES, test_sites)
+
+# y_pred is in standardised units — rescale back to log1p(TMB) space
+y_pred_raw = post_test[Sites.y_pred].squeeze() * y_std + y_mean  # (N_samples, n_test)
+y_pred_summary = summarise_post_samples(y_pred_raw)
+
+y_pred_mean = y_pred_summary["mean"]
+y_true       = y_test_raw
+
+mse      = eval_mse(y_pred_mean, y_true).item()
+rmse     = float(mse ** 0.5)
+r2       = float(1 - ((y_pred_mean - y_true) ** 2).sum() / ((y_true - y_true.mean()) ** 2).sum())
+coverage = eval_post_coverage(y_true, y_pred_summary["q2.5"], y_pred_summary["q97.5"]).item()
+
+print(f"Views: {VIEWS}  k={MV_K}")
+print(f"  MSE={mse:.4f}  RMSE={rmse:.4f}  R²={r2:.4f}  95% cov={coverage:.3f}")
+
+# Scatter: predicted vs actual
+y_pred_mean_np = y_pred_mean.numpy()
+y_pred_q025_np = y_pred_summary["q2.5"].numpy()
+y_pred_q975_np = y_pred_summary["q97.5"].numpy()
+y_true_np      = y_true.numpy()
+
+fig, ax = plt.subplots(figsize=(5, 5))
+ax.errorbar(y_true_np, y_pred_mean_np,
+            yerr=[y_pred_mean_np - y_pred_q025_np, y_pred_q975_np - y_pred_mean_np],
+            fmt="o", alpha=0.4, markersize=3, elinewidth=0.5, color="steelblue")
+lims = [min(y_true_np.min(), y_pred_mean_np.min()) - 0.1,
+        max(y_true_np.max(), y_pred_mean_np.max()) + 0.1]
+ax.plot(lims, lims, "k--", lw=1)
+ax.set_xlabel("True log1p(TMB)")
+ax.set_ylabel("Predicted log1p(TMB)")
+ax.set_title(f"{'+ '.join(VIEWS)}  k={MV_K}  R²={r2:.3f}")
+plt.tight_layout()
+plt.show()
+```
+
+## Save results
+
+```{python}
+#| label: mv-save
+pred_df = pd.DataFrame({
+    "y_true":       y_true_np,
+    "y_pred_mean":  y_pred_mean_np,
+    "y_pred_q2.5":  y_pred_q025_np,
+    "y_pred_q97.5": y_pred_q975_np,
+    "sample_id":    data["sample_ids_test"],
+})
+pred_df.to_csv(os.path.join(MV_OUTPUT_DIR, f"predictions_{views_tag}_k{MV_K}.csv"), index=False)
+
+metrics_df = pd.DataFrame([{
+    "views":           str(VIEWS),
+    "k":               MV_K,
+    "outcome_mse":     mse,
+    "outcome_rmse":    rmse,
+    "outcome_r2":      r2,
+    "outcome_95p_cov": coverage,
+    "global_runtime":  global_state["inference_time"],
+    "local_runtime":   local_state["inference_time"],
+    "global_epochs":   factor_model.total_epochs,
+    "local_epochs":    factor_model.local_epochs,
+}])
+metrics_df.to_csv(os.path.join(MV_OUTPUT_DIR, f"metrics_{views_tag}_k{MV_K}.csv"), index=False)
+
+print(f"Saved to {MV_OUTPUT_DIR}")
+metrics_df
+```
+
+## Factor interpretation
+
+```{python}
+import importlib
+importlib.reload(sys.modules["factor_interpretation"])
+```
+
+```{python}
+#| label: mv-interpret
+
+from factor_interpretation import summarize_factors, tabulate_top_features, plot_factor_scores_2d, plot_factor_outcome
+from constants import Sites, Params
+
+# Read variational means directly from the param store — more reliable than
+# running train_handler.predict() on training data, which goes through the
+# plate-based forward and can return unexpected shapes.
+L = len(VIEWS)
+Z_mean      = pyro.param(Params.loc_Z).detach()                                        # (n_train, K)
+Lambda_list = [pyro.param(Params.loc_Lambda_l.format(l=l)).detach() for l in range(L)] # list of (p_l, K)
+beta_mean   = pyro.param(Params.loc_beta).detach()                                     # (K,)
+
+# Draw beta posterior samples from the Gaussian guide (loc + scale * eps)
+loc_beta   = pyro.param(Params.loc_beta).detach()
+scale_beta = pyro.param(Params.scale_beta).detach()
+beta_samps = loc_beta + scale_beta * torch.randn(MV_N_POSTERIOR_SAMPLES, len(loc_beta))  # (S, K)
+
+# Gene names aligned to the columns that survived the zero-variance filter
+raw_names     = make_feature_names(data, VIEWS)
+filtered_names = [
+    [n for n, keep in zip(names, col_filters[l].tolist()) if keep]
+    for l, names in enumerate(raw_names)
+]
+
+view_labels = {
+    "expr":        "Expression",
+    "meth_tss200": "TSS200 Methylation",
+    "meth_body":   "Body Methylation",
+}
+vnames = [view_labels.get(v, v) for v in VIEWS]
+
+# Main summary: PVE + R² plots, printed per-factor table
+summary = summarize_factors(
+    X_list     = X_train_clean,
+    Z          = Z_mean,
+    Lambda_list= Lambda_list,
+    beta       = beta_mean,
+    y          = y_train_clean,      # standardised scale for R²_y
+    beta_samples = beta_samps,
+    view_names = vnames,
+    plot       = True,
+    verbose    = True,
+    show       = "post"
+)
+```
+
+```{python}
+#| label: mv-loadings-heatmap
+from factor_interpretation import plot_factor_loadings
+
+plot_factor_loadings(
+    Lambda_list = Lambda_list,
+    view_names  = vnames,
+    rotate      = True,
+    n_factors   = MV_K,
+    title       = f"Factor loadings — {' + '.join(vnames)}",
+)
+```
+
+```{python}
+#| label: mv-score-scatter
+# Rotated factor scores and top factors by variance explained
+from factor_interpretation import _np
+Z_rot       = _np(Z_mean) @ summary["R"]                          # (n_train, K)
+top_factors = summary["post"]["per_factor"]["factor"].tolist()    # sorted by PVE desc
+
+# Pairwise factor score scatter coloured by TMB
+plot_factor_scores_2d(
+    Z           = Z_rot,
+    y           = y_train_raw.numpy(),
+    top_factors = top_factors[:6],
+    y_label     = "log1p(TMB)",
+    title       = f"Factor scores ({' + '.join(vnames)})",
+)
+```
+
+```{python}
+#| label: mv-score-vs-outcome
+# Per-factor score vs TMB (top / bottom 50 comparison + ranked scatter)
+plot_factor_outcome(
+    Z              = Z_rot,
+    y              = y_train_raw.numpy(),
+    top_factors    = top_factors[:8],
+    n_factors_show = 8,
+    outcome_label  = "log1p(TMB)",
+    factor_summary = summary,
+)
+```
+
+```{python}
+#| label: mv-top-genes
+# Top genes by |loading| per factor, per view
+top_gene_tables = tabulate_top_features(
+    Lambda_list        = Lambda_list,
+    feature_names_list = filtered_names,
+    n_top_factors      = 8,
+    n_top_features     = 10,
+    rotate             = True,
+)
+
+for vname, tbl in zip(vnames, top_gene_tables):
+    print(f"\n── {vname} ──")
+    display(tbl)
 ```
