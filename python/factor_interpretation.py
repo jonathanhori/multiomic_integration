@@ -154,6 +154,7 @@ def plot_pve(
     view_names: Optional[List[str]] = None,
     rotate: bool = False,
     title: Optional[str] = None,
+    save_path: Optional[str] = None,
 ) -> dict:
     """
     Bar chart of PVE per factor with per-view and combined panels.
@@ -197,6 +198,8 @@ def plot_pve(
     rot_note = " (varimax-rotated)" if rotate else ""
     fig.suptitle(title or f"Proportion of Variance Explained per Factor{rot_note}")
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
     plt.show()
     return pve
 
@@ -207,6 +210,7 @@ def plot_r2(
     Lambda_list: List,
     view_names: Optional[List[str]] = None,
     title: Optional[str] = None,
+    save_path: Optional[str] = None,
 ) -> dict:
     """
     Bar chart of MOFA-style R² per factor with per-view and combined panels.
@@ -247,6 +251,8 @@ def plot_r2(
 
     fig.suptitle(title or "R² per Factor (MOFA-style)")
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
     plt.show()
     return r2
 
@@ -257,6 +263,7 @@ def plot_factor_loadings(
     rotate: bool = True,
     n_factors: Optional[int] = None,
     title: Optional[str] = None,
+    save_path: Optional[str] = None,
 ) -> List[np.ndarray]:
     """
     Heatmap of factor loadings, one panel per view.
@@ -299,6 +306,8 @@ def plot_factor_loadings(
 
     fig.suptitle(title or f"Factor Loadings{rot_suffix}")
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
     plt.show()
     return rotated_list
 
@@ -310,19 +319,26 @@ def plot_factor_scores_2d(
     n_factors: int = 5,
     y_label: str = "outcome",
     title: Optional[str] = None,
+    save_path: Optional[str] = None,
+    layout: str = "matrix",
+    cmap: str = "viridis",
 ) -> None:
     """
-    Pairwise scatterplot matrix of factor scores, optionally coloured by outcome y.
-    Diagonal panels show per-factor histograms; off-diagonal panels show scatter plots.
+    Scatterplot(s) of factor scores, optionally coloured by outcome y.
 
     Parameters
     ----------
     Z           : (n, K) array-like — factor scores
-    y           : optional (n,) array-like for colouring off-diagonal scatter points
-    top_factors : ordered factor indices to include; defaults to the first n_factors
-    n_factors   : number of factors to include in the matrix (ignored if top_factors given)
+    y           : optional (n,) array-like for colouring scatter points
+    top_factors : ordered factor indices to include; defaults to first n_factors
+    n_factors   : number of factors to include (ignored if top_factors given)
     y_label     : colour-bar label when y is supplied
     title       : figure title
+    save_path   : if given, save figure to this path before showing
+    layout      : "matrix" (default) — full pairwise scatterplot matrix with
+                  diagonal histograms; "sequential" — single row of consecutive
+                  pairs (F1 vs F2, F2 vs F3, …) with one shared colour bar
+    cmap        : matplotlib colormap name for outcome colouring (default "viridis")
     """
     Z_np = _np(Z)
     K = Z_np.shape[1]
@@ -340,7 +356,35 @@ def plot_factor_scores_2d(
     vmin = float(y_np.min()) if y_np is not None else None
     vmax = float(y_np.max()) if y_np is not None else None
 
-    fig, axes = plt.subplots(m, m, figsize=(2.5 * m, 2.5 * m), squeeze=False)
+    if layout == "sequential":
+        pairs = [(top_factors[i], top_factors[i + 1]) for i in range(m - 1)]
+        n_pairs = len(pairs)
+        fig, axes = plt.subplots(1, n_pairs, figsize=(3.2 * n_pairs, 3.2),
+                                 squeeze=False, constrained_layout=True)
+        axes_flat = axes.flatten()
+        sc_ref = None
+        for ax, (fj, fi) in zip(axes_flat, pairs):
+            if y_np is not None:
+                sc = ax.scatter(Z_np[:, fj], Z_np[:, fi],
+                                c=y_np, cmap=cmap, s=18, alpha=0.7,
+                                vmin=vmin, vmax=vmax)
+                sc_ref = sc
+            else:
+                ax.scatter(Z_np[:, fj], Z_np[:, fi], s=18, alpha=0.7)
+            ax.set_xlabel(f"F{fj + 1}")
+            ax.set_ylabel(f"F{fi + 1}")
+        if y_np is not None and sc_ref is not None:
+            fig.colorbar(sc_ref, ax=axes_flat[-1], label=y_label,
+                         location="right", pad=0.04)
+        fig.suptitle(title or "Factor score scatter plots")
+        if save_path:
+            plt.savefig(save_path, bbox_inches="tight")
+        plt.show()
+        return
+
+    # ── matrix layout ──────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(m, m, figsize=(2.5 * m, 2.5 * m),
+                             squeeze=False, constrained_layout=True)
 
     sc_ref = None
     for row in range(m):
@@ -355,7 +399,7 @@ def plot_factor_scores_2d(
             else:
                 if y_np is not None:
                     sc = ax.scatter(Z_np[:, fj], Z_np[:, fi],
-                                    c=y_np, cmap="viridis", s=10, alpha=0.6,
+                                    c=y_np, cmap=cmap, s=10, alpha=0.6,
                                     vmin=vmin, vmax=vmax)
                     sc_ref = sc
                 else:
@@ -371,10 +415,12 @@ def plot_factor_scores_2d(
                 ax.set_yticklabels([])
 
     if y_np is not None and sc_ref is not None:
-        fig.colorbar(sc_ref, ax=axes, label=y_label, shrink=0.6, pad=0.02)
+        fig.colorbar(sc_ref, ax=axes[:, -1].tolist(), label=y_label,
+                     location="right", pad=0.04)
 
-    fig.suptitle(title or "Factor score scatterplot matrix", y=1.01)
-    plt.tight_layout()
+    fig.suptitle(title or "Factor score scatterplot matrix")
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
     plt.show()
 
 
@@ -385,12 +431,20 @@ def plot_factor_outcome(
     n_factors_show: int = 6,
     outcome_label: str = "outcome",
     title: Optional[str] = None,
+    factor_summary: Optional[dict] = None,
+    show_rotation: str = "post",
+    save_path: Optional[str] = None,
 ) -> None:
     """
-    For each factor, plot outcome values along samples ranked by factor score.
+    For each factor, plot outcome values along samples ranked by that factor's score.
 
-    This reveals whether the score-outcome relationship is monotone or
-    non-linear. A rolling-mean trend line is overlaid.
+    Subplots are arranged in a single row and share the y-axis (outcome scale).
+    A single colour bar on the right encodes factor score; the colour scale spans
+    the global min/max across all displayed factors so relative spread is preserved.
+
+    When ``factor_summary`` is supplied, each subplot additionally shows:
+      - a dashed black reference line: y_mean + β_k · (z_k − z̄_k)
+      - a text annotation with β_k and its 95% CI (starred if CI excludes zero)
 
     Parameters
     ----------
@@ -398,8 +452,12 @@ def plot_factor_outcome(
     y              : (n,) array-like — outcome values
     top_factors    : ordered factor indices; defaults to 0 … n_factors_show
     n_factors_show : number of factors to plot
-    outcome_label  : y-axis label
+    outcome_label  : y-axis label (shown on leftmost subplot only)
     title          : figure title
+    factor_summary : optional dict returned by ``summarize_factors``
+    show_rotation  : which rotation to use for β — "post" (varimax, default)
+                     or "pre" (unrotated)
+    save_path      : if given, save figure to this path before showing
     """
     Z_np, y_np = _np(Z), _np(y).squeeze()
     K = Z_np.shape[1]
@@ -407,36 +465,70 @@ def plot_factor_outcome(
     if top_factors is None:
         top_factors = list(range(K))
     show = top_factors[:n_factors_show]
+    n = len(show)
 
-    ncols = min(3, len(show))
-    nrows = (len(show) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
+    # Build factor-number → beta info lookup from the summary object
+    beta_info: dict = {}
+    if factor_summary is not None:
+        key = show_rotation if show_rotation in ("pre", "post") else "post"
+        pf = factor_summary[key]["per_factor"]
+        for _, row in pf.iterrows():
+            beta_info[int(row["factor"])] = {
+                "beta":       float(row["beta"]),
+                "beta_lower": float(row["beta_lower"]),
+                "beta_upper": float(row["beta_upper"]),
+            }
+
+    # Global colour scale across all shown factors
+    vmin_z = float(Z_np[:, show].min())
+    vmax_z = float(Z_np[:, show].max())
+
+    fig, axes = plt.subplots(1, n, figsize=(3.2 * n, 3.5),
+                             sharey=True, squeeze=False)
     axes_flat = axes.flatten()
+
+    y_mean = float(y_np.mean())
 
     for plot_i, f_idx in enumerate(show):
         ax = axes_flat[plot_i]
         order = np.argsort(Z_np[:, f_idx])
-        sc = ax.scatter(
+        ax.scatter(
             np.arange(len(order)), y_np[order],
-            c=Z_np[order, f_idx], cmap="coolwarm", s=14, alpha=0.7,
+            c=Z_np[order, f_idx], cmap="viridis", s=14, alpha=0.7,
+            vmin=vmin_z, vmax=vmax_z,
         )
-        plt.colorbar(sc, ax=ax, label="score")
-        window = max(1, len(order) // 10)
-        smoothed = (
-            pd.Series(y_np[order])
-            .rolling(window, center=True, min_periods=1)
-            .mean()
-        )
-        ax.plot(np.arange(len(order)), smoothed, color="black", lw=1.5)
-        ax.set_xlabel(f"Sample rank by Factor {f_idx + 1}")
-        ax.set_ylabel(outcome_label)
-        ax.set_title(f"Factor {f_idx + 1}")
 
-    for ax in axes_flat[len(show):]:
-        ax.set_visible(False)
+        info = beta_info.get(f_idx + 1)
+        if info is not None and not np.isnan(info["beta"]):
+            b = info["beta"]
+            b_lo, b_hi = info["beta_lower"], info["beta_upper"]
+
+            z_ranked = Z_np[order, f_idx]
+            pred = y_mean + b * (z_ranked - z_ranked.mean())
+            ax.plot(np.arange(len(order)), pred,
+                    color="black", lw=1.5, ls="--", alpha=0.9)
+
+            has_ci = not (np.isnan(b_lo) or np.isnan(b_hi))
+            sig = "*" if (has_ci and (b_lo > 0 or b_hi < 0)) else ""
+            ann = f"β = {b:.3f}{sig}"
+            if has_ci:
+                ann += f"\n[{b_lo:.3f}, {b_hi:.3f}]"
+            ax.text(0.04, 0.96, ann, transform=ax.transAxes,
+                    va="top", ha="left", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                              ec="gray", alpha=0.85))
+
+        ax.set_xlabel(f"Rank by F{f_idx + 1}")
+        ax.set_title(f"Factor {f_idx + 1}")
+        if plot_i == 0:
+            ax.set_ylabel(outcome_label)
+        else:
+            ax.tick_params(labelleft=False)
 
     fig.suptitle(title or f"{outcome_label} vs. ranked factor score")
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
     plt.show()
 
 
@@ -517,6 +609,16 @@ def _factor_metrics_from_arrays(
     sort_order = np.argsort(ESS)[::-1]
     cumulative_pve_data = np.cumsum(pve_data[sort_order])
 
+    # Per-view per-factor PVE: pve_per_view[k, l] = ESS_kl / TSS_l
+    # Rows are sorted to match per_factor (by ESS descending).
+    L_views = len(X_list_np)
+    pve_per_view = np.zeros((K, L_views))
+    for l_idx, (_, L_mat) in enumerate(zip(X_list_np, Lambda_np_list)):
+        ess_kl = z_sq * np.sum(L_mat ** 2, axis=0)   # (K,)
+        tss_l = TSS_list[l_idx]
+        pve_per_view[:, l_idx] = ess_kl / tss_l if tss_l > 0 else 0.0
+    pve_per_view = pve_per_view[sort_order, :]
+
     # ── outcome importance (optional) ─────────────────────────────────────────
     # beta_ess_k = β_k² ||z_k||²  — rank-1 signal energy of factor k in ŷ.
     # Exact decomposition of ||ŷ||² when Z has orthogonal columns.
@@ -572,6 +674,7 @@ def _factor_metrics_from_arrays(
         "per_view_model_r2":   per_view_r2,
         "total_outcome_r2":    total_outcome_r2,
         "per_factor":          per_factor,
+        "pve_per_view":        pve_per_view,   # (K, L) sorted by ESS desc
         "cumulative_pve_data": cumulative_pve_data,
     }
 
@@ -640,6 +743,21 @@ def _print_factor_summary(
     print(f"\n  Cumulative PVE (data): [{cum_str}]")
     if has_ci:
         print(f"  * 95% CI excludes zero")
+
+    pvv = metrics["pve_per_view"]   # (K, L) sorted by ESS desc
+    if pvv.shape[1] > 1:
+        n_rows = len(df)            # df already trimmed to n_show above
+        pvv_show = pvv[:n_rows, :]
+        col_w = max(10, max(len(v) for v in view_names) + 2)
+        print(f"\n  Per-factor PVE by view  [ESS_kl / TSS_l]:")
+        hdr2 = f"  {'Factor':>6}" + "".join(f"  {v:>{col_w}}" for v in view_names)
+        print(hdr2)
+        print("  " + "-" * (8 + (col_w + 2) * pvv.shape[1]))
+        for i, fid in enumerate(df["factor"].astype(int)):
+            row_str = f"  {fid:>6}" + "".join(f"  {pvv_show[i, l]:>{col_w}.4f}"
+                                               for l in range(pvv.shape[1]))
+            print(row_str)
+
     print(sep)
 
 
@@ -687,6 +805,7 @@ def summarize_factors(
     plot: bool = True,
     verbose: bool = True,
     n_show: Optional[int] = None,
+    show: str = "both",
 ) -> dict:
     """
     Postprocessing summary for MatrixDecomp or SupMultiviewShared models.
@@ -717,6 +836,8 @@ def summarize_factors(
                     cumulative PVE comparison
     verbose       : if True, print a formatted summary table
     n_show        : rows to print in per-factor table (None = all)
+    show          : which rotation result to print/plot — "pre" (unrotated
+                    only), "post" (varimax-rotated only), or "both" (default)
 
     Returns
     -------
@@ -773,22 +894,30 @@ def summarize_factors(
     post = _factor_metrics_from_arrays(X_np_list, Z_rot, L_rot_list,
                                        beta_rot, y_np, post_lower, post_upper)
 
+    show_pre  = show in ("pre",  "both")
+    show_post = show in ("post", "both")
+
     if verbose:
-        _print_factor_summary("Unrotated",       pre,  view_names, n_show)
-        _print_factor_summary("Varimax-rotated", post, view_names, n_show)
+        if show_pre:
+            _print_factor_summary("Unrotated",       pre,  view_names, n_show)
+        if show_post:
+            _print_factor_summary("Varimax-rotated", post, view_names, n_show)
 
     if plot:
-        plot_pve(L_np_list,  view_names=view_names, rotate=False,
-                 title="PVE per factor (unrotated)")
-        plot_pve(L_rot_list, view_names=view_names, rotate=False,
-                 title="PVE per factor (varimax-rotated)")
-        plot_r2(X_np_list, Z_np,  L_np_list,  view_names=view_names,
-                title="R² per factor (unrotated)")
-        plot_r2(X_np_list, Z_rot, L_rot_list, view_names=view_names,
-                title="R² per factor (varimax-rotated)")
-        _plot_cumulative_pve(pre, post)
+        if show_pre:
+            plot_pve(L_np_list, view_names=view_names, rotate=False,
+                     title="PVE per factor (unrotated)")
+            plot_r2(X_np_list, Z_np, L_np_list, view_names=view_names,
+                    title="R² per factor (unrotated)")
+        if show_post:
+            plot_pve(L_rot_list, view_names=view_names, rotate=False,
+                     title="PVE per factor (varimax-rotated)")
+            plot_r2(X_np_list, Z_rot, L_rot_list, view_names=view_names,
+                    title="R² per factor (varimax-rotated)")
+        if show_pre and show_post:
+            _plot_cumulative_pve(pre, post)
 
-    return {"pre": pre, "post": post, "R": R}
+    return {"pre": pre, "post": post, "R": R, "Z_rot": Z_rot}
 
 
 def tabulate_top_features(
