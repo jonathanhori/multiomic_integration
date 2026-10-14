@@ -124,14 +124,15 @@ eval_mofa_shared <- function(mofa_obj,
   outcome_mse <- mean((y_pred - y_test_std)^2)
   outcome_95p_coverage <- mean(y_test_std >= pred_int[, "lwr"] &
                                 y_test_std <= pred_int[, "upr"])
+  outcome_95p_width <- mean(pred_int[, "upr"] - pred_int[, "lwr"])
 
   data.frame(
     view                 = seq_len(L) - 1L,  # 0-indexed to match Python
     joint_rse            = joint_rse,
     test_rse             = test_rse,
-    joint_95p_coverage   = NA_real_,
     outcome_mse          = outcome_mse,
-    outcome_95p_coverage = outcome_95p_coverage
+    outcome_95p_coverage = outcome_95p_coverage,
+    outcome_95p_width    = outcome_95p_width
   )
 }
 
