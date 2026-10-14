@@ -1338,11 +1338,12 @@ plot_factor_scores_2d(
 
 ```{python}
 plot_factor_outcome(
-    Z_est, train_y_clean,
+    factor_summary["Z_rot"], train_y_clean,
     top_factors=top_factors_fac,
     n_factors_show=6,
     outcome_label="outcome",
     title="Outcome along samples ranked by factor score — top active factors",
+    factor_summary=factor_summary,
 )
 ```
 
