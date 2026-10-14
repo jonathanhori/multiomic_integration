@@ -2822,7 +2822,7 @@ readRDS = robjects.r['readRDS']
 #   "mild_misalignment"
 #   "strong_misalignment"
 #   "anti_aligned"        — beta on the lowest-variance factor
-USE_MISALIGNED = True
+USE_MISALIGNED = False
 ALIGN_LABEL    = "anti_aligned"
 
 # rep_config = {
@@ -2830,7 +2830,7 @@ ALIGN_LABEL    = "anti_aligned"
 #     "rep": 1, "sparsity": 0.25, "k_delta": 10
 # }
 rep_config = {
-    "n": 100, "p_l": 100, "snr_x": 2, "snr_y": 2,
+    "n": 500, "p_l": 1000, "snr_x": 2, "snr_y": 2,
     "rep": 2, "sparsity": 0.25, "k_delta": 10
 }
 if USE_MISALIGNED:
@@ -3078,6 +3078,34 @@ print(eval_table[["view", "joint_rse", "test_rse", "joint_95p_coverage"]].to_str
 
 print(f"\nOutcome MSE:  {eval_table['outcome_mse'].iloc[0]:.4f}")
 print(f"Outcome 95% CI coverage: {eval_table['outcome_95p_coverage'].iloc[0]:.2f}")
+```
+
+### Plot outcome
+
+Training
+```{python}
+p = sns.scatterplot(x = post_samples['y'].mean(dim = 0).tolist(), 
+                    y = data_package['train_y_clean'].squeeze().tolist())
+p.set(xlabel = "Predicted y", ylabel = "Simulated y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = post_samples['y'].mean(dim = 0).tolist(), 
+            y = data_package['train_y_clean'].squeeze().tolist(), scatter = False, ax = p)
+```
+
+```{python}
+# torch.mean(eval_structures['post_pred_outcome'])
+# torch.std(eval_structures['post_pred_outcome']))
+```
+
+```{python}
+p = sns.scatterplot(x = post_samples_test['y_pred'].mean(dim = 0).tolist(), 
+                    y = data_package['test_y_clean'].squeeze().tolist())
+p.set(xlabel = "Predicted y", ylabel = "Simulated y")
+p.set_title("Predicted vs. actual outcome")
+p.axline((0, 0), slope = 1, color = "black", ls = "--")
+sns.regplot(x = post_samples_test['y_pred'].mean(dim = 0).tolist(), 
+            y = data_package['test_y_clean'].squeeze().tolist(), scatter = False, ax = p)
 ```
 
 ## Outcome predictions: train and test
@@ -3859,6 +3887,7 @@ Lambda_rot_list = plot_factor_loadings(
     view_names=view_names,
     rotate=True,
     title="Factor loadings — SupMultiviewShared (varimax-rotated)",
+    save_path = "./loadings.png"
 )
 ```
 
@@ -3868,9 +3897,12 @@ Lambda_rot_list = plot_factor_loadings(
 plot_factor_scores_2d(
     Z_interp, y=y_interp,
     top_factors=top_factors_interp,
-    n_factors=5,
-    y_label="outcome",
-    title="Factor score scatterplot matrix (coloured by outcome)\nTop active factors",
+    n_factors=4,
+    y_label="Outcome",
+    title="Factor scores for Top Active Factors",
+    layout="sequential",
+    save_path = "./scores_heatmap.png",
+    cmap = "plasma"
 )
 ```
 
@@ -3878,11 +3910,14 @@ plot_factor_scores_2d(
 
 ```{python}
 plot_factor_outcome(
-    Z_interp, y_interp,
+    factor_summary["Z_rot"], y_interp,
     top_factors=top_factors_interp,
     n_factors_show=5,
-    outcome_label="outcome",
-    title="Outcome along samples ranked by factor score — top active factors",
+    outcome_label="Outcome",
+    title="Outcome versus Score for Top Active Factors",
+    factor_summary=factor_summary,
+    save_path = "./scores_vs_outcome.png",
+    # sharey = True
 )
 ```
 
