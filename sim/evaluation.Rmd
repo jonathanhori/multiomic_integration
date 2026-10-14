@@ -6,7 +6,7 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, dpi = 300, fig.width = 10)
 ```
 
 
@@ -29,6 +29,34 @@ jafar_data <- Data
 output_dir = "./results/"
 dir.create(output_dir) #, showWarnings = FALSE)
 # getwd()
+```
+
+# PDF export
+
+Run `pdf-open` before any figure chunks you want to capture, then `pdf-close`
+when done. Both are `eval=FALSE` so a full render skips them automatically.
+Width / height here are appropriate for multi-panel facet figures; adjust as
+needed per figure.
+
+```{r pdf-open, eval=FALSE}
+dir.create("./figures", showWarnings = FALSE)
+pdf("./figures/evaluation_figures.pdf",
+    width       = 14,
+    height      = 10,
+    useDingbats = FALSE)
+
+theme_set(
+  theme_bw(base_size = 14) +
+    theme(
+      strip.background = element_blank(),
+      strip.text       = element_text(face = "bold"),
+      legend.position  = "bottom"
+    )
+)
+```
+
+```{r pdf-close, eval=FALSE}
+dev.off()
 ```
 
 
@@ -1709,7 +1737,16 @@ reshape_shared_metrics <- function(df, model_name) {
     ) |>
     select(-structure_metric)
 
-  bind_rows(rse_long, cov_long) |>
+  width_long <- df |>
+    pivot_longer(
+      cols      = any_of("outcome_95p_width"),
+      names_to  = "structure_metric",
+      values_to = "value"
+    ) |>
+    mutate(structure = "outcome", metric = "95p_width") |>
+    select(-structure_metric)
+
+  bind_rows(rse_long, cov_long, width_long) |>
     mutate(model = model_name)
 }
 
@@ -1833,6 +1870,29 @@ for (k_val in levels(shared_mofa_combined$k_delta)) {
 }
 ```
 
+## 95% Credible interval width
+
+```{r shared-mofa-width}
+for (k_val in levels(shared_mofa_combined$k_delta)) {
+  print(
+    shared_mofa_combined |>
+      filter(k_delta == k_val, metric == "95p_width", view == 0) |>
+      ggplot(aes(x = n,
+                 y = value,
+                 group = interaction(n, model),
+                 colour = model)) +
+      geom_boxplot() +
+      facet_wrap(vars(p),
+                 scales = "free_y",
+                 labeller = label_both) +
+      labs(
+        title = paste0("95% CI width (outcome) — k_delta = ", k_val),
+        y = "Width"
+      )
+  )
+}
+```
+
 ## Covariance Frobenius error
 
 ```{r shared-mofa-cov-load}
@@ -1911,6 +1971,11 @@ misaligned_mofa_raw <- lapply(misaligned_mofa_files, readRDS) |>
 ```
 
 ## Reshape
+
+```{r}
+misaligned_shared_raw
+```
+
 
 ```{r misaligned-reshape}
 misaligned_shared_metrics <- reshape_shared_metrics(misaligned_shared_raw, "SharedFactorModel")
@@ -2046,6 +2111,65 @@ for (k_val in levels(misaligned_combined$k_delta)) {
 }
 ```
 
+## 95% Credible interval width
+
+```{r misaligned-width}
+for (k_val in levels(misaligned_combined$k_delta)) {
+  print(
+    misaligned_combined |>
+      filter(k_delta == k_val, metric == "95p_width", view == 0) |>
+      ggplot(aes(x = n,
+                 y = value,
+                 group = interaction(n, model),
+                 colour = model)) +
+      geom_boxplot() +
+      facet_grid(align_label ~ p,
+                 scales = "free_y",
+                 labeller = label_both) +
+      labs(
+        title = paste0("95% CI width (outcome) — k_delta = ", k_val),
+        y = "Width"
+      )
+  )
+}
+```
+
+## CI width–coverage correlation
+
+```{r misaligned-width-cov-cor}
+width_cov_data <- misaligned_combined |>
+  filter(metric %in% c("95p_coverage", "95p_width"), structure == "outcome", view == 0) |>
+  select(n, p, align_label, k_delta, model, rep, metric, value) |>
+  pivot_wider(names_from = metric, values_from = value)
+
+width_cov_cor <- width_cov_data |>
+  group_by(n, p, align_label, k_delta, model) |>
+  summarise(
+    cor    = cor(`95p_coverage`, `95p_width`, use = "complete.obs"),
+    n_reps = sum(!is.na(`95p_coverage`) & !is.na(`95p_width`)),
+    .groups = "drop"
+  )
+
+for (k_val in levels(misaligned_combined$k_delta)) {
+  print(
+    width_cov_cor |>
+      filter(k_delta == k_val) |>
+      ggplot(aes(x = n, y = cor,
+                 group = interaction(n, model),
+                 colour = model)) +
+      geom_point(size = 2, position = position_dodge(width = 0.5)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      facet_grid(align_label ~ p, labeller = label_both) +
+      ylim(-1, 1) +
+      labs(
+        title = paste0("Correlation: CI width vs coverage (outcome) — k_delta = ", k_val),
+        subtitle = "Pearson r across reps within each scenario",
+        y = "Correlation (width vs coverage)", x = "n"
+      )
+  )
+}
+```
+
 ## Covariance Frobenius error
 
 ```{r misaligned-cov-load}
@@ -2100,4 +2224,151 @@ for (k_val in levels(misaligned_cov$k_delta)) {
       )
   )
 }
+```
+
+
+# Symmetric scenario — publication figures
+
+Signal reconstruction, outcome prediction, credible interval coverage, and
+covariance reconstruction for the symmetric loading alignment, varying N and P.
+Metrics averaged over views where applicable.
+
+```{r sym-prep}
+pub_colours <- c("VIPER" = "#2166AC", "MOFA" = "#D6604D")
+pub_labels  <- c("VIPER" = "VIPER", "MOFA" = "MOFA")
+
+p_label_fn <- function(x) paste0("p = ", x)
+p_labeller <- labeller(p = p_label_fn)
+
+pub_theme <- theme_bw(base_size = 14) + theme(
+  legend.position    = "bottom",
+  legend.title       = element_text(face = "bold"),
+  panel.grid.minor   = element_blank(),
+  axis.title         = element_text(face = "bold"),
+  strip.text         = element_text(face = "bold"),
+  strip.background   = element_blank()
+)
+
+sym_combined <- misaligned_combined |>
+  filter(align_label == "symmetric") |>
+  mutate(model = recode(as.character(model), "SharedFactorModel" = "VIPER"),
+         model = factor(model))
+
+sym_cov <- misaligned_cov |>
+  filter(align_label == "symmetric") |>
+  mutate(model = recode(as.character(model), "SharedFactorModel" = "VIPER"),
+         model = factor(model))
+```
+
+## Signal reconstruction
+
+RSE values averaged across the three views.
+
+```{r sym-rse}
+struct_labels <- c(
+  joint               = "Joint structure RSE (train, oracle)",
+  data_reconstruction = "Test reconstruction RSE"
+)
+
+for (struct in c("joint", "data_reconstruction")) {
+  print(
+    sym_combined |>
+      filter(k_delta == "10", structure == struct, metric == "rse") |>
+      group_by(model, n, p, rep) |>
+      summarise(value = mean(value), .groups = "drop") |>
+      ggplot(aes(x = n, y = value,
+                 group = interaction(n, model),
+                 colour = model)) +
+      geom_boxplot(width = 0.6, outlier.size = 0.8) +
+      facet_wrap(~p, nrow = 1, labeller = p_labeller) +
+      scale_colour_manual(values = pub_colours, labels = pub_labels) +
+      scale_y_continuous(limits = c(NA, NA)) + #, expand = expansion(mult = c(0, 0.05))) +
+      labs(x = "N", y = "Relative Squared Error",
+           colour = "Model",
+           subtitle = struct_labels[[struct]]) +
+      pub_theme
+  )
+}
+```
+
+## Outcome metrics
+
+```{r sym-outcome}
+sym_outcome_data <- bind_rows(
+  sym_combined |>
+    filter(k_delta == "10", structure == "outcome", metric == "mse", view == 0) |>
+    mutate(metric_label = "Outcome MSE"),
+  sym_combined |>
+    filter(k_delta == "10", structure == "outcome", metric == "95p_coverage", view == 0) |>
+    mutate(metric_label = "95% CI Coverage")
+) |>
+  mutate(metric_label = factor(metric_label, levels = c("Outcome MSE", "95% CI Coverage")))
+
+coverage_ref <- tibble(
+  metric_label = factor("95% CI Coverage", levels = levels(sym_outcome_data$metric_label)),
+  yintercept   = 0.95
+)
+
+print(
+  sym_outcome_data |>
+    ggplot(aes(x = n, y = value,
+               group = interaction(n, model),
+               colour = model)) +
+    geom_boxplot(width = 0.6, outlier.size = 0.8) +
+    geom_hline(data = coverage_ref, aes(yintercept = yintercept),
+               linetype = "dashed", colour = "black", linewidth = 0.6,
+               inherit.aes = FALSE) +
+    facet_grid(metric_label ~ p, scales = "free_y", switch = "y",
+               labeller = labeller(p = p_label_fn, metric_label = label_value)) +
+    scale_colour_manual(values = pub_colours, labels = pub_labels) +
+    labs(x = "N", y = NULL, colour = "Model",
+         title = "Outcome prediction performance") +
+    pub_theme +
+    theme(strip.placement = "outside")
+)
+```
+
+## Covariance reconstruction
+
+```{r sym-cov, fig.height=3}
+print(
+  sym_cov |>
+    filter(k_delta == "10", cov_type == "within") |>
+    ggplot(aes(x = n, y = cov_frob,
+               group = interaction(n, model),
+               colour = model)) +
+    geom_boxplot(width = 0.6, outlier.size = 0.8) +
+    facet_wrap(~p, nrow = 1, labeller = p_labeller) +
+    scale_colour_manual(values = pub_colours, labels = pub_labels) +
+    scale_y_continuous(trans = "log10", expand = expansion(mult = c(0.05, 0.05))) +
+    guides(y = "axis_logticks",
+           colour = guide_legend(override.aes = list(linewidth = 2))) +
+    labs(x = "N", y = "Frobenius norm (log scale)",
+         colour = "Model",
+         subtitle = "Within-view covariance reconstruction error") +
+    pub_theme
+)
+```
+
+## Runtime
+
+```{r sym-runtime, fig.height=3}
+print(
+  sym_combined |>
+    filter(k_delta == "10", view == 0, structure == "joint", metric == "rse") |>
+    select(model, n, p, rep, runtime) |>
+    ggplot(aes(x = n, y = runtime,
+               group = interaction(n, model),
+               colour = model)) +
+    geom_boxplot(width = 0.6, outlier.size = 0.8) +
+    facet_wrap(~p, nrow = 1, labeller = p_labeller) +
+    scale_colour_manual(values = pub_colours, labels = pub_labels) +
+    scale_y_continuous(trans = "log10", expand = expansion(mult = c(0.05, 0.05))) +
+    guides(y = "axis_logticks",
+           colour = guide_legend(override.aes = list(linewidth = 2))) +
+    labs(x = "N", y = "Runtime (seconds)",
+         colour = "Model",
+         subtitle = "Total training runtime") +
+    pub_theme
+)
 ```
