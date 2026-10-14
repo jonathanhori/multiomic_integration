@@ -526,19 +526,19 @@ class SupMultiviewShared(PyroModule):
             #                        torch.matmul(Z, Lambda_l_list[l].squeeze(0).T))
 
 
-    def predict_forward(self, X_list, batch_idx, y=None, cens=None):
+    def predict_forward(self, X_list, batch_idx):
         assert self.params is not None, "Param dict is None: has training inference been run first?"
         if self.dense:
             return self.predict_forward_dense(X_list, batch_idx)
         else:
             return self.predict_forward_mgp(X_list, batch_idx)
 
-    def predict_guide(self, X_list, batch_idx, y=None, cens=None):
+    def predict_guide(self, X_list, batch_idx):
         assert self.params is not None, "Param dict is None: has training inference been run first?"
         if self.dense:
-            return self.predict_guide_dense(X_list, batch_idx, y)
+            return self.predict_guide_dense(X_list, batch_idx)
         else:
-            return self.predict_guide_mgp(X_list, batch_idx, y)
+            return self.predict_guide_mgp(X_list, batch_idx)
 
 
     def predict_forward_mgp(self, X_list, batch_idx):
@@ -618,7 +618,7 @@ class SupMultiviewShared(PyroModule):
                 raise NotImplementedError
 
 
-    def predict_guide_mgp(self, X_list, batch_idx, y=None):
+    def predict_guide_mgp(self, X_list, batch_idx):
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
 
@@ -759,7 +759,7 @@ class SupMultiviewShared(PyroModule):
                 raise NotImplementedError
 
 
-    def predict_guide_dense(self, X_list, batch_idx, y=None):
+    def predict_guide_dense(self, X_list, batch_idx):
         if self.p_l_list is None:
             self.p_l_list = [X_l.shape[1] for X_l in X_list]
 
