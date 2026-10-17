@@ -1,0 +1,298 @@
+---
+title: "SupMultiviewShared — optimiser hyperparameter selection"
+jupyter: python3
+---
+
+Selects AdagradRMSProp and minibatch settings by k-fold cross-validation on one
+simulated dataset, two ways:
+
+1. **Grid search** — `run_cv_grid_shared` over a fixed grid; checkpointed to CSV.
+2. **Optuna** — multi-objective search (outcome MSE, covariance error, training
+   time) with `run_optuna_study`; the study is stored in `sim/optuna_cv_shared.db`.
+
+Both normalise inside each fold, so there is no cross-fold leakage.
+
+## Setup
+
+```{python}
+import os
+import sys
+import importlib
+import itertools
+
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+for _mod in ("multiview_shared", "run_methods", "handler", "data_utils", "constants", "optuna_cv"):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from run_methods import load_rds, run_cv_grid_shared
+from data_utils import zero_variance_col_filter, extract_sim_decomp_shared
+from optuna_cv import run_optuna_study, pareto_dataframe
+```
+
+## Settings
+
+```{python}
+DATA_ROOT   = "~/multiomic_integration/sim/data"
+RESULTS_DIR = os.path.expanduser("~/multiomic_integration/sim/results/integration_shared")
+
+rep_config = {
+    "n": 500, "p_l": 1000, "snr_x": 2, "snr_y": 2,
+    "rep": 1, "sparsity": 0.25, "k_delta": 10,
+}
+
+N_CV_FOLDS             = 5
+CV_SEED                = 42
+N_CV_POSTERIOR_SAMPLES = 10
+N_CV_WORKERS           = N_CV_FOLDS    # 1 = sequential; N_CV_FOLDS = all folds in parallel
+
+OPTUNA_STORAGE = "sqlite:////Users/jonathanhori/multiomic_integration/sim/optuna_cv_shared.db"
+OPTUNA_STUDY   = "shared_cv_run2"
+OPTUNA_TRIALS  = 50
+```
+
+## Load data
+
+CV uses the training file only. Zero-variance columns are dropped on the full
+training set; normalisation happens inside each fold.
+
+```{python}
+cond_dir = (f"n{rep_config['n']}p{rep_config['p_l']}"
+            f"_snr{rep_config['snr_x']}.{rep_config['snr_y']}"
+            f"_sparse{rep_config['sparsity']}")
+sim_data = load_rds(os.path.expanduser(
+    f"{DATA_ROOT}/multi_view_shared/k.5/train/{cond_dir}/"
+    f"sim_data_shared_rep{rep_config['rep']}.rds"))
+
+X_l_raw  = sim_data["X_l"]
+y_cv_raw = sim_data["y"].squeeze()
+
+cv_col_filters = [zero_variance_col_filter(X) for X in X_l_raw]
+X_l_cv_raw     = [X[:, f] for X, f in zip(X_l_raw, cv_col_filters)]
+
+# Simulation truth used for the covariance reconstruction (cov_frob) metric.
+cv_sim_decomp = extract_sim_decomp_shared(sim_data)
+
+K_FIT = int(sim_data["K"]) + rep_config["k_delta"]
+cv_model_config = {"k": K_FIT, "dense_model": False}
+
+print(f"CV data: {X_l_cv_raw[0].shape[0]} observations")
+for l, X in enumerate(X_l_cv_raw):
+    print(f"  View {l}: {X.shape[1]} features (after zero-var filter)")
+```
+
+```{python}
+def select_best_config(cv_results, grid_names, metric="outcome_mse", lower_is_better=True):
+    """Return (best_config dict, per-config mean metric Series) from a CV results DataFrame."""
+    agg      = cv_results.groupby("config_idx")[metric].mean()
+    best_idx = int(agg.idxmin() if lower_is_better else agg.idxmax())
+    best_row = cv_results[cv_results["config_idx"] == best_idx].iloc[0]
+
+    best_config = {}
+    for k in grid_names:
+        v = best_row[k]
+        if isinstance(v, np.integer):
+            v = int(v)
+        elif isinstance(v, np.floating):
+            v = float(v)
+        best_config[k] = v
+    return best_config, agg
+```
+
+## Grid search
+
+```{python}
+# AdagradRMSProp hyperparameter grid. Minibatch is a fraction of the fold
+# training size, so comparisons are valid across different n.
+cv_grid_values = {
+    "eta":                   [0.1, 0.25, 0.5, 0.75, 1.0],
+    "delta":                 [1e-16],
+    "t":                     [0.1, 0.25, 0.5, 0.75, 1.0],
+    "num_particles":         [1, 2],
+    "minibatch_fraction":    [0.05, 0.1, 0.2, 0.5],
+    "min_epochs":            [100],
+    "max_epochs":            [500],
+    "convergence_criterion": ["elbo_snr"],
+    "window":                [50],
+    "snr_threshold":         [1],
+}
+cv_train_grid_names = tuple(cv_grid_values)
+cv_train_grid = list(itertools.product(*cv_grid_values.values()))
+
+n_train_per_fold = int(X_l_cv_raw[0].shape[0] * (N_CV_FOLDS - 1) / N_CV_FOLDS)
+print(f"{len(cv_train_grid)} configurations; per-fold training size {n_train_per_fold}")
+print("minibatch sizes at fold scale:",
+      [max(1, int(n_train_per_fold * f)) for f in cv_grid_values["minibatch_fraction"]])
+```
+
+```{python}
+# The checkpoint is written after every config; rerunning resumes where it stopped.
+CV_CHECKPOINT_PATH = os.path.join(
+    RESULTS_DIR,
+    f"cv_results_{cond_dir}_rep{rep_config['rep']}_kdelta{rep_config['k_delta']}.csv")
+
+cv_results_shared = run_cv_grid_shared(
+    X_l_cv_raw, y_cv_raw,
+    model_config=cv_model_config,
+    train_grid=cv_train_grid,
+    train_grid_names=cv_train_grid_names,
+    n_folds=N_CV_FOLDS,
+    seed=CV_SEED,
+    n_posterior_samples=N_CV_POSTERIOR_SAMPLES,
+    opt="adagrad",
+    n_workers=N_CV_WORKERS,
+    sim_decomp=cv_sim_decomp,
+    column_filters=cv_col_filters,
+    checkpoint_path=CV_CHECKPOINT_PATH,
+    resume=True,
+)
+```
+
+Earlier grid runs over absolute minibatch sizes can be loaded instead of rerunning:
+
+```{python}
+# cv_results_shared = pd.concat([
+#     pd.read_csv(os.path.join(RESULTS_DIR, "cv_results_n500p1000_snr2.2_sparse0.25_rep1_kdelta10_minibatch32-64.csv")),
+#     pd.read_csv(os.path.join(RESULTS_DIR, "cv_results_n500p1000_snr2.2_sparse0.25_rep1_kdelta10_minibatch128-256.csv")),
+# ], ignore_index=True)
+# cv_train_grid_names = tuple(c for c in cv_train_grid_names if c != "minibatch_fraction") + ("minibatch_size",)
+```
+
+### Best configuration per metric
+
+```{python}
+cv_summary_cols = [c for c in ["outcome_mse", "cov_frob", "train_time", "local_time",
+                               "total_time", "epochs", "local_epochs"]
+                   if c in cv_results_shared.columns]
+(cv_results_shared.groupby("config_idx")[cv_summary_cols].mean()
+                  .sort_values("outcome_mse").head(10))
+```
+
+```{python}
+for metric in [m for m in ["outcome_mse", "cov_frob"] if m in cv_results_shared.columns]:
+    best_config, agg = select_best_config(cv_results_shared, cv_train_grid_names, metric=metric)
+    print(f"Best config by mean CV {metric} ({agg.min():.4f}):")
+    for k, v in best_config.items():
+        print(f"  {k}: {v}")
+    print()
+```
+
+### Rank aggregation across metrics
+
+Each metric is ranked independently (rank 1 = best). The mean rank gives a
+single scale-invariant combined ranking.
+
+```{python}
+quality_metrics = [c for c in ["outcome_mse", "cov_frob", "total_time"]
+                   if c in cv_results_shared.columns]
+cv_multi_summary = cv_results_shared.groupby("config_idx")[quality_metrics].mean()
+for col in quality_metrics:
+    cv_multi_summary[f"rank_{col}"] = cv_multi_summary[col].rank()
+rank_cols = [f"rank_{c}" for c in quality_metrics]
+cv_multi_summary["mean_rank"] = cv_multi_summary[rank_cols].mean(axis=1)
+cv_multi_summary = cv_multi_summary.sort_values("mean_rank")
+cv_multi_summary[quality_metrics + ["mean_rank"] + rank_cols].head(15)
+```
+
+```{python}
+# Top 5 configs by combined rank
+for rank_pos, config_idx in enumerate(cv_multi_summary.index[:5], start=1):
+    row = cv_results_shared[cv_results_shared["config_idx"] == config_idx].iloc[0]
+    print(f"--- Rank {rank_pos}  (config_idx={config_idx}, "
+          f"mean_rank={cv_multi_summary.loc[config_idx, 'mean_rank']:.2f}) ---")
+    for k in cv_train_grid_names:
+        print(f"  {k}: {row[k]}")
+    for m in quality_metrics:
+        print(f"  mean {m}: {cv_multi_summary.loc[config_idx, m]:.4f}")
+    print()
+```
+
+```{python}
+# outcome_mse vs cov_frob; dot size = training time, colour = combined rank.
+if {"cov_frob", "outcome_mse"} <= set(cv_multi_summary.columns):
+    plot_df = cv_multi_summary.reset_index()
+    sizes = (plot_df["total_time"] / plot_df["total_time"].max() * 300 + 20
+             if "total_time" in plot_df else 60)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc = ax.scatter(plot_df["outcome_mse"], plot_df["cov_frob"], c=plot_df["mean_rank"],
+                    s=sizes, cmap="viridis_r", alpha=0.75, edgecolors="grey", linewidths=0.4)
+    plt.colorbar(sc, ax=ax, label="Mean rank (lower = better overall)")
+    for _, row in plot_df.head(10).iterrows():
+        ax.annotate(str(int(row["config_idx"])), (row["outcome_mse"], row["cov_frob"]),
+                    fontsize=7, xytext=(3, 3), textcoords="offset points")
+    ax.set(xlabel="CV outcome MSE", ylabel="CV cov_frob",
+           title="MSE vs cov_frob  (dot size ∝ train time, colour = combined rank)")
+    plt.tight_layout()
+    plt.show()
+```
+
+```{python}
+# Outcome MSE across folds for the top configs
+top_cv = cv_results_shared[cv_results_shared["config_idx"]
+                           .isin(cv_multi_summary.head(10).index)].copy()
+top_cv["config_label"] = ("eta=" + top_cv["eta"].astype(str)
+                          + " t=" + top_cv["t"].astype(str)
+                          + " mbf=" + top_cv["minibatch_fraction"].astype(str))
+order = top_cv.groupby("config_label")["outcome_mse"].mean().sort_values().index
+
+fig, ax = plt.subplots()
+sns.boxplot(data=top_cv, x="outcome_mse", y="config_label", order=order, ax=ax)
+ax.set(title="CV outcome MSE — top 10 configs by combined rank",
+       xlabel="Outcome MSE (standardised y)", ylabel="")
+plt.tight_layout()
+plt.show()
+```
+
+## Optuna
+
+```{python}
+optuna_param_space = {
+    # tuned (continuous, log scale)
+    "eta":                {"type": "float", "low": 0.001, "high": 1.0,  "log": True},
+    "t":                  {"type": "float", "low": 0.01,  "high": 1.0,  "log": True},
+    "snr_threshold":      {"type": "float", "low": 0.1,   "high": 10.0, "log": True},
+    # fraction of fold training size; converted to an absolute count inside each fold
+    "minibatch_fraction": {"type": "float", "low": 0.05,  "high": 0.5,  "log": True},
+    # fixed
+    "num_particles":         {"type": "fixed", "value": 1},
+    "delta":                 {"type": "fixed", "value": 1e-16},
+    "min_epochs":            {"type": "fixed", "value": 200},
+    "max_epochs":            {"type": "fixed", "value": 500},
+    "convergence_criterion": {"type": "fixed", "value": "elbo_snr"},
+    "window":                {"type": "fixed", "value": 50},
+}
+```
+
+```{python}
+study, labels = run_optuna_study(
+    X_l_cv_raw, y_cv_raw,
+    model_config=cv_model_config,
+    param_space=optuna_param_space,
+    sim_decomp=cv_sim_decomp,
+    column_filters=cv_col_filters,
+    n_trials=OPTUNA_TRIALS,
+    n_folds=N_CV_FOLDS,
+    seed=CV_SEED,
+    n_posterior_samples=N_CV_POSTERIOR_SAMPLES,
+    storage=OPTUNA_STORAGE,
+    study_name=OPTUNA_STUDY,
+)
+```
+
+```{python}
+# Pareto front, ranked by distance from the ideal point after min-max scaling.
+pareto_df = pareto_dataframe(study, labels)
+for col in ["outcome_mse", "cov_frob", "train_time"]:
+    pareto_df[f"{col}_norm"] = ((pareto_df[col] - pareto_df[col].min())
+                                / (pareto_df[col].max() - pareto_df[col].min()))
+norm_cols = [c for c in pareto_df.columns if c.endswith("_norm")]
+pareto_df["dist_from_ideal"] = pareto_df[norm_cols].pow(2).sum(axis=1).pow(0.5)
+pareto_df.sort_values("dist_from_ideal")
+```

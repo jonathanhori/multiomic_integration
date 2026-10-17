@@ -1,0 +1,207 @@
+---
+title: "VIPER (SupMultiviewDecomp) — single-condition pipeline"
+jupyter: python3
+---
+
+Runs the full pipeline for VIPER — shared factors plus view-specific factors —
+on one simulated dataset: load → process → train → local inference →
+prediction → evaluation → factor interpretation. Every step goes through the
+helpers in `python/run_methods.py` (with `model_type="viper"`).
+
+This is a starting skeleton: the training settings below come from the
+`python/hyperparam_run.py` grid and have not been re-tuned since the
+June 2026 changes to `model.py`. Interpretation currently covers the shared
+part of the model only.
+
+- Sweeps over replicates and conditions: `python/hyperparam_run.py`
+- Earlier SupMultiviewDecomp exploration: `sim/archive/python_integration_2026-06.qmd`
+
+## Setup
+
+```{python}
+import os
+import sys
+import importlib
+
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+
+# Pick up edits to the helper modules without restarting the kernel.
+for _mod in ("model", "run_methods", "handler", "data_utils",
+             "constants", "factor_interpretation"):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
+import numpy as np
+import pandas as pd
+import torch
+import pyro
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from run_methods import (
+    load_rds, process_data, train_model, train_model_locally, evaluate_fitted_model,
+)
+from factor_interpretation import plot_pve, plot_r2, plot_factor_loadings
+from constants import Sites
+```
+
+## Settings
+
+All choices for this run live in this cell.
+
+```{python}
+MODEL_TYPE = "viper"
+DATA_ROOT  = "~/multiomic_integration/sim/data_ortho"
+
+rep_config = {
+    "n": 500, "p_l": 100, "snr_x": 2, "snr_y": 2,
+    "rep": 1, "sparsity": 0.25, "k_delta": 10,
+}
+
+DEVICE              = torch.device("cpu")
+N_POSTERIOR_SAMPLES = 300
+
+# StepLR + Adam (VIPER's default optimiser in run_methods).
+train_config = {
+    "initial_lr":      0.05,
+    "betas":           (0.9, 0.999),
+    "num_particles":   2,
+    "lr_step_size":    10,
+    "lr_decay_factor": 0.9,
+    "minibatch_size":  32,
+    "min_epochs":      50,
+    "max_epochs":      300,
+}
+local_config = {**train_config}
+```
+
+## Load data
+
+```{python}
+cond_dir = (f"n{rep_config['n']}p{rep_config['p_l']}"
+            f"_snr{rep_config['snr_x']}.{rep_config['snr_y']}"
+            f"_sparse{rep_config['sparsity']}")
+
+def rds_path(split):
+    return os.path.expanduser(f"{DATA_ROOT}/{split}/{cond_dir}/"
+                              f"sim_data_ywithview_rep{rep_config['rep']}.rds")
+
+print("Loading:", rds_path("train"))
+sim_data      = load_rds(rds_path("train"))
+sim_data_test = load_rds(rds_path("test"))
+
+print("L =", int(sim_data["L"]), " K =", int(sim_data["K"]),
+      " K_l =", sim_data["K_l"].int().tolist(),
+      " n =", sim_data["X_l"][0].shape[0], " p =", sim_data["X_l"][0].shape[1])
+```
+
+## Process data
+
+```{python}
+train_subset, test_subset, data_package = process_data(
+    sim_data, sim_data_test,
+    training_split=False, training_size=0.8, seed=123,
+    model_type=MODEL_TYPE,
+)
+print("train n:", len(train_subset), " test n:", len(test_subset))
+```
+
+## Train
+
+```{python}
+K_DELTA = rep_config["k_delta"]
+model_config = {
+    "k":                    int(sim_data["K"]) + K_DELTA,
+    "k_l_list":             [k_l + K_DELTA for k_l in data_package["k_l_list"]],
+    "include_view_factors": True,
+    "dense_model":          False,
+}
+
+pyro.clear_param_store()
+factor_model, train_handler, global_state = train_model(
+    model_config, train_config, train_subset,
+    model_type=MODEL_TYPE, write=False, verbose=True, device=DEVICE,
+)
+print(f"Global training: {factor_model.total_epochs} epochs, "
+      f"{global_state['inference_time']:.1f}s")
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+axes[0].plot(factor_model.loss_history[1:])
+axes[0].set(xlabel="Epoch", ylabel="Negative ELBO", title="Minibatch loss per epoch")
+axes[1].plot(factor_model.var_param_convergence_history[1:])
+axes[1].set(xlabel="Epoch", ylabel="Norm difference",
+            title="Variational parameter change per epoch")
+plt.tight_layout()
+plt.show()
+```
+
+## Local inference on the test set
+
+```{python}
+factor_model, test_handler, local_state = train_model_locally(
+    factor_model, local_config, test_subset,
+    model_type=MODEL_TYPE, verbose=True, device=DEVICE,
+)
+print(f"Local inference: {factor_model.local_epochs} epochs, "
+      f"{local_state['inference_time']:.1f}s")
+```
+
+## Evaluate
+
+```{python}
+eval_table, _, post_samples, post_samples_test = evaluate_fitted_model(
+    rep_config, data_package, train_handler, test_handler,
+    global_state, local_state,
+    N_POSTERIOR_SAMPLES, model_type=MODEL_TYPE,
+)
+eval_table
+```
+
+## Prediction
+
+```{python}
+pred_train = post_samples[Sites.y].mean(dim=0).squeeze()
+pred_test  = post_samples_test[Sites.y_pred].mean(dim=0).squeeze()
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+for ax, pred, true, label in [
+    (axes[0], pred_train, data_package["train_y_clean"].squeeze(), "Train"),
+    (axes[1], pred_test,  data_package["test_y_clean"].squeeze(),  "Test"),
+]:
+    sns.regplot(x=pred.numpy(), y=true.numpy(), ax=ax, scatter_kws={"alpha": 0.6})
+    ax.axline((0, 0), slope=1, color="black", ls="--")
+    ax.set(xlabel="Predicted y", ylabel="Simulated y", title=f"Outcome predictions — {label}")
+plt.tight_layout()
+plt.show()
+```
+
+## Factor interpretation (shared factors)
+
+```{python}
+L = data_package["L"]
+X_list_interp      = data_package["train_X_l_list_clean"]
+Z_interp           = post_samples[Sites.Z].mean(dim=0)
+Lambda_list_interp = [post_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze()
+                      for l in range(L)]
+view_names         = [f"View {l}" for l in range(L)]
+```
+
+```{python}
+pve = plot_pve(Lambda_list_interp, view_names=view_names,
+               title="PVE per shared factor — VIPER (unrotated)")
+```
+
+```{python}
+r2 = plot_r2(X_list_interp, Z_interp, Lambda_list_interp, view_names=view_names,
+             title="R² per shared factor — VIPER")
+```
+
+```{python}
+Lambda_rot_list = plot_factor_loadings(
+    Lambda_list_interp, view_names=view_names, rotate=True,
+    title="Shared loadings — VIPER (varimax-rotated)",
+)
+```

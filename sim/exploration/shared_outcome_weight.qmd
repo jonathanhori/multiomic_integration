@@ -1,0 +1,239 @@
+---
+title: "SupMultiviewShared — outcome up-weighting"
+jupyter: python3
+---
+
+The shared scores `Z` are informed by two likelihood terms: the reconstruction
+of the views (`X_l = Z @ Lambda_l^T + E_l`) and the outcome (`y = Z @ beta + e`).
+Per observation the reconstruction contributes `sum_l p_l` Gaussian terms while
+the outcome contributes a single term, so the ELBO is dominated by reconstruction
+by a factor of `sum_l p_l` (here in the hundreds–thousands). When the
+outcome-relevant factor is *not* a high-variance direction in `X` (the misaligned
+regime), the reconstruction gradient barely registers it and whether a given run
+recovers it is left to SVI noise — producing large run-to-run variance in
+outcome MSE.
+
+`outcome_weight` up-weights the outcome log-likelihood via `pyro.poutine.scale`
+so it informs `Z` comparably to the views. `outcome_weight=1.0` is the original
+objective. A natural scale is the per-observation count of reconstruction terms,
+`sum_l p_l`.
+
+1. **Single dataset**: sweep a few weights on one condition and compare held-out
+   outcome MSE.
+2. **Across misaligned scenarios**: results from `python/outcome_weight_sweep.py`.
+
+## Setup
+
+```{python}
+import os
+import sys
+import importlib
+
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+for _mod in ("multiview_shared", "run_methods", "handler", "data_utils", "constants"):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
+import pandas as pd
+import torch
+import pyro
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from run_methods import (
+    load_rds, process_data, train_model, train_model_locally, evaluate_fitted_model,
+)
+```
+
+## Settings
+
+```{python}
+MODEL_TYPE = "shared"
+DATA_ROOT  = "~/multiomic_integration/sim/data"
+
+USE_MISALIGNED = True
+ALIGN_LABEL    = "anti_aligned"
+rep_config = {
+    "n": 500, "p_l": 1000, "snr_x": 2, "snr_y": 2,
+    "rep": 2, "sparsity": 0.25, "k_delta": 10,
+}
+
+DEVICE              = torch.device("cpu")
+N_POSTERIOR_SAMPLES = 300
+FRACTIONS           = [0.2]          # minibatch_fraction values to try, e.g. [0.1, 0.2, 0.3]
+
+# Output of python/outcome_weight_sweep.py
+SWEEP_CSV = os.path.expanduser(
+    "~/multiomic_integration/sim/results/integration_shared_misaligned/outcome_weight_sweep.csv")
+
+train_config = {
+    "eta":                   0.25,
+    "delta":                 1e-16,
+    "t":                     0.1,
+    "num_particles":         1,
+    "minibatch_fraction":    0.15,
+    "min_epochs":            200,
+    "max_epochs":            500,
+    "convergence_criterion": "elbo_snr",
+    "window":                50,
+    "snr_threshold":         5,
+}
+```
+
+## Load and process data
+
+```{python}
+cond_dir = (f"n{rep_config['n']}p{rep_config['p_l']}"
+            f"_snr{rep_config['snr_x']}.{rep_config['snr_y']}"
+            f"_sparse{rep_config['sparsity']}")
+data_dir = "multi_view_shared"
+if USE_MISALIGNED:
+    rep_config["align_label"] = ALIGN_LABEL
+    cond_dir += f"_align_{ALIGN_LABEL}"
+    data_dir  = "multi_view_shared_misaligned"
+
+def rds_path(split):
+    return os.path.expanduser(f"{DATA_ROOT}/{data_dir}/k.5/{split}/{cond_dir}/"
+                              f"sim_data_shared_rep{rep_config['rep']}.rds")
+
+sim_data      = load_rds(rds_path("train"))
+sim_data_test = load_rds(rds_path("test"))
+train_subset, test_subset, data_package = process_data(
+    sim_data, sim_data_test, training_split=False, training_size=0.8, seed=123,
+    model_type=MODEL_TYPE,
+)
+K_FIT = int(sim_data["K"]) + rep_config["k_delta"]
+```
+
+## Single dataset: outcome MSE vs. outcome_weight
+
+```{python}
+# Per-observation reconstruction term count — the imbalance the outcome fights.
+views   = data_package["train_X_l_list_clean"]
+L_views = len(views)
+total_p = sum(int(x.shape[1]) for x in views)
+print(f"L = {L_views} views, total features sum_l p_l = {total_p}")
+
+# Candidate weights: baseline, one view's worth, and full rebalance.
+outcome_weight_grid = [1.0, float(total_p // L_views), float(total_p)]
+print("outcome_weight grid:", outcome_weight_grid)
+```
+
+```{python}
+ow_results = []
+for frac in FRACTIONS:
+    for ow in outcome_weight_grid:
+        pyro.clear_param_store()
+        model_config = {"k": K_FIT, "dense_model": False, "outcome_weight": ow}
+        config = {**train_config, "minibatch_fraction": frac}
+
+        fm, train_handler, global_state = train_model(
+            model_config, config, train_subset,
+            model_type=MODEL_TYPE, write=False, device=DEVICE)
+        # Local inference for test Z uses X only — outcome_weight does not leak in.
+        fm, test_handler, local_state = train_model_locally(
+            fm, config, test_subset, model_type=MODEL_TYPE, device=DEVICE)
+        eval_table, _, _, _ = evaluate_fitted_model(
+            rep_config, data_package, train_handler, test_handler,
+            global_state, local_state, N_POSTERIOR_SAMPLES, model_type=MODEL_TYPE)
+
+        ow_results.append({
+            "outcome_weight":     ow,
+            "minibatch_fraction": frac,
+            "outcome_mse":        float(eval_table["outcome_mse"].iloc[0]),
+            "mean_joint_rse":     float(eval_table["joint_rse"].mean()),
+            "mean_test_rse":      float(eval_table["test_rse"].mean()),
+            "global_epochs":      int(fm.total_epochs),
+        })
+        print(f"outcome_weight={ow:>8.1f}  minibatch_fraction={frac}  "
+              f"outcome_mse={ow_results[-1]['outcome_mse']:.4f}  "
+              f"mean_joint_rse={ow_results[-1]['mean_joint_rse']:.4f}")
+
+ow_df = pd.DataFrame(ow_results)
+ow_df
+```
+
+```{python}
+# The Bayes floor for snr_y is 1 / (1 + snr_y).
+bayes_floor = 1.0 / (1.0 + float(rep_config["snr_y"]))
+
+fig, ax = plt.subplots(figsize=(6, 4))
+for frac, grp in ow_df.groupby("minibatch_fraction"):
+    ax.plot(grp["outcome_weight"], grp["outcome_mse"], marker="o",
+            label=f"minibatch_fraction={frac}")
+ax.axhline(bayes_floor, color="black", ls="--",
+           label=f"Bayes floor 1/(1+snr_y) = {bayes_floor:.2f}")
+ax.set_xscale("log")
+ax.set(xlabel="outcome_weight (log scale)", ylabel="Test outcome MSE",
+       title="Effect of outcome up-weighting on held-out prediction")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Across misaligned scenarios
+
+Produced by `python/outcome_weight_sweep.py`, which fits every
+(n, p) cell × scenario × replicate × weight × minibatch fraction. Weights are
+labelled `1x` / `per-view` / `full` so they are comparable across p.
+
+```{python}
+sweep_df = pd.read_csv(SWEEP_CSV)
+weight_kinds = ["1x", "per-view", "full"]
+cells  = sorted(set(zip(sweep_df["n"], sweep_df["p_l"])))
+labels = [l for l in ["symmetric", "mild_misalignment", "strong_misalignment", "anti_aligned"]
+          if l in set(sweep_df["align_label"])]
+print(f"{len(sweep_df)} fits, reps per setting: "
+      f"{sweep_df.groupby(['n', 'p_l', 'align_label', 'weight_kind', 'minibatch_fraction']).size().unique()}")
+```
+
+```{python}
+# Mean outcome MSE over reps: rows = scenario, cols = (n, p) cell,
+# each panel = weight_kind x minibatch_fraction.
+agg = (sweep_df
+       .groupby(["n", "p_l", "align_label", "weight_kind", "minibatch_fraction"])
+       ["outcome_mse"].mean().reset_index())
+
+vmin, vmax = agg["outcome_mse"].min(), agg["outcome_mse"].max()
+fig, axes = plt.subplots(len(labels), len(cells),
+                         figsize=(4 * len(cells), 3.2 * len(labels)), squeeze=False)
+for i, label in enumerate(labels):
+    for j, (n_cell, p_cell) in enumerate(cells):
+        ax = axes[i][j]
+        sub = agg[(agg["align_label"] == label) & (agg["n"] == n_cell) & (agg["p_l"] == p_cell)]
+        if sub.empty:
+            ax.set_visible(False)
+            continue
+        pivot = (sub.pivot(index="weight_kind", columns="minibatch_fraction",
+                           values="outcome_mse").reindex(weight_kinds))
+        sns.heatmap(pivot, ax=ax, vmin=vmin, vmax=vmax, cmap="viridis_r",
+                    annot=True, fmt=".2f", cbar=(j == len(cells) - 1),
+                    cbar_kws={"label": "outcome MSE"})
+        if i == 0:
+            ax.set_title(f"n={n_cell}, p={p_cell}")
+        ax.set_ylabel(f"{label}\noutcome_weight" if j == 0 else "")
+        ax.set_xlabel("minibatch_fraction" if i == len(labels) - 1 else "")
+
+bayes_floor = 1.0 / (1.0 + 2.0)     # the sweep uses snr_y = 2
+fig.suptitle(f"Test outcome MSE by outcome_weight × minibatch_fraction "
+             f"(Bayes floor = {bayes_floor:.2f})", y=1.002)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Per-cell best setting vs. the un-weighted baseline (1x at the smallest fraction).
+best = (agg.loc[agg.groupby(["n", "p_l", "align_label"])["outcome_mse"].idxmin()]
+           .rename(columns={"weight_kind": "best_weight_kind",
+                            "minibatch_fraction": "best_minibatch_fraction",
+                            "outcome_mse": "best_mse"}))
+base_frac = agg["minibatch_fraction"].min()
+baseline = (agg[(agg["weight_kind"] == "1x") & (agg["minibatch_fraction"] == base_frac)]
+            .rename(columns={"outcome_mse": "baseline_mse"})
+            [["n", "p_l", "align_label", "baseline_mse"]])
+summary = best.merge(baseline, on=["n", "p_l", "align_label"], how="left")
+summary["improvement"] = summary["baseline_mse"] - summary["best_mse"]
+summary[["n", "p_l", "align_label", "best_weight_kind", "best_minibatch_fraction",
+         "best_mse", "baseline_mse", "improvement"]]
+```

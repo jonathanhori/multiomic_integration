@@ -1,0 +1,205 @@
+---
+title: "SupMultiviewShared — stopping rule and initialisation"
+jupyter: python3
+---
+
+Two comparisons on the same data and model, each varying one training choice
+while holding everything else fixed:
+
+1. **Convergence criterion** — `elbo_min`, `elbo_snr`, `grad_norm` for global
+   training. Local inference uses the same base settings for every run, so only
+   the global stopping rule differs.
+2. **Initialisation** — default guide initialisation vs. SVD of the stacked views.
+
+The VIPER (SupMultiviewDecomp) version of the convergence comparison is in
+`sim/archive/python_integration_2026-06.qmd`.
+
+## Setup
+
+```{python}
+import os
+import sys
+import importlib
+
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+sys.path.insert(1, "/Users/jonathanhori/multiomic_integration/python")
+for _mod in ("multiview_shared", "run_methods", "handler", "data_utils", "constants"):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
+import numpy as np
+import pandas as pd
+import torch
+import pyro
+import matplotlib.pyplot as plt
+
+from run_methods import (
+    load_rds, process_data, train_model, train_model_locally, evaluate_fitted_model,
+)
+```
+
+## Settings
+
+```{python}
+MODEL_TYPE = "shared"
+DATA_ROOT  = "~/multiomic_integration/sim/data"
+
+rep_config = {
+    "n": 500, "p_l": 1000, "snr_x": 2, "snr_y": 2,
+    "rep": 2, "sparsity": 0.25, "k_delta": 10,
+}
+
+DEVICE              = torch.device("cpu")
+N_POSTERIOR_SAMPLES = 200
+
+train_config = {
+    "eta":                   0.25,
+    "delta":                 1e-16,
+    "t":                     0.1,
+    "num_particles":         1,
+    "minibatch_fraction":    0.15,
+    "min_epochs":            200,
+    "max_epochs":            500,
+    "convergence_criterion": "elbo_snr",
+    "window":                50,
+    "snr_threshold":         5,
+}
+
+# Stopping-rule settings for the convergence comparison
+CRITERIA = ["elbo_min", "elbo_snr", "grad_norm"]
+CRITERION_SETTINGS = {"window": 50, "snr_threshold": 0.1, "grad_norm_tol": 1e-3}
+```
+
+## Load and process data
+
+```{python}
+cond_dir = (f"n{rep_config['n']}p{rep_config['p_l']}"
+            f"_snr{rep_config['snr_x']}.{rep_config['snr_y']}"
+            f"_sparse{rep_config['sparsity']}")
+
+def rds_path(split):
+    return os.path.expanduser(f"{DATA_ROOT}/multi_view_shared/k.5/{split}/{cond_dir}/"
+                              f"sim_data_shared_rep{rep_config['rep']}.rds")
+
+sim_data      = load_rds(rds_path("train"))
+sim_data_test = load_rds(rds_path("test"))
+train_subset, test_subset, data_package = process_data(
+    sim_data, sim_data_test, training_split=False, training_size=0.8, seed=123,
+    model_type=MODEL_TYPE,
+)
+K_FIT = int(sim_data["K"]) + rep_config["k_delta"]
+model_config = {"k": K_FIT, "dense_model": False}
+n_train = len(train_subset)
+```
+
+```{python}
+def fit_and_evaluate(global_config, svd_init=False):
+    """Global training with global_config, local inference with train_config,
+    then evaluation. Returns a dict of the fitted model, timings and metrics."""
+    pyro.clear_param_store()
+    fm, train_handler, global_state = train_model(
+        model_config, global_config, train_subset,
+        model_type=MODEL_TYPE, write=False, device=DEVICE, svd_init=svd_init)
+    fm, test_handler, local_state = train_model_locally(
+        fm, train_config, test_subset, model_type=MODEL_TYPE, device=DEVICE)
+    eval_table, _, _, _ = evaluate_fitted_model(
+        rep_config, data_package, train_handler, test_handler,
+        global_state, local_state, N_POSTERIOR_SAMPLES, model_type=MODEL_TYPE)
+    return {
+        "model":        fm,
+        "epochs":       fm.total_epochs,
+        "time_s":       global_state["inference_time"] + global_state["svd_time"],
+        "loss_history": fm.loss_history,
+        "var_history":  fm.var_param_convergence_history,
+        "eval_table":   eval_table,
+    }
+
+def summary_row(res):
+    tbl = res["eval_table"]
+    return {
+        "epochs":               res["epochs"],
+        "time_s":               round(res["time_s"], 1),
+        "joint_rse":            tbl["joint_rse"].mean(),
+        "test_rse":             tbl["test_rse"].mean(),
+        "outcome_mse":          tbl["outcome_mse"].iloc[0],
+        "outcome_95p_coverage": tbl["outcome_95p_coverage"].iloc[0],
+    }
+```
+
+## Convergence criterion comparison
+
+```{python}
+cc_results = {
+    criterion: fit_and_evaluate({**train_config, **CRITERION_SETTINGS,
+                                 "convergence_criterion": criterion})
+    for criterion in CRITERIA
+}
+cc_summary = pd.DataFrame({c: summary_row(r) for c, r in cc_results.items()}).T
+cc_summary
+```
+
+```{python}
+palette = {"elbo_min": "steelblue", "elbo_snr": "darkorange", "grad_norm": "seagreen"}
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for criterion, res in cc_results.items():
+    hist = np.array(res["loss_history"]) / n_train
+    for ax in axes:
+        ax.plot(np.arange(1, len(hist) + 1), hist, label=criterion,
+                color=palette[criterion], alpha=0.85)
+axes[0].set_title("Neg-ELBO per datum — full history")
+axes[1].set_title("Neg-ELBO per datum — first 200 epochs")
+axes[1].set_xlim(0, 200)
+for ax in axes:
+    ax.set(xlabel="Epoch", ylabel="Neg-ELBO / n")
+    ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+cols = list(cc_summary.columns)
+fig, axes = plt.subplots(1, len(cols), figsize=(4 * len(cols), 4))
+for ax, col in zip(axes, cols):
+    ax.bar(cc_summary.index, cc_summary[col].astype(float),
+           color=[palette[c] for c in cc_summary.index])
+    ax.set_title(col)
+    ax.tick_params(axis="x", rotation=15)
+plt.suptitle("SupMultiviewShared — convergence criterion comparison", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 4))
+for criterion, res in cc_results.items():
+    hist = np.array(res["var_history"])
+    ax.plot(np.arange(1, len(hist) + 1), hist, label=criterion,
+            color=palette[criterion], alpha=0.85)
+ax.set(xlabel="Epoch", ylabel="Mean param-norm change",
+       title="Variational parameter convergence history")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Initialisation: default vs. SVD
+
+```{python}
+init_results = {
+    "default": fit_and_evaluate(train_config, svd_init=False),
+    "svd":     fit_and_evaluate(train_config, svd_init=True),
+}
+pd.DataFrame({name: summary_row(r) for name, r in init_results.items()}).T
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 3))
+for name, res in init_results.items():
+    ax.plot([l / n_train for l in res["loss_history"]], label=name, alpha=0.8)
+ax.set(xlabel="Epoch", ylabel="Neg-ELBO per datum",
+       title=f"SVD vs default init  (N={rep_config['n']}, P={rep_config['p_l']}, K={K_FIT})")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
