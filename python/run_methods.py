@@ -28,13 +28,13 @@ def load_data(file_name_base,
               files_for_condition,
               test_files_for_condition):
     """Read data
-    
-    TODO: read the data in addition to pulling out relevant reps. currently input 
+
+    TODO: read the data in addition to pulling out relevant reps. currently input
     is file name base, but should be the directory plus data config
     """
-    
+
     # DATA LOADING HERE
-    
+
     # Extract desired replicate
     print(file_name_base.format(rep))
     sim_data = files_for_condition.get(file_name_base.format(rep))
@@ -42,25 +42,25 @@ def load_data(file_name_base,
         sim_data_test = test_files_for_condition.get(file_name_base.format(rep))
     else:
         sim_data_test = None
-    
+
     # L = int(sim_data.get("L"))
-    
+
     # X_l_list = sim_data.get("X_l")
     # y = sim_data.get("y")
-    
+
     # X_l_list_test = sim_data_test.get("X_l")
     # y_test = sim_data_test.get("y")
-    
+
     # k = int(sim_data.get("K"))
     # k_l_list = sim_data.get("K_l").int().tolist() #[int(k_l + k_delta) for k_l in sim_data.get("K_l").int().tolist()]
-    
+
     # n = X_l_list[0].shape[0]
     # n_test = X_l_list_test[0].shape[0]
-    
+
     # p_l = int(sim_data.get("p_l")[0])
-    
+
     return sim_data, sim_data_test
-    
+
     # return {
     #     'L': L,
     #     'X_l_list': X_l_list,
@@ -74,364 +74,7 @@ def load_data(file_name_base,
     #     'p_l': p_l,
     #     'sim_data': X_l_sd_list
     # }
-    
-def process_data(sim_data,
-                 sim_data_test,
-                training_split,
-                training_size,
-                seed = 123):
-    """After loading input data, perform train/test split if necessary, and 
-    create data loaders"""
 
-    L = int(sim_data.get("L"))
-    
-    X_l_list = sim_data.get("X_l")
-    y = sim_data.get("y")
-    
-    k = int(sim_data.get("K"))
-    k_l_list = sim_data.get("K_l").int().tolist() #[int(k_l + k_delta) for k_l in sim_data.get("K_l").int().tolist()]
-    
-    n = X_l_list[0].shape[0]
-    
-    p_l = int(sim_data.get("p_l")[0])
-
-    # Perform train/test split if necessary
-    if training_split:
-        train_idx, test_idx = train_test_split(
-            torch.arange(X_l_list[0].shape[0]),
-            train_size = training_size,
-            random_state = seed,
-            shuffle = True
-        )
-        train_X_l_list = [X[train_idx, :] for X in X_l_list]
-        test_X_l_list = [X[test_idx, :] for X in X_l_list]
-        
-        train_y = y[train_idx]
-        test_y = y[test_idx]
-    else:
-        X_l_list_test = sim_data_test.get("X_l")
-        y_test = sim_data_test.get("y")
-        n_test = X_l_list_test[0].shape[0]
-    
-        train_idx = torch.arange(n)
-        test_idx = torch.arange(n_test)
-        
-        train_X_l_list = X_l_list
-        test_X_l_list = X_l_list_test
-        
-        train_y = y
-        test_y = y_test
-
-    # Clean: remove 0 variance columns and standardize. Using Training data            
-    X_l_list_column_filters = [zero_variance_col_filter(X) for X in train_X_l_list]
-    
-    train_X_l_list = [X[:, col_filter] for X, col_filter in zip(train_X_l_list, X_l_list_column_filters)]
-    test_X_l_list = [X[:, col_filter] for X, col_filter in zip(test_X_l_list, X_l_list_column_filters)]
-
-    clean_train_X_dict_list = [normalize_tensor_by_col(X) for X in train_X_l_list]
-    X_l_mean_list = [clean["means"] for clean in clean_train_X_dict_list]
-    X_l_sd_list = [clean["sds"] for clean in clean_train_X_dict_list]
-    
-    clean_test_X_dict_list = [normalize_tensor_by_col(X, means, stds) 
-                            for X, means, stds in 
-                            zip(test_X_l_list, X_l_mean_list, X_l_sd_list)]
-    
-    train_X_l_list_clean = [clean["data_clean"] for clean in clean_train_X_dict_list]
-    test_X_l_list_clean = [clean["data_clean"] for clean in clean_test_X_dict_list]
-
-    y_mean = torch.mean(train_y)
-    y_std = torch.std(train_y)
-    
-    train_y_clean = (train_y - y_mean) / y_std
-    test_y_clean = (test_y - y_mean) / y_std
-    
-    
-    # Package data into dataset
-    train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]), 
-                                *train_X_l_list_clean, 
-                                train_y_clean)
-    test_subset = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]), 
-                                *test_X_l_list_clean, 
-                                test_y_clean)
-    
-    # Extract simulated structures
-    SIM_decomp = extract_sim_decomp(sim_data)
-    train_SIM_decomp = {k: v for k, v in SIM_decomp.items()}
-    train_SIM_decomp['SIM_Z'] = train_SIM_decomp['SIM_Z'][train_idx, :]
-    train_SIM_decomp['SIM_Phi_l_list'] = [Phi[train_idx, :] for Phi in train_SIM_decomp['SIM_Phi_l_list']]
-    
-    # contains items needed for later steps ==> evaluation 
-    input_data_package = {
-        'k': k,
-        'k_l_list': k_l_list,
-        'L': L,
-        'train_X_l_list_clean': train_X_l_list_clean,
-        'test_X_l_list_clean': test_X_l_list_clean,
-        'train_y_clean': train_y_clean,
-        'test_y_clean': test_y_clean,
-        'X_l_list_column_filters': X_l_list_column_filters,
-        'X_l_mean_list': X_l_mean_list,
-        'X_l_sd_list': X_l_sd_list,
-        'SIM_decomp': SIM_decomp,
-        'train_SIM_decomp': train_SIM_decomp
-    }
-    
-    return train_subset, test_subset, input_data_package
-
-
-def train_model(model_config,
-                train_config,
-                train_subset,
-                model_out_filename,
-                verbose = False,
-                write = True,
-                # mode = "global",
-                out_dir = "./model_output/"):
-    """Train the supervised multiview decomposition model
-    """
-    
-    k = model_config['k']
-    k_l_list = model_config['k_l_list']
-    include_view_factors = model_config['include_view_factors']
-    dense_model = model_config['dense_model']
-    
-    initial_lr = train_config['initial_lr']
-    betas = train_config['betas']
-    num_particles = train_config['num_particles']
-    lr_step_size = train_config['lr_step_size']
-    lr_decay_factor = train_config['lr_decay_factor']
-    mini_size = train_config['minibatch_size']
-    min_epochs = train_config['min_epochs']
-    max_epochs = train_config['max_epochs']
-    
-    
-    ###############################################
-    factor_model = SupMultiviewDecomp(
-        k,
-        k_l_list,
-        include_view_factors = include_view_factors,
-        dense = dense_model
-    )
-
-    # OPT = Adam({"lr": initial_lr})
-    opt_args = {"lr": initial_lr, "betas": betas}
-    # OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-    LOSS = Trace_ELBO(num_particles = num_particles)
-    scheduler_args = {
-        'optimizer': torch.optim.Adam, 
-        'optim_args': opt_args,
-        'step_size': lr_step_size,
-        'gamma': lr_decay_factor #,
-        # 'verbose': True
-    }
-    scheduler = pyro.optim.StepLR(scheduler_args)
-    
-    train_handler = ModelHandler(
-        "train", 
-        factor_model,
-        # opt = OPT, # Opt is not needed if opt_scheduler is provided
-        loss = LOSS,
-        orthogonal_projection = True,
-        opt_scheduler = scheduler
-        )
-
-    try:            
-        t0 = time.time()
-        svi = train_handler.do_inference(
-            train_dataset = train_subset,
-            min_epochs = min_epochs,
-            epochs = max_epochs,
-            minibatch_flag = True,
-            minibatch_size = mini_size,
-            variational_diff_func = np.mean,
-            verbose = verbose
-            )
-        t1 = time.time()
-        run_minibatch = t1 - t0
-        
-        #################
-        # Inference finished, save and evaluate
-        # Save model parameters
-
-        model_state_dict = {
-            "inference_time": run_minibatch,
-            "epochs": factor_model.total_epochs,
-            # "model_param_store": pyro.get_param_store(),
-            "model_state_dict": pyro.get_param_store().get_state(),
-            "optimizer_state": train_handler.opt.get_state(),
-            "loss_history": factor_model.loss_history,
-            "param_convergence_history": factor_model.var_param_convergence_history,
-            "config": train_config              
-        }
-        
-        if write:
-            print("Exporting:")
-            print(model_out_filename)
-            torch.save(model_state_dict, model_out_filename + ".pth")
-            pyro.get_param_store().save(model_out_filename + "_paramstore.pth") #os.path.join(model_out_path, model_out_filename + "_paramstore.pth"))
-        
-    except Exception as e:
-        print(e)
-    
-    return factor_model, train_handler, model_state_dict
-
-
-def train_model_locally(factor_model,
-                        train_config,
-                        data_subset,
-                        model_out_filename,
-                        out_dir = "./model_output/"):
-    """After the model has been globally trained, perform local training on new observations
-    """
-    initial_lr = train_config['initial_lr']
-    betas = train_config['betas']
-    num_particles = train_config['num_particles']
-    lr_step_size = train_config['lr_step_size']
-    lr_decay_factor = train_config['lr_decay_factor']
-    mini_size = train_config['minibatch_size']
-    min_epochs = train_config['min_epochs']
-    max_epochs = train_config['max_epochs']
-    
-     #################
-    # Inference for predictive model
-    print('local training')
-    # LOCAL_OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-    # LOCAL_LOSS = Trace_ELBO(num_particles = 1)
-    opt_args = {"lr": initial_lr, "betas": betas}
-    # OPT = ClippedAdam({"lr": initial_lr, "lrd": lrd})
-    LOCAL_LOSS = Trace_ELBO(num_particles = num_particles)
-    scheduler_args = {
-        'optimizer': torch.optim.Adam, 
-        'optim_args': opt_args,
-        'step_size': lr_step_size,
-        'gamma': lr_decay_factor,
-        'verbose': True
-    }
-    scheduler = pyro.optim.StepLR(scheduler_args)
-    
-    test_handler = ModelHandler("predict",
-                                factor_model,
-                                loss = LOCAL_LOSS,
-                                orthogonal_projection = True,
-                                opt_scheduler = scheduler)  
-    
-    t0 = time.time()
-    svi = test_handler.do_inference(
-        data_subset,
-        min_epochs = min_epochs,
-        epochs = max_epochs,
-        minibatch_flag = True,
-        minibatch_size = mini_size,
-        verbose = False
-        )
-    t1 = time.time()
-    test_run_minibatch = t1 - t0
-    
-    model_state_dict = {
-        "inference_time": test_run_minibatch,
-        "epochs": factor_model.local_epochs,
-        # "model_param_store": pyro.get_param_store(),
-        "model_state_dict": pyro.get_param_store().get_state(),
-        "optimizer_state": test_handler.opt.get_state(),
-        "loss_history": factor_model.local_loss_history,
-        "param_convergence_history": factor_model.local_var_param_convergence_history,
-        "config": train_config                
-    }
-    
-    torch.save(model_state_dict, model_out_filename + "_local.pth")
-
-    pyro.get_param_store().save(model_out_filename + "_local_paramstore.pth")
-    
-    return factor_model, test_handler, model_state_dict
-            
-def evaluate_fitted_model(rep_config,
-                          data_package,
-                          train_handler,
-                          test_handler,
-                          global_train_state,
-                          local_train_state,
-                          N_POSTERIOR_SAMPLES,
-                          metric_out_filename):
-    """After training a model and performing local retraining, evaluate metrics.
-    
-        rep_config (dict): information on simulation scenario
-        data_package (dict): raw data 
-    
-    """
-
-
-
-    train_X_l_list_clean = data_package['train_X_l_list_clean']
-    test_X_l_list_clean = data_package['test_X_l_list_clean']
-    test_y_clean = data_package['test_y_clean']
-    X_l_list_column_filters = data_package['X_l_list_column_filters']
-    X_l_mean_list = data_package['X_l_mean_list']
-    X_l_sd_list = data_package['X_l_sd_list']
-    train_SIM_decomp = data_package['train_SIM_decomp']
-    L = data_package['L']
-    
-    n = rep_config['n']
-    p_l = rep_config['p_l']
-    snr_x = rep_config['snr_x']
-    snr_y = rep_config['snr_y']
-    sparsity = rep_config['sparsity']
-    k_delta = rep_config['k_delta']
-    rep = rep_config['rep']
-    
-    run_minibatch = global_train_state['inference_time']
-    test_run_minibatch = local_train_state['inference_time']
-    
-    
-
-    #################
-    # Sample from posterior
-    print('Sampling from posterior')
-    sites = [Sites.joint_structure_l.format(l = l) for l in range(L)] \
-        + [Sites.view_structure_l.format(l = l) for l in range(L)]
-    outcome_sites = [Sites.y_pred]
-    post_samples = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
-    post_samples_y = test_handler.predict(test_X_l_list_clean, N_POSTERIOR_SAMPLES, outcome_sites)
-
-    eval_structures = calc_all_structures_with_rescaling(L,
-                                                        X_l_list_column_filters,
-                                                        X_l_mean_list,
-                                                        X_l_sd_list,
-                                                        post_samples,
-                                                        post_samples_y,
-                                                        train_SIM_decomp,
-                                                        test_y_clean.squeeze())
-        
-
-    #################
-    # Evaluate
-    # Compare estimated structures (targeting mean 0 var 1 data) with 
-    #   RESCALED simulated structures
-    
-    eval_metric_table = eval_performance(**eval_structures)
-    eval_metric_table = eval_metric_table.\
-        assign(n = n,
-            p = p_l,
-            snr_x = snr_x,
-            snr_y = snr_y,
-            rep = rep,
-            sparsity = sparsity,
-            k_delta = k_delta,
-            runtime = run_minibatch,
-            predict_runtime = test_run_minibatch
-            )
-
-    # Save evaluation
-
-    # print("Exporting metrics:")
-    # print(metric_out_filename)
-
-    # eval_metric_table.to_csv(metric_out_filename + ".csv")
-    return eval_metric_table
-
-
-##############################################################################
-# Single-view helpers (MatrixDecomp)
-##############################################################################
 
 def load_rds(path):
     """Load a single RDS file via rpy2 and return a dict of tensors."""
@@ -445,243 +88,593 @@ def load_rds(path):
     return r_to_torch(r_obj)
 
 
-def process_data_single_view(sim_data, training_size, seed=123,
-                              training_split=True, sim_data_test=None):
-    """Single-view analogue of process_data.
+##############################################################################
+# Pipeline helpers — one set for all three models
+#
+# Every helper takes model_type, one of:
+#   "single_view" : MatrixDecomp         (one view, supervised)
+#   "shared"      : SupMultiviewShared   (shared factors only)
+#   "viper"       : SupMultiviewDecomp   (shared + view-specific factors)
+##############################################################################
+
+MODEL_TYPES = ("single_view", "shared", "viper")
+
+# Per-model settings used when the caller does not override them. These
+# reproduce what each model's original helpers did.
+_MODEL_DEFAULTS = {
+    "single_view": {"opt": "adagrad",   "orthogonal_projection": False},
+    "shared":      {"opt": "adagrad",   "orthogonal_projection": True},
+    "viper":       {"opt": "scheduled", "orthogonal_projection": True},
+}
+
+
+def _check_model_type(model_type):
+    if model_type not in MODEL_TYPES:
+        raise ValueError(f"model_type must be one of {MODEL_TYPES}, got {model_type!r}")
+
+
+def process_data(sim_data, sim_data_test, training_split, training_size, seed=123,
+                 model_type="viper"):
+    """Train/test split, drop zero-variance columns, and standardise each view
+    and the outcome using training-set statistics.
 
     Parameters
     ----------
-    sim_data : dict of tensors
-        Output of load_rds; expected keys: X_l (list of 1), y, Z, Lambda_l, K.
-    training_size : float
-        Fraction of observations used for training (only used when training_split=True).
-    seed : int
-    training_split : bool
-        If True, perform a random train/test split on sim_data.
-        If False, use sim_data as training and sim_data_test as test.
+    sim_data : dict of tensors with keys X_l (list of views), y, K, and the
+        simulated structures (Z, Lambda_l, ...). Structures may be None for
+        real data.
     sim_data_test : dict of tensors or None
-        Separate test dataset (required when training_split=False).
+        Separate test set; required when training_split=False.
+    training_split : bool
+        True splits sim_data at random; False uses sim_data_test as the test set.
 
     Returns
     -------
-    train_subset, test_subset : TensorDataset
-    data_package : dict
+    train_subset, test_subset : TensorDataset(idx, X_1, ..., X_L, y)
+    data_package : dict used by evaluate_fitted_model
     """
-    X = sim_data["X_l"][0]
+    _check_model_type(model_type)
+
+    X_l_list = sim_data["X_l"]
     y = sim_data["y"]
-    k = int(sim_data["K"].item())
-    n = X.shape[0]
+    k = int(sim_data["K"])
+    L = len(X_l_list)
+    n = X_l_list[0].shape[0]
 
     if training_split:
         train_idx, test_idx = train_test_split(
             torch.arange(n), train_size=training_size, random_state=seed, shuffle=True
         )
-        X_train_raw = X[train_idx]
-        X_test_raw  = X[test_idx]
-        y_train_raw = y[train_idx]
-        y_test_raw  = y[test_idx]
+        train_X_l_list = [X[train_idx] for X in X_l_list]
+        test_X_l_list  = [X[test_idx]  for X in X_l_list]
+        train_y = y[train_idx]
+        test_y  = y[test_idx]
     else:
         assert sim_data_test is not None, "sim_data_test required when training_split=False"
-        X_test_full = sim_data_test["X_l"][0]
-        y_test_full = sim_data_test["y"]
-        train_idx   = torch.arange(n)
-        test_idx    = torch.arange(X_test_full.shape[0])
-        X_train_raw = X
-        X_test_raw  = X_test_full
-        y_train_raw = y
-        y_test_raw  = y_test_full
+        test_X_l_list = sim_data_test["X_l"]
+        test_y        = sim_data_test["y"]
+        train_idx = torch.arange(n)
+        test_idx  = torch.arange(test_X_l_list[0].shape[0])
+        train_X_l_list = X_l_list
+        train_y = y
 
-    col_filter   = zero_variance_col_filter(X_train_raw)
-    X_train_filt = X_train_raw[:, col_filter]
-    X_test_filt  = X_test_raw[:, col_filter]
+    # Clean: remove zero-variance columns and standardise, using training data
+    X_l_list_column_filters = [zero_variance_col_filter(X) for X in train_X_l_list]
+    train_X_l_list = [X[:, f] for X, f in zip(train_X_l_list, X_l_list_column_filters)]
+    test_X_l_list  = [X[:, f] for X, f in zip(test_X_l_list,  X_l_list_column_filters)]
 
-    train_norm = normalize_tensor_by_col(X_train_filt)
-    X_train    = train_norm["data_clean"]
-    X_mean     = train_norm["means"]
-    X_sd       = train_norm["sds"]
+    clean_train = [normalize_tensor_by_col(X) for X in train_X_l_list]
+    X_l_mean_list        = [d["means"]      for d in clean_train]
+    X_l_sd_list          = [d["sds"]        for d in clean_train]
+    train_X_l_list_clean = [d["data_clean"] for d in clean_train]
 
-    test_norm = normalize_tensor_by_col(X_test_filt, X_mean, X_sd)
-    X_test    = test_norm["data_clean"]
+    clean_test = [normalize_tensor_by_col(X, m, s)
+                  for X, m, s in zip(test_X_l_list, X_l_mean_list, X_l_sd_list)]
+    test_X_l_list_clean = [d["data_clean"] for d in clean_test]
 
-    y_mean  = torch.mean(y_train_raw)
-    y_std   = torch.std(y_train_raw)
-    y_train = (y_train_raw - y_mean) / y_std
-    y_test  = (y_test_raw  - y_mean) / y_std
+    y_mean = torch.mean(train_y)
+    y_std  = torch.std(train_y)
+    train_y_clean = (train_y - y_mean) / y_std
+    test_y_clean  = (test_y  - y_mean) / y_std
 
-    train_subset = TensorDataset(torch.arange(len(train_idx)), X_train, y_train.squeeze())
-    test_subset  = TensorDataset(torch.arange(X_test.shape[0]),  X_test,  y_test.squeeze())
+    # MatrixDecomp expects a 1-D outcome; the multiview models take y as loaded.
+    train_y_data = train_y_clean.squeeze() if model_type == "single_view" else train_y_clean
+    test_y_data  = test_y_clean.squeeze()  if model_type == "single_view" else test_y_clean
+    train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]),
+                                 *train_X_l_list_clean, train_y_data)
+    test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
+                                 *test_X_l_list_clean, test_y_data)
+
+    # Simulated structures, with score rows restricted to the training set
+    if model_type == "single_view":
+        SIM_decomp = extract_sim_decomp_single_view(sim_data)
+        train_SIM_decomp = SIM_decomp     # rows are selected in evaluation via train_idx
+    elif model_type == "shared":
+        SIM_decomp = extract_sim_decomp_shared(sim_data)
+        train_SIM_decomp = {**SIM_decomp, "SIM_Z": SIM_decomp["SIM_Z"][train_idx]}
+    else:
+        SIM_decomp = extract_sim_decomp(sim_data)
+        train_SIM_decomp = {**SIM_decomp,
+                            "SIM_Z": SIM_decomp["SIM_Z"][train_idx],
+                            "SIM_Phi_l_list": [Phi[train_idx] for Phi in SIM_decomp["SIM_Phi_l_list"]]}
 
     data_package = {
-        "k":          k,
-        "train_idx":  train_idx,
-        "X_train":    X_train,
-        "X_test":     X_test,
-        "y_train":    y_train.squeeze(),
-        "y_test":     y_test.squeeze(),
-        "col_filter": col_filter,
-        "X_mean":     X_mean,
-        "X_sd":       X_sd,
-        "sim_decomp": extract_sim_decomp_single_view(sim_data),
+        "model_type":              model_type,
+        "k":                       k,
+        "L":                       L,
+        "train_idx":               train_idx,
+        "test_idx":                test_idx,
+        "train_X_l_list_clean":    train_X_l_list_clean,
+        "test_X_l_list_clean":     test_X_l_list_clean,
+        "train_y_clean":           train_y_clean,
+        "test_y_clean":            test_y_clean,
+        "X_l_list_column_filters": X_l_list_column_filters,
+        "X_l_mean_list":           X_l_mean_list,
+        "X_l_sd_list":             X_l_sd_list,
+        "SIM_decomp":              SIM_decomp,
+        "train_SIM_decomp":        train_SIM_decomp,
     }
+    if model_type == "viper":
+        data_package["k_l_list"] = sim_data["K_l"].int().tolist()
 
     return train_subset, test_subset, data_package
 
 
-def train_model_single_view(model_config, train_config, train_subset, 
-                            opt = "adagrad",
-                            scheduled = False,
-                            verbose=False):
-    """Single-view analogue of train_model. Trains a MatrixDecomp model globally.
+def compute_svd_init(X_l_list, k):
+    """Top-k SVD of horizontally stacked views for guide initialisation.
+
+    Returns (Z_init, Lambda_l_init_list) scaled so that Z columns have
+    unit variance and Lambda entries are O(1), consistent with the model priors.
+
+    The factorisation used is X_concat ≈ (sqrt(N)*U_k) @ (s_k/sqrt(N)*V_k)^T,
+    which keeps Z ~ N(0,I) and Lambda entries ~ O(sqrt(P/p_l)).
 
     Parameters
     ----------
-    model_config : dict
-        Keys: k (int), dense (bool).
-    train_config : dict
-        Keys: initial_lr, betas, num_particles, lr_step_size, lr_decay_factor,
-        minibatch_size, min_epochs, max_epochs.
+    X_l_list : list of (N, p_l) float tensors
+        Normalised training views (a list of one for single-view data).
+    k : int
+        Number of factors to extract.
 
     Returns
     -------
-    factor_model, train_handler, runtime (seconds)
+    Z_init : (N, k) tensor
+    Lambda_l_init_list : list of (p_l, k) tensors
     """
-    from matrix_decomp import MatrixDecomp
+    X_concat = torch.cat(X_l_list, dim=1).float()
+    n = X_concat.shape[0]
+    U, s, Vt = torch.linalg.svd(X_concat, full_matrices=False)
 
-    factor_model = MatrixDecomp(
-        model_config["k"], supervised=True, dense=model_config["dense"]
-    )
+    Z_init = U[:, :k] * (n ** 0.5)          # (N, k), each column has var ≈ 1
 
-    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-    if opt == "adagrad":
-        OPT = AdagradRMSProp({
-            "eta": train_config['eta'], 
-            "delta": train_config['delta'], 
-            "t": train_config['t']})
-        train_handler = ModelHandler(
-            "train", factor_model,
-            opt = OPT,
-            loss=LOSS,
-            opt_scheduler=None,
-            orthogonal_projection=False,
-    )
-    elif scheduled:
-        scheduler = pyro.optim.StepLR({
-            "optimizer": torch.optim.Adam,
-            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-            "step_size": train_config["lr_step_size"],
-            "gamma":     train_config["lr_decay_factor"],
-        })
-        train_handler = ModelHandler(
-            "train", factor_model,
-            loss=LOSS,
-            opt_scheduler=scheduler,
-            orthogonal_projection=False,
+    Lambda_l_init_list = []
+    col = 0
+    for X_l in X_l_list:
+        p_l = X_l.shape[1]
+        # (p_l, k): rows of Vt scaled by singular values, normalised by sqrt(N)
+        Lambda_l_init_list.append(
+            (Vt[:k, col:col + p_l].T * s[:k].unsqueeze(0)) / (n ** 0.5)
         )
+        col += p_l
+
+    return Z_init, Lambda_l_init_list
+
+
+def _build_model(model_type, model_config, device="cpu", Z_init=None, Lambda_l_init_list=None):
+    """Construct the factor model for model_type from model_config.
+
+    model_config keys: k, dense_model (or "dense"), outcome_weight (optional),
+    and for "viper" also k_l_list and include_view_factors.
+    """
+    k = model_config["k"]
+    dense = model_config.get("dense_model", model_config.get("dense"))
+    outcome_weight = model_config.get("outcome_weight", 1.0)
+
+    if model_type == "single_view":
+        from matrix_decomp import MatrixDecomp
+        return MatrixDecomp(
+            k, supervised=True, dense=dense, outcome_weight=outcome_weight, device=device,
+            scores_init=Z_init,
+            loadings_init=Lambda_l_init_list[0] if Lambda_l_init_list is not None else None,
+        )
+    if model_type == "shared":
+        from multiview_shared import SupMultiviewShared
+        return SupMultiviewShared(
+            k, dense=dense, outcome_weight=outcome_weight, device=device,
+            joint_scores_init=Z_init, joint_loadings_list_init=Lambda_l_init_list,
+        )
+    return SupMultiviewDecomp(
+        k, model_config["k_l_list"],
+        include_view_factors=model_config["include_view_factors"],
+        dense=dense, outcome_weight=outcome_weight, device=device,
+        joint_scores_init=Z_init, joint_loadings_list_init=Lambda_l_init_list,
+    )
+
+
+def _build_handler(mode, factor_model, train_config, model_type, opt=None, device="cpu"):
+    """ModelHandler for global training (mode="train") or local inference
+    (mode="predict").
+
+    opt : "adagrad" uses AdagradRMSProp (requires eta/delta/t in train_config);
+        "scheduled" uses StepLR with Adam (requires initial_lr/betas/
+        lr_step_size/lr_decay_factor). None uses the model's default.
+    """
+    defaults = _MODEL_DEFAULTS[model_type]
+    opt = opt or defaults["opt"]
+    loss = Trace_ELBO(num_particles=train_config["num_particles"])
+
+    if opt == "adagrad":
+        optimizer = AdagradRMSProp({
+            "eta":   train_config["eta"],
+            "delta": train_config["delta"],
+            "t":     train_config["t"],
+        })
+        return ModelHandler(mode, factor_model, opt=optimizer, loss=loss, opt_scheduler=None,
+                            orthogonal_projection=defaults["orthogonal_projection"],
+                            device=device)
+
+    scheduler = pyro.optim.StepLR({
+        "optimizer":  torch.optim.Adam,
+        "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
+        "step_size":  train_config["lr_step_size"],
+        "gamma":      train_config["lr_decay_factor"],
+    })
+    return ModelHandler(mode, factor_model, loss=loss, opt_scheduler=scheduler,
+                        orthogonal_projection=defaults["orthogonal_projection"],
+                        device=device)
+
+
+def _minibatch_size(train_config, n):
+    """Absolute minibatch size from minibatch_fraction (preferred) or
+    minibatch_size, halved until it fits in n observations."""
+    if "minibatch_fraction" in train_config:
+        mb = max(1, int(n * train_config["minibatch_fraction"]))
+    else:
+        mb = int(train_config["minibatch_size"])
+    while mb > n:
+        mb //= 2
+    return mb
+
+
+def _convergence_kwargs(train_config):
+    """Stopping-rule settings present in train_config; anything missing falls
+    back to the ModelHandler.do_inference defaults."""
+    keys = ("convergence_criterion", "window", "snr_threshold", "grad_norm_tol")
+    return {key: train_config[key] for key in keys if key in train_config}
+
+
+def train_model(model_config, train_config, train_subset, model_out_filename=None,
+                model_type="viper", opt=None, verbose=False, write=True, device="cpu",
+                svd_init=False, optuna_trial=None, optuna_step_offset=0):
+    """Train a model globally on the training set.
+
+    Parameters
+    ----------
+    model_out_filename : str or None
+        Path stem for the saved state; nothing is written when None or write=False.
+    opt : "adagrad", "scheduled" or None (the model's default: "scheduled"
+        for viper, "adagrad" otherwise).
+    svd_init : bool
+        If True, initialise the score and shared-loading locations from the
+        top-k SVD of the stacked training views before starting SVI.
+
+    Returns
+    -------
+    factor_model, train_handler, model_state_dict
+    """
+    _check_model_type(model_type)
+    k = model_config["k"]
+
+    Z_init, Lambda_l_init_list = None, None
+    svd_time = 0
+    if svd_init:
+        svd_t0 = time.time()
+        # train_subset is TensorDataset(idx, X_1, ..., X_L, y); views are [1:-1]
+        X_l_list = [t.to(device) for t in train_subset.tensors[1:-1]]
+        Z_init, Lambda_l_init_list = compute_svd_init(X_l_list, k)
+        svd_time = time.time() - svd_t0
 
     t0 = time.time()
+    factor_model = _build_model(model_type, model_config, device, Z_init, Lambda_l_init_list)
+    train_handler = _build_handler("train", factor_model, train_config, model_type, opt, device)
+
     train_handler.do_inference(
         train_dataset=train_subset,
         min_epochs=train_config["min_epochs"],
         epochs=train_config["max_epochs"],
         minibatch_flag=True,
-        minibatch_size=train_config["minibatch_size"],
+        minibatch_size=_minibatch_size(train_config, len(train_subset)),
         variational_diff_func=np.mean,
         verbose=verbose,
+        optuna_trial=optuna_trial,
+        optuna_step_offset=optuna_step_offset,
+        **_convergence_kwargs(train_config),
+    )
+    run_time = time.time() - t0
+
+    model_state_dict = {
+        "svd_time":                  svd_time,
+        "inference_time":            run_time,
+        "epochs":                    factor_model.total_epochs,
+        "model_state_dict":          pyro.get_param_store().get_state(),
+        "optimizer_state":           train_handler.opt.get_state(),
+        "loss_history":              factor_model.loss_history,
+        "param_convergence_history": factor_model.var_param_convergence_history,
+        "config":                    train_config,
+    }
+    if write and model_out_filename:
+        torch.save(model_state_dict, model_out_filename + ".pth")
+        pyro.get_param_store().save(model_out_filename + "_paramstore.pth")
+
+    return factor_model, train_handler, model_state_dict
+
+
+def train_model_locally(factor_model, train_config, data_subset, model_out_filename=None,
+                        model_type="viper", opt=None, verbose=False, device="cpu"):
+    """Local inference on new observations: infers their scores with the
+    global variational parameters frozen.
+
+    Parameters
+    ----------
+    model_out_filename : str or None
+        If given, the local state is saved to <stem>_local.pth and
+        <stem>_local_paramstore.pth.
+
+    Returns
+    -------
+    factor_model, test_handler, model_state_dict
+    """
+    _check_model_type(model_type)
+    test_handler = _build_handler("predict", factor_model, train_config, model_type, opt, device)
+
+    t0 = time.time()
+    test_handler.do_inference(
+        train_dataset=data_subset,
+        min_epochs=train_config["min_epochs"],
+        epochs=train_config["max_epochs"],
+        minibatch_flag=True,
+        minibatch_size=_minibatch_size(train_config, len(data_subset)),
+        variational_diff_func=np.mean,
+        verbose=verbose,
+        **_convergence_kwargs(train_config),
     )
     runtime = time.time() - t0
 
-    return factor_model, train_handler, runtime
+    model_state_dict = {
+        "inference_time":            runtime,
+        "epochs":                    factor_model.local_epochs,
+        "model_state_dict":          pyro.get_param_store().get_state(),
+        "optimizer_state":           test_handler.opt.get_state(),
+        "loss_history":              factor_model.local_loss_history,
+        "param_convergence_history": factor_model.local_var_param_convergence_history,
+        "config":                    train_config,
+    }
+    if model_out_filename:
+        torch.save(model_state_dict, model_out_filename + "_local.pth")
+        pyro.get_param_store().save(model_out_filename + "_local_paramstore.pth")
+
+    return factor_model, test_handler, model_state_dict
+
+
+def evaluate_fitted_model(rep_config, data_package, train_handler, test_handler,
+                          global_train_state, local_train_state,
+                          N_POSTERIOR_SAMPLES, metric_out_filename=None,
+                          model_type="viper"):
+    """Draw posterior samples and compute evaluation metrics after global
+    training and local inference.
+
+    Parameters
+    ----------
+    rep_config : dict or None
+        Simulation condition (n, p_l, snr_x, snr_y, rep, sparsity, k_delta),
+        added as columns to the metric table. None adds no condition columns.
+    metric_out_filename : unused; kept for existing call sites.
+
+    Returns
+    -------
+    eval_metric_table : DataFrame of structure RSE, coverage, outcome MSE, ...
+    cov_metric_table : DataFrame of covariance error per view pair (shared
+        model only; None otherwise)
+    post_samples : posterior samples on the training set (Z, beta, y, Lambda_l, ...)
+    post_samples_test : posterior samples on the test set (Z_pred, y_pred)
+    """
+    _check_model_type(model_type)
+    L                       = data_package["L"]
+    train_X_l_list_clean    = data_package["train_X_l_list_clean"]
+    test_X_l_list_clean     = data_package["test_X_l_list_clean"]
+    test_y_clean            = data_package["test_y_clean"].squeeze()
+    X_l_list_column_filters = data_package["X_l_list_column_filters"]
+    X_l_mean_list           = data_package["X_l_mean_list"]
+    X_l_sd_list             = data_package["X_l_sd_list"]
+
+    # Posterior samples on the training set (global model) and test set (local model)
+    sites = [Sites.Z, Sites.y, Sites.beta] + [Sites.Lambda_l.format(l=l) for l in range(L)]
+    if model_type == "single_view":
+        sites += ["structure"]
+    elif model_type == "viper":
+        sites += ([Sites.joint_structure_l.format(l=l) for l in range(L)]
+                  + [Sites.view_structure_l.format(l=l) for l in range(L)])
+    test_sites = [Sites.y_pred, Sites.Z_pred]
+
+    post_samples      = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES, sites)
+    post_samples_test = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES, test_sites)
+    # Sim data from R (via rpy2) is always on CPU; move posterior samples to CPU so all
+    # downstream comparisons (eval_rse, numpy conversions, etc.) see consistent devices.
+    post_samples      = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                         for k, v in post_samples.items()}
+    post_samples_test = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                         for k, v in post_samples_test.items()}
+
+    # Compare estimated structures (targeting mean 0 var 1 data) with
+    # RESCALED simulated structures
+    cov_metric_table = None
+    if model_type == "single_view":
+        eval_structures = calc_all_structures_with_rescaling_single_view(
+            X_l_list_column_filters[0], X_l_mean_list[0], X_l_sd_list[0],
+            post_samples, post_samples_test,
+            data_package["SIM_decomp"], data_package["train_idx"], test_y_clean,
+        )
+        eval_metric_table = eval_performance_single_view(**eval_structures)
+    elif model_type == "shared":
+        eval_structures = calc_all_structures_with_rescaling_shared(
+            L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,
+            post_samples, post_samples_test, data_package["train_SIM_decomp"], test_y_clean,
+            post_loading_samples=post_samples,
+        )
+        eval_metric_table = eval_performance_shared(
+            **{k: v for k, v in eval_structures.items() if k not in ("est_cov", "sim_cov")})
+        if "est_cov" in eval_structures:
+            cov_metric_table = eval_cov_shared(
+                eval_structures["est_cov"], eval_structures["sim_cov"], L)
+    else:
+        eval_structures = calc_all_structures_with_rescaling(
+            L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,
+            post_samples, post_samples_test, data_package["train_SIM_decomp"], test_y_clean,
+        )
+        eval_metric_table = eval_performance(**eval_structures)
+
+    # Per-view RSE of test data reconstruction (Z_test @ Lambda_l^T vs X_l_test).
+    # VIPER's test reconstruction also needs the view-specific scores, so skip it there.
+    if model_type != "viper":
+        mean_Z_pred = post_samples_test[Sites.Z_pred].mean(dim=0).squeeze()
+        eval_metric_table = eval_metric_table.assign(test_rse=[
+            eval_rse(
+                mean_Z_pred @ post_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze().mT,
+                test_X_l_list_clean[l],
+            ).item()
+            for l in range(L)
+        ])
+
+    if rep_config is not None:
+        condition_cols = dict(
+            n=rep_config["n"],         p=rep_config["p_l"],
+            snr_x=rep_config["snr_x"], snr_y=rep_config["snr_y"],
+            rep=rep_config["rep"],     sparsity=rep_config["sparsity"],
+            k_delta=rep_config["k_delta"],
+            runtime=global_train_state["inference_time"],
+            predict_runtime=local_train_state["inference_time"],
+            svd_time=global_train_state.get("svd_time", 0),
+        )
+        eval_metric_table = eval_metric_table.assign(**condition_cols)
+        if cov_metric_table is not None:
+            cov_metric_table = cov_metric_table.assign(**condition_cols)
+
+    return eval_metric_table, cov_metric_table, post_samples, post_samples_test
+
+
+def load_model(model_out_filename, model_config, n_train, train_config,
+               model_type="viper", opt=None, device="cpu"):
+    """Restore a saved model for prediction without retraining.
+
+    Sets the two instance attributes that are not persisted to disk but are
+    required before any forward/guide or predict_forward/predict_guide call:
+      - model.n      : training-set size (needed by the guide to size loc_Z/scale_Z init tensors)
+      - model.params : reference to the param store (needed by predict_forward/predict_guide)
+    """
+    _check_model_type(model_type)
+    pyro.clear_param_store()
+    state = torch.load(model_out_filename + "_paramstore.pth",
+                       map_location=device, weights_only=False)
+    pyro.get_param_store().set_state(state)
+
+    factor_model = _build_model(model_type, model_config, device)
+    factor_model.n = n_train
+    factor_model.params = pyro.get_param_store()
+
+    train_handler = _build_handler("train", factor_model, train_config, model_type, opt, device)
+    global_state = torch.load(model_out_filename + ".pth", weights_only=False)
+    return factor_model, train_handler, global_state
+
+
+##############################################################################
+# Model-specific names, kept so existing scripts and notebooks run unchanged.
+# New code should call the helpers above with model_type.
+##############################################################################
+
+svd_init_shared = compute_svd_init
+
+
+def process_data_shared(sim_data, sim_data_test, training_split, training_size, seed=123):
+    return process_data(sim_data, sim_data_test, training_split, training_size, seed,
+                        model_type="shared")
+
+
+def train_model_shared(model_config, train_config, train_subset,
+                       model_out_filename, opt="adagrad", verbose=False, write=True,
+                       device="cpu", optuna_trial=None, optuna_step_offset=0,
+                       svd_init=False):
+    return train_model(model_config, train_config, train_subset, model_out_filename,
+                       model_type="shared", opt=opt, verbose=verbose, write=write,
+                       device=device, svd_init=svd_init, optuna_trial=optuna_trial,
+                       optuna_step_offset=optuna_step_offset)
+
+
+def train_model_locally_shared(factor_model, train_config, data_subset,
+                               opt="adagrad", verbose=False, device="cpu"):
+    return train_model_locally(factor_model, train_config, data_subset,
+                               model_type="shared", opt=opt, verbose=verbose, device=device)
+
+
+def evaluate_fitted_model_shared(rep_config, data_package,
+                                 train_handler, test_handler,
+                                 global_train_state, local_train_state,
+                                 N_POSTERIOR_SAMPLES, metric_out_filename):
+    return evaluate_fitted_model(rep_config, data_package, train_handler, test_handler,
+                                 global_train_state, local_train_state,
+                                 N_POSTERIOR_SAMPLES, model_type="shared")
+
+
+def load_model_shared(model_out_filename, model_config, n_train, train_config,
+                      opt="adagrad", device="cpu"):
+    return load_model(model_out_filename, model_config, n_train, train_config,
+                      model_type="shared", opt=opt, device=device)
+
+
+def process_data_single_view(sim_data, training_size, seed=123,
+                             training_split=True, sim_data_test=None):
+    """Returns the package from process_data plus the single-view key names
+    (X_train, y_train, col_filter, ...) that older notebooks read directly."""
+    train_subset, test_subset, data_package = process_data(
+        sim_data, sim_data_test, training_split, training_size, seed,
+        model_type="single_view")
+    data_package.update({
+        "X_train":    data_package["train_X_l_list_clean"][0],
+        "X_test":     data_package["test_X_l_list_clean"][0],
+        "y_train":    data_package["train_y_clean"].squeeze(),
+        "y_test":     data_package["test_y_clean"].squeeze(),
+        "col_filter": data_package["X_l_list_column_filters"][0],
+        "X_mean":     data_package["X_l_mean_list"][0],
+        "X_sd":       data_package["X_l_sd_list"][0],
+        "sim_decomp": data_package["SIM_decomp"],
+    })
+    return train_subset, test_subset, data_package
+
+
+def train_model_single_view(model_config, train_config, train_subset,
+                            opt="adagrad", scheduled=False, verbose=False):
+    """Returns (factor_model, train_handler, runtime in seconds)."""
+    factor_model, train_handler, state = train_model(
+        model_config, train_config, train_subset, model_type="single_view",
+        opt="scheduled" if scheduled else opt, verbose=verbose, write=False)
+    return factor_model, train_handler, state["inference_time"]
 
 
 def train_model_locally_single_view(factor_model, train_config, test_subset,
                                     opt="adagrad", verbose=False):
-    """Single-view analogue of train_model_locally. Infers local Z for test observations.
-
-    Global variational parameters are frozen (read from factor_model.params).
-    No files are written.
-
-    Parameters
-    ----------
-    opt : str
-        "adagrad" to use AdagradRMSProp (requires eta/delta/t in train_config);
-        "scheduled" to use StepLR with Adam (requires initial_lr/betas/lr_step_size/
-        lr_decay_factor in train_config).
-
-    Returns
-    -------
-    test_handler, runtime (seconds)
-    """
-    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-    if opt == "adagrad":
-        OPT = AdagradRMSProp({
-            "eta":   train_config["eta"],
-            "delta": train_config["delta"],
-            "t":     train_config["t"],
-        })
-        test_handler = ModelHandler(
-            "predict", factor_model,
-            opt=OPT,
-            loss=LOSS,
-            opt_scheduler=None,
-            orthogonal_projection=False,
-        )
-    else:
-        scheduler = pyro.optim.StepLR({
-            "optimizer": torch.optim.Adam,
-            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-            "step_size": train_config["lr_step_size"],
-            "gamma":     train_config["lr_decay_factor"],
-        })
-        test_handler = ModelHandler(
-            "predict", factor_model,
-            loss=LOSS,
-            opt_scheduler=scheduler,
-            orthogonal_projection=False,
-        )
-
-    t0 = time.time()
-    test_handler.do_inference(
-        train_dataset=test_subset,
-        min_epochs=train_config["min_epochs"],
-        epochs=train_config["max_epochs"],
-        minibatch_flag=True,
-        minibatch_size=train_config["minibatch_size"],
-        variational_diff_func=np.mean,
-        verbose=verbose,
-    )
-    runtime = time.time() - t0
-
-    return test_handler, runtime
+    """Returns (test_handler, runtime in seconds)."""
+    _, test_handler, state = train_model_locally(
+        factor_model, train_config, test_subset, model_type="single_view",
+        opt=opt, verbose=verbose)
+    return test_handler, state["inference_time"]
 
 
 def evaluate_fitted_model_single_view(train_handler, test_handler, data_package,
-                                       n_posterior_samples=300):
-    """Single-view analogue of evaluate_fitted_model.
-
-    Returns a one-row DataFrame with structure RSE, covariance Frobenius error,
-    outcome MSE, and 95% credible interval coverage.
-    """
-    post_train = train_handler.predict(
-        [data_package["X_train"]], n_posterior_samples,
-        return_sites=["structure", Sites.Lambda_l.format(l=0)],
-    )
-    post_test = test_handler.predict(
-        [data_package["X_test"]], n_posterior_samples,
-        return_sites=["y_pred"],
-    )
-
-    eval_structures = calc_all_structures_with_rescaling_single_view(
-        data_package["col_filter"],
-        data_package["X_mean"],
-        data_package["X_sd"],
-        post_train,
-        post_test,
-        data_package["sim_decomp"],
-        data_package["train_idx"],
-        data_package["y_test"],
-    )
-
-    return eval_performance_single_view(**eval_structures)
+                                      n_posterior_samples=300):
+    """Returns the metric table only."""
+    eval_metric_table, _, _, _ = evaluate_fitted_model(
+        None, data_package, train_handler, test_handler, None, None,
+        n_posterior_samples, model_type="single_view")
+    return eval_metric_table
 
 
 ##############################################################################
@@ -742,11 +735,13 @@ def train_eval_cv_fold(X_raw, y_raw, train_idx, val_idx, model_config, train_con
 
     pyro.clear_param_store()
 
-    factor_model, train_handler, _ = train_model_single_view(
-        model_config, train_config, train_ds, opt=opt, verbose=verbose
+    factor_model, train_handler, _ = train_model(
+        model_config, train_config, train_ds, model_type="single_view",
+        opt=opt, verbose=verbose, write=False,
     )
-    val_handler, _ = train_model_locally_single_view(
-        factor_model, train_config, val_ds, opt=opt, verbose=verbose
+    _, val_handler, _ = train_model_locally(
+        factor_model, train_config, val_ds, model_type="single_view",
+        opt=opt, verbose=verbose,
     )
 
     post_train = train_handler.predict(
@@ -874,416 +869,6 @@ def run_cv_grid(X_raw, y_raw, model_config, train_grid, train_grid_names,
     return pd.DataFrame(rows)
 
 
-##############################################################################
-# SupMultiviewShared helpers
-##############################################################################
-
-def process_data_shared(sim_data, sim_data_test, training_split, training_size, seed=123):
-    """Multiview shared-structure analogue of process_data. No k_l_list or view factors."""
-    import pandas as pd
-
-    L = int(sim_data.get("L"))
-    X_l_list = sim_data.get("X_l")
-    y = sim_data.get("y")
-    k = int(sim_data.get("K"))
-    n = X_l_list[0].shape[0]
-
-    if training_split:
-        train_idx, test_idx = train_test_split(
-            torch.arange(n), train_size=training_size, random_state=seed, shuffle=True
-        )
-        train_X_l_list = [X[train_idx] for X in X_l_list]
-        test_X_l_list  = [X[test_idx]  for X in X_l_list]
-        train_y = y[train_idx]
-        test_y  = y[test_idx]
-    else:
-        X_l_list_test = sim_data_test.get("X_l")
-        y_test = sim_data_test.get("y")
-        n_test = X_l_list_test[0].shape[0]
-        train_idx = torch.arange(n)
-        test_idx  = torch.arange(n_test)
-        train_X_l_list = X_l_list
-        test_X_l_list  = X_l_list_test
-        train_y = y
-        test_y  = y_test
-
-    X_l_list_column_filters = [zero_variance_col_filter(X) for X in train_X_l_list]
-    train_X_l_list = [X[:, f] for X, f in zip(train_X_l_list, X_l_list_column_filters)]
-    test_X_l_list  = [X[:, f] for X, f in zip(test_X_l_list,  X_l_list_column_filters)]
-
-    clean_train = [normalize_tensor_by_col(X) for X in train_X_l_list]
-    X_l_mean_list        = [d["means"]      for d in clean_train]
-    X_l_sd_list          = [d["sds"]        for d in clean_train]
-    train_X_l_list_clean = [d["data_clean"] for d in clean_train]
-
-    clean_test = [normalize_tensor_by_col(X, m, s)
-                  for X, m, s in zip(test_X_l_list, X_l_mean_list, X_l_sd_list)]
-    test_X_l_list_clean = [d["data_clean"] for d in clean_test]
-
-    y_mean = torch.mean(train_y)
-    y_std  = torch.std(train_y)
-    train_y_clean = (train_y - y_mean) / y_std
-    test_y_clean  = (test_y  - y_mean) / y_std
-
-    train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]),
-                                 *train_X_l_list_clean, train_y_clean)
-    test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
-                                 *test_X_l_list_clean,  test_y_clean)
-
-    SIM_decomp = extract_sim_decomp_shared(sim_data)
-    train_SIM_decomp = {**SIM_decomp, "SIM_Z": SIM_decomp["SIM_Z"][train_idx]}
-
-    return train_subset, test_subset, {
-        "k": k, "L": L,
-        "train_X_l_list_clean": train_X_l_list_clean,
-        "test_X_l_list_clean":  test_X_l_list_clean,
-        "train_y_clean":        train_y_clean,
-        "test_y_clean":         test_y_clean,
-        "X_l_list_column_filters": X_l_list_column_filters,
-        "X_l_mean_list":        X_l_mean_list,
-        "X_l_sd_list":          X_l_sd_list,
-        "SIM_decomp":           SIM_decomp,
-        "train_SIM_decomp":     train_SIM_decomp,
-    }
-
-
-def load_model_shared(model_out_filename, model_config, n_train, train_config,
-                      opt="adagrad", device="cpu"):
-    """Restore a saved SupMultiviewShared for prediction without retraining.
-
-    Sets the two instance attributes that are not persisted to disk but are
-    required before any forward/guide or predict_forward/predict_guide call:
-      - model.n      : training-set size (needed by guide_mgp to size loc_Z/scale_Z init tensors)
-      - model.params : reference to the param store (needed by predict_forward/predict_guide)
-    """
-    from multiview_shared import SupMultiviewShared
-
-    pyro.clear_param_store()
-    state = torch.load(model_out_filename + "_paramstore.pth",
-                       map_location=device, weights_only=False)
-    pyro.get_param_store().set_state(state)
-
-    factor_model = SupMultiviewShared(model_config["k"], dense=model_config["dense_model"],
-                                      outcome_weight=model_config.get("outcome_weight", 1.0),
-                                      device=device)
-    factor_model.n = n_train
-    factor_model.params = pyro.get_param_store()
-
-    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-    if opt == "adagrad":
-        OPT = AdagradRMSProp({
-            "eta":   train_config["eta"],
-            "delta": train_config["delta"],
-            "t":     train_config["t"],
-        })
-        train_handler = ModelHandler("train", factor_model, opt=OPT, loss=LOSS, device=device)
-    else:
-        scheduler = pyro.optim.StepLR({
-            "optimizer":  torch.optim.Adam,
-            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-            "step_size":  train_config["lr_step_size"],
-            "gamma":      train_config["lr_decay_factor"],
-        })
-        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler,
-                                     device=device)
-
-    global_state = torch.load(model_out_filename + ".pth", weights_only=False)
-    return factor_model, train_handler, global_state
-
-
-def svd_init_shared(X_l_list, k):
-    """Top-k SVD of horizontally stacked views for guide initialisation.
-
-    Returns (Z_init, Lambda_l_init_list) scaled so that Z columns have
-    unit variance and Lambda entries are O(1), consistent with the model priors.
-
-    The factorisation used is X_concat ≈ (sqrt(N)*U_k) @ (s_k/sqrt(N)*V_k)^T,
-    which keeps Z ~ N(0,I) and Lambda entries ~ O(sqrt(P/p_l)).
-
-    Parameters
-    ----------
-    X_l_list : list of (N, p_l) float tensors
-        Normalised training views.
-    k : int
-        Number of factors to extract.
-
-    Returns
-    -------
-    Z_init : (N, k) tensor
-    Lambda_l_init_list : list of (p_l, k) tensors
-    """
-    X_concat = torch.cat(X_l_list, dim=1).float()
-    n = X_concat.shape[0]
-    U, s, Vt = torch.linalg.svd(X_concat, full_matrices=False)
-
-    Z_init = U[:, :k] * (n ** 0.5)          # (N, k), each column has var ≈ 1
-
-    Lambda_l_init_list = []
-    col = 0
-    for X_l in X_l_list:
-        p_l = X_l.shape[1]
-        # (p_l, k): rows of Vt scaled by singular values, normalised by sqrt(N)
-        Lambda_l_init_list.append(
-            (Vt[:k, col:col + p_l].T * s[:k].unsqueeze(0)) / (n ** 0.5)
-        )
-        col += p_l
-
-    return Z_init, Lambda_l_init_list
-
-
-def train_model_shared(model_config, train_config, train_subset,
-                       model_out_filename, opt="adagrad", verbose=False, write=True,
-                       device="cpu", optuna_trial=None, optuna_step_offset=0,
-                       svd_init=False):
-    """Train SupMultiviewShared globally.
-
-    Parameters
-    ----------
-    opt : str
-        "adagrad" uses AdagradRMSProp (requires eta/delta/t in train_config).
-        "scheduled" uses StepLR with Adam (requires initial_lr/betas/
-        lr_step_size/lr_decay_factor in train_config).
-    device : str or torch.device
-        Device to run on, e.g. "cpu", "mps", or "cuda".
-    svd_init : bool
-        If True, initialise loc_Z and loc_Lambda_l from the top-k SVD of the
-        stacked training views before starting SVI.
-    """
-    from multiview_shared import SupMultiviewShared
-
-    k     = model_config["k"]
-    dense = model_config["dense_model"]
-    outcome_weight = model_config.get("outcome_weight", 1.0)
-    
-    
-    
-    
-    if svd_init:
-        svd_time0 = time.time()
-        # train_subset is TensorDataset(idx, X_1, ..., X_L, y); views are [1:-1]
-        X_l_list = [t.to(device) for t in train_subset.tensors[1:-1]]
-        Z_init, Lambda_l_init_list = svd_init_shared(X_l_list, k)
-        svd_time1 = time.time()
-        
-        t0 = time.time()
-        factor_model = SupMultiviewShared(k, dense=dense, outcome_weight=outcome_weight,
-                                          device=device,
-                                          joint_scores_init=Z_init,
-                                          joint_loadings_list_init=Lambda_l_init_list)
-    else:
-        t0 = time.time()
-        factor_model = SupMultiviewShared(k, dense=dense, outcome_weight=outcome_weight,
-                                          device=device)
-    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-
-    if opt == "adagrad":
-        OPT = AdagradRMSProp({
-            "eta":   train_config["eta"],
-            "delta": train_config["delta"],
-            "t":     train_config["t"],
-        })
-        train_handler = ModelHandler("train", factor_model,
-                                     opt=OPT, loss=LOSS, opt_scheduler=None, device=device)
-    else:
-        scheduler = pyro.optim.StepLR({
-            "optimizer":  torch.optim.Adam,
-            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-            "step_size":  train_config["lr_step_size"],
-            "gamma":      train_config["lr_decay_factor"],
-        })
-        train_handler = ModelHandler("train", factor_model, loss=LOSS, opt_scheduler=scheduler,
-                                     device=device)
-
-    n_train = len(train_subset)
-    if "minibatch_fraction" in train_config:
-        train_mb = max(1, int(n_train * train_config["minibatch_fraction"]))
-    else:
-        train_mb = int(train_config["minibatch_size"])
-    while train_mb > n_train:
-        train_mb //= 2
-
-    try:
-        
-        train_handler.do_inference(
-            train_dataset=train_subset,
-            min_epochs=train_config["min_epochs"],
-            epochs=train_config["max_epochs"],
-            minibatch_flag=True,
-            minibatch_size=train_mb,
-            variational_diff_func=np.mean,
-            verbose=verbose,
-            convergence_criterion=train_config["convergence_criterion"],
-            window=train_config["window"],
-            snr_threshold=train_config["snr_threshold"],
-            optuna_trial=optuna_trial,
-            optuna_step_offset=optuna_step_offset,
-        )
-        run_time = time.time() - t0
-
-        model_state_dict = {
-            "svd_time":                  svd_time1 - svd_time0 if svd_init else 0,
-            "inference_time":            run_time,
-            "epochs":                    factor_model.total_epochs,
-            "model_state_dict":          pyro.get_param_store().get_state(),
-            "optimizer_state":           train_handler.opt.get_state(),
-            "loss_history":              factor_model.loss_history,
-            "param_convergence_history": factor_model.var_param_convergence_history,
-            "config":                    train_config,
-        }
-        if write:
-            torch.save(model_state_dict, model_out_filename + ".pth")
-            pyro.get_param_store().save(model_out_filename + "_paramstore.pth")
-    except Exception as e:
-        print(e)
-        raise
-
-    return factor_model, train_handler, model_state_dict
-
-
-def train_model_locally_shared(factor_model, train_config, data_subset,
-                                opt="adagrad", verbose=False, device="cpu"):
-    """Local inference for SupMultiviewShared: infers Z for test observations.
-
-    Global variational parameters are frozen (loaded from factor_model).
-    No files are written.
-
-    Parameters
-    ----------
-    opt : str
-        "adagrad" uses AdagradRMSProp; "scheduled" uses StepLR with Adam.
-    device : str or torch.device
-        Device to run on, e.g. "cpu", "mps", or "cuda".
-
-    Returns
-    -------
-    factor_model, test_handler, model_state_dict
-    """
-    LOSS = Trace_ELBO(num_particles=train_config["num_particles"])
-
-    if opt == "adagrad":
-        OPT = AdagradRMSProp({
-            "eta":   train_config["eta"],
-            "delta": train_config["delta"],
-            "t":     train_config["t"],
-        })
-        test_handler = ModelHandler("predict", factor_model,
-                                    opt=OPT, loss=LOSS, opt_scheduler=None, device=device)
-    else:
-        scheduler = pyro.optim.StepLR({
-            "optimizer":  torch.optim.Adam,
-            "optim_args": {"lr": train_config["initial_lr"], "betas": train_config["betas"]},
-            "step_size":  train_config["lr_step_size"],
-            "gamma":      train_config["lr_decay_factor"],
-        })
-        test_handler = ModelHandler("predict", factor_model, loss=LOSS, opt_scheduler=scheduler,
-                                    device=device)
-
-    n_local = len(data_subset)
-    if "minibatch_fraction" in train_config:
-        local_mb = max(1, int(n_local * train_config["minibatch_fraction"]))
-    else:
-        local_mb = int(train_config["minibatch_size"])
-    while local_mb > n_local:
-        local_mb //= 2
-
-    t0 = time.time()
-    test_handler.do_inference(
-        train_dataset=data_subset,
-        min_epochs=train_config["min_epochs"],
-        epochs=train_config["max_epochs"],
-        minibatch_flag=True,
-        minibatch_size=local_mb,
-        variational_diff_func=np.mean,
-        verbose=verbose,
-        convergence_criterion=train_config["convergence_criterion"],
-        window=train_config["window"],
-        snr_threshold=train_config["snr_threshold"],
-    )
-    runtime = time.time() - t0
-
-    model_state_dict = {
-        "inference_time":            runtime,
-        "epochs":                    factor_model.local_epochs,
-        "model_state_dict":          pyro.get_param_store().get_state(),
-        "optimizer_state":           test_handler.opt.get_state(),
-        "loss_history":              factor_model.local_loss_history,
-        "param_convergence_history": factor_model.local_var_param_convergence_history,
-        "config":                    train_config,
-    }
-    return factor_model, test_handler, model_state_dict
-
-
-def evaluate_fitted_model_shared(rep_config, data_package,
-                                  train_handler, test_handler,
-                                  global_train_state, local_train_state,
-                                  N_POSTERIOR_SAMPLES, metric_out_filename):
-    """Evaluate SupMultiviewShared after global training + local inference."""
-    train_X_l_list_clean     = data_package["train_X_l_list_clean"]
-    test_X_l_list_clean      = data_package["test_X_l_list_clean"]
-    test_y_clean             = data_package["test_y_clean"]
-    X_l_list_column_filters  = data_package["X_l_list_column_filters"]
-    X_l_mean_list            = data_package["X_l_mean_list"]
-    X_l_sd_list              = data_package["X_l_sd_list"]
-    train_SIM_decomp         = data_package["train_SIM_decomp"]
-    L                        = data_package["L"]
-
-    sites = [Sites.Z, Sites.y, Sites.beta] + [Sites.Lambda_l.format(l=l) for l in range(L)]
-    test_sites = [Sites.y_pred, Sites.Z_pred]
-    post_samples      = train_handler.predict(train_X_l_list_clean, N_POSTERIOR_SAMPLES,
-                                              sites)
-    post_samples_test = test_handler.predict(test_X_l_list_clean,   N_POSTERIOR_SAMPLES,
-                                             test_sites)
-    # Sim data from R (via rpy2) is always on CPU; move posterior samples to CPU so all
-    # downstream comparisons (eval_rse, numpy conversions, etc.) see consistent devices.
-    post_samples      = {k: v.cpu() if isinstance(v, torch.Tensor) else v
-                         for k, v in post_samples.items()}
-    post_samples_test = {k: v.cpu() if isinstance(v, torch.Tensor) else v
-                         for k, v in post_samples_test.items()}
-
-    eval_structures = calc_all_structures_with_rescaling_shared(
-        L, X_l_list_column_filters, X_l_mean_list, X_l_sd_list,
-        post_samples, post_samples_test, train_SIM_decomp, test_y_clean.squeeze(),
-        post_loading_samples=post_samples,
-    )
-
-    # Per-view RSE of test data reconstruction (Z_test @ Lambda_l^T vs X_l_test)
-    mean_Z_pred = post_samples_test[Sites.Z_pred].mean(dim=0).squeeze()
-    test_rse = [
-        eval_rse(
-            mean_Z_pred @ post_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze().mT,
-            test_X_l_list_clean[l],
-        ).item()
-        for l in range(L)
-    ]
-
-    condition_cols = dict(
-        n=rep_config["n"],         p=rep_config["p_l"],
-        snr_x=rep_config["snr_x"], snr_y=rep_config["snr_y"],
-        rep=rep_config["rep"],     sparsity=rep_config["sparsity"],
-        k_delta=rep_config["k_delta"],
-        runtime=global_train_state["inference_time"],
-        predict_runtime=local_train_state["inference_time"],
-        svd_time = global_train_state["svd_time"]
-    )
-
-    # Performance table (structure RSE, coverage, outcome MSE, test reconstruction RSE)
-    perf_keys = {k: v for k, v in eval_structures.items()
-                 if k not in ("est_cov", "sim_cov")}
-    eval_metric_table = (
-        eval_performance_shared(**perf_keys)
-        .assign(test_rse=test_rse)
-        .assign(**condition_cols)
-    )
-
-    # Covariance table (within- and cross-view Frobenius error)
-    cov_metric_table = None
-    if "est_cov" in eval_structures:
-        cov_metric_table = eval_cov_shared(
-            eval_structures["est_cov"], eval_structures["sim_cov"], L
-        ).assign(**condition_cols)
-
-    return eval_metric_table, cov_metric_table, post_samples, post_samples_test
-
 
 ##############################################################################
 # Cross-validation helpers — SupMultiviewShared
@@ -1357,13 +942,14 @@ def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
 
     pyro.clear_param_store()
 
-    factor_model, train_handler, global_state = train_model_shared(
-        model_config, train_config, train_ds,
-        model_out_filename="", opt=opt, verbose=verbose, write=False,
+    factor_model, train_handler, global_state = train_model(
+        model_config, train_config, train_ds, model_type="shared",
+        opt=opt, verbose=verbose, write=False,
     )
 
-    factor_model, val_handler, local_state = train_model_locally_shared(
-        factor_model, train_config, val_ds, opt=opt, verbose=verbose,
+    factor_model, val_handler, local_state = train_model_locally(
+        factor_model, train_config, val_ds, model_type="shared",
+        opt=opt, verbose=verbose,
     )
 
     post_val     = val_handler.predict(X_l_va, n_posterior_samples, [Sites.y_pred])
@@ -1379,7 +965,7 @@ def train_eval_cv_fold_shared(X_l_raw_list, y_raw, train_idx, val_idx,
         "train_time":    train_time,
         "local_time":    local_time,
         "total_time":    train_time + local_time,
-        "effective_minibatch_size": int(train_config["minibatch_size"]),
+        "effective_minibatch_size": _minibatch_size(train_config, n_train),
     }
 
     if sim_decomp is not None and column_filters is not None:
