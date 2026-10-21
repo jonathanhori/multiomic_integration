@@ -18,6 +18,8 @@ from constants import Sites
 ######## 
 # Utilities for converting data from R
 def floatmatrix_to_torch(m):
+    """Convert an rpy2 FloatMatrix to a float32 tensor, accounting for R's
+    column-major storage."""
     t = torch.tensor(list(m), dtype=torch.float32)
     # R matrices are stored column-major, so reshape and transpose
     t = t.view(m.ncol, m.nrow).t()
@@ -106,6 +108,12 @@ def load_rds_rep(directory_name, directory_path, filename_dict, rep_stem):
 ##########
 # Input data processing
 def normalize_tensor_by_col(data, training_means = None, training_stds = None):
+    """Standardise each column to mean 0 and sd 1.
+
+    With no means/sds given, uses the column means and sds of `data` (training
+    set); otherwise applies the given training statistics (test set).
+    Returns {"data_clean", "means", "sds"}.
+    """
     # Means and sds are are broadcast across rows
     if training_means is None and training_stds is None:
         data_means = torch.mean(data, 0)
@@ -121,6 +129,11 @@ def normalize_tensor_by_col(data, training_means = None, training_stds = None):
 
 # Remove columns that are all 0s
 def zero_variance_col_filter(tens_2d):
+    """Boolean mask of columns that are not entirely zero.
+
+    Note: this drops all-zero columns only. A constant non-zero column passes
+    the filter and would give sd 0 (NaN after standardisation).
+    """
     return tens_2d.abs().sum(dim=0).bool()
     
 ###########
@@ -147,6 +160,9 @@ def extract_est_decomp(L, autoguide = True):
         raise NotImplementedError
 
 def extract_sim_decomp(sim_data_dict):
+    """Simulated structures for SupMultiviewDecomp data: shared loadings and
+    scores, view-specific loadings and scores (as simulated and after
+    projection onto the complement of the shared signal)."""
     SIM_Lambda_l_list = sim_data_dict["Lambda_l"]
     SIM_Z = sim_data_dict["Z"] 
 
@@ -198,18 +214,22 @@ def obtain_posterior_pred_samples(#model,
     
     
 def calc_struct(scores, loadings):
+    """Low-rank signal scores @ loadings^T."""
     return scores @ loadings.T
 
 def scale_est_struct(struct_list, mean_list, sd_list):
+    """Map standardised structures back to the original data scale."""
     return [struct * sd + mean for struct, mean, sd in zip(struct_list, mean_list, sd_list)]
     # return [(struct_list[i] - mean_list[i]) / sd_list[i] for i in range(len(struct_list))]
 
 def scale_sim_struct(struct_list, mean_list, sd_list):
+    """Map simulated structures onto the standardised scale the model is fitted on."""
     return [(struct - mean) / sd for struct, mean, sd in zip(struct_list, mean_list, sd_list)]
     # return [struct_list[i] * sd_list[i] + mean_list[i] for i in range(len(struct_list))]
     
     
 def scale_sim_cov(sim_cov, sim_sd1, sim_sd2):
+    """Rescale a covariance block to standardised data: diag(1/sd1) C diag(1/sd2)."""
     # For one matrix at a time
     return torch.diag(1 / sim_sd1) @ sim_cov @ torch.diag(1 / sim_sd2)
     
@@ -222,6 +242,10 @@ def calc_all_structures_with_rescaling(L,
                                         post_pred_outcome_samples,
                                         sim_decomp,
                                         sim_outcome):
+    """SupMultiviewDecomp evaluation inputs: simulated shared and view-specific
+    structures (filtered columns, standardised scale), posterior summaries of
+    the estimated structures, and the posterior predictive outcome summary
+    with the true test outcome. Output feeds eval_performance."""
 
     SIM_joint_struct_l_list = list(map(calc_struct, \
         [sim_decomp.get("SIM_Z")] * L, sim_decomp.get("SIM_Lambda_l_list")))
@@ -273,18 +297,23 @@ def calc_all_structures_with_rescaling(L,
 # Evaluate structures
 
 def eval_rse(est_struct, sim_struct):
+    """Squared relative error ||sim - est||_F^2 / ||sim||_F^2."""
     return torch.norm(sim_struct - est_struct) ** 2 / torch.norm(sim_struct) ** 2
 
 def eval_mse(pred_outcome, sim_outcome):
+    """Mean squared error between predicted and true outcomes."""
     return torch.nn.functional.mse_loss(sim_outcome, pred_outcome)
 
 def calc_cov(loading1, loading2 = None):
+    """Covariance implied by loadings: L1 L1^T, or the cross-covariance L1 L2^T."""
     if loading2 is None:
         return loading1 @ loading1.T
     else:
         return loading1 @ loading2.T
     
 def eval_cov(est_cov, sim_cov):
+    """Mean squared entrywise error between estimated and simulated covariance
+    (sim_cov should already be on the standardised scale)."""
     # Sim cov should be rescaled by corresponding standard deviations to be on the same scale
     return torch.norm(sim_cov - est_cov) ** 2 / (est_cov.shape[0] * est_cov.shape[1])
 
@@ -464,13 +493,16 @@ def calc_all_structures_with_rescaling_shared(
             for l in range(L)
         ]
 
+        # The fitted model's implied covariance uses the fitted scores' second
+        # moment, since the fit only identifies Z Lambda^T (see scores_second_moment).
+        Sigma_Z = (scores_second_moment(post_loading_samples[Sites.Z])
+                   if Sites.Z in post_loading_samples else None)
         est_cov = {}
         sim_cov = {}
         for l in range(L):
             for m in range(l, L):
-                loading2_est = est_Lambda_list[m] if l != m else None
                 loading2_sim = sim_Lambda_list[m] if l != m else None
-                est_cov[(l, m)] = calc_cov(est_Lambda_list[l], loading2_est)
+                est_cov[(l, m)] = implied_cov(est_Lambda_list[l], est_Lambda_list[m], Sigma_Z)
                 raw_cov = calc_cov(sim_Lambda_list[l], loading2_sim)
                 sim_cov[(l, m)] = scale_sim_cov(raw_cov, X_l_sd_list[l], X_l_sd_list[m])
 
@@ -590,7 +622,9 @@ def calc_all_structures_with_rescaling_single_view(
     # Covariance in normalized space: diag(1/sd) @ (Lambda @ Lambda.T) @ diag(1/sd)
     # Use posterior mean of Lambda (samples shape: N_samples x p_filtered x k)
     Lambda_post_mean = post_pred_train_samples['Lambda_l0'].mean(dim=0).squeeze()
-    est_cov = calc_cov(Lambda_post_mean)
+    Sigma_Z = (scores_second_moment(post_pred_train_samples[Sites.Z])
+               if Sites.Z in post_pred_train_samples else None)
+    est_cov = implied_cov(Lambda_post_mean, Lambda_post_mean, Sigma_Z)
     sim_cov_norm = scale_sim_cov(calc_cov(SIM_Lambda), X_sd, X_sd)
 
     # Outcome summaries (test set)
@@ -642,6 +676,11 @@ def eval_performance_single_view(
 
 
 def varimax(Phi, gamma = 1, q = 20, tol = 1e-6):
+    """Varimax rotation of a (p, k) loading matrix.
+
+    Returns (rotated loadings Phi @ R, rotation matrix R). Scores rotate as
+    Z @ R and outcome effects as R^T beta. At most q iterations.
+    """
     # Source - https://stackoverflow.com/a
     # Posted by bmcmenamin
     # Retrieved 2025-12-15, License - CC BY-SA 3.0
@@ -678,5 +717,70 @@ def align_tensor_shapes(target, input = None, additional = None):
 
 
 def inv_gamma_moments(a, b):
+    """Print the mean and variance of an InverseGamma(a, b) distribution."""
     print(f'mean: {b / (a - 1)}')
     print(f'variance: {(b ** 2) / ((a - 1) ** 2) * (a - 2)}')
+
+def standardised_true_loadings(data_package):
+    """True simulated loadings for each view, on the standardised scale the
+    model is fitted on: rows of zero-variance-filtered features, divided by each
+    feature's training sd. Works for any data_package from run_methods.process_data.
+
+    Returns a list of (p_l, K_true) tensors.
+    """
+    sim = data_package["SIM_decomp"]
+    Lambda_list = sim["SIM_Lambda_l_list"] if "SIM_Lambda_l_list" in sim else [sim["SIM_Lambda"]]
+    return [Lam[f] / sd.unsqueeze(1)
+            for Lam, f, sd in zip(Lambda_list,
+                                  data_package["X_l_list_column_filters"],
+                                  data_package["X_l_sd_list"])]
+
+
+def scores_second_moment(Z):
+    """Second moment of fitted factor scores, Sigma_Z = (1/n) sum_i E[z_i z_i^T].
+
+    Z : posterior draws (S, n, K) — averaged over draws, which includes the
+        posterior variance of the scores — or point estimates (n, K).
+
+    A fitted factor model only identifies the signal Z Lambda^T; nothing forces
+    the fitted scores to have unit variance. The covariance the fit implies is
+    therefore Lambda Sigma_Z Lambda^T, not Lambda Lambda^T.
+    """
+    Z = torch.as_tensor(Z).double()
+    if Z.dim() == 2:
+        Z = Z.unsqueeze(0)
+    Z = Z.reshape(Z.shape[0], -1, Z.shape[-1])
+    return torch.einsum("sni,snj->ij", Z, Z) / (Z.shape[0] * Z.shape[1])
+
+
+def implied_cov(Lambda_l, Lambda_m, Sigma_Z=None):
+    """Factor part of the implied covariance between two views:
+    Lambda_l Sigma_Z Lambda_m^T (Sigma_Z = identity when None)."""
+    Lambda_l = torch.as_tensor(Lambda_l).double()
+    Lambda_m = torch.as_tensor(Lambda_m).double()
+    if Sigma_Z is None:
+        return Lambda_l @ Lambda_m.T
+    return Lambda_l @ torch.as_tensor(Sigma_Z).double() @ Lambda_m.T
+
+
+def implied_cov_errors(Lambda_list, Sigma_Z, data_package):
+    """Covariance reconstruction error for any factor method, against the
+    simulated truth in data_package (from run_methods.process_data).
+
+    For each pair of views l <= m: mean squared entrywise error between the
+    fitted Lambda_l Sigma_Z Lambda_m^T and the true covariance on the
+    standardised scale. Returns a DataFrame: view_l, view_m, cov_type, cov_frob.
+    """
+    sim = data_package["SIM_decomp"]
+    true = sim["SIM_Lambda_l_list"] if "SIM_Lambda_l_list" in sim else [sim["SIM_Lambda"]]
+    filters, sds = data_package["X_l_list_column_filters"], data_package["X_l_sd_list"]
+    true = [T[f].double() for T, f in zip(true, filters)]
+    rows = []
+    L = len(Lambda_list)
+    for l in range(L):
+        for m in range(l, L):
+            est = implied_cov(Lambda_list[l], Lambda_list[m], Sigma_Z)
+            tru = scale_sim_cov(true[l] @ true[m].T, sds[l].double(), sds[m].double())
+            rows.append({"view_l": l, "view_m": m, "cov_type": "within" if l == m else "cross",
+                         "cov_frob": eval_cov(est, tru).item()})
+    return pd.DataFrame(rows)

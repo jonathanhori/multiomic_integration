@@ -1,3 +1,77 @@
+"""
+Pipeline helpers for the supervised factor models.
+
+One set of functions runs every model; ``model_type`` selects which:
+
+    "single_view"  MatrixDecomp         X = Z Lambda^T + E,                    one view
+    "shared"       SupMultiviewShared   X_l = Z Lambda_l^T + E_l,              L views
+    "viper"        SupMultiviewDecomp   X_l = Z Lambda_l^T + Phi_l Gamma_l^T + E_l
+
+In all three the outcome is y = Z beta + e, so the shared scores Z are informed
+by both the views and the outcome.
+
+Pipeline
+--------
+    sim_data = load_rds(path)                         # dict of tensors from an R .rds file
+    train_subset, test_subset, data_package = process_data(..., model_type=...)
+    factor_model, train_handler, global_state = train_model(..., model_type=...)
+    factor_model, test_handler, local_state = train_model_locally(..., model_type=...)
+    eval_table, cov_table, post_samples, post_samples_test = evaluate_fitted_model(...)
+
+``train_model`` fits the global parameters (loadings, beta, noise variances) and
+the training-set scores by stochastic variational inference. ``train_model_locally``
+then freezes the global parameters and infers scores for new observations from
+their views alone; the outcome is never used at test time. ``evaluate_fitted_model``
+draws posterior samples from both fits and compares them with the simulated truth.
+
+model_config
+------------
+    k                     number of shared factors to fit (usually true K + k_delta)
+    dense_model           False: multiplicative gamma process (MGP) shrinkage prior on
+                          the loadings, which switches off unneeded factors;
+                          True: dense prior. ("dense" is accepted as an alias.)
+    outcome_weight        multiplies the outcome log-likelihood (default 1). The views
+                          contribute sum_l p_l terms per observation against the
+                          outcome's one, so larger values give the outcome more pull on Z.
+    k_l_list              viper only: view-specific factors to fit per view
+    include_view_factors  viper only: whether to fit the view-specific factors
+
+train_config
+------------
+Optimiser (opt="adagrad", the default for single_view and shared) — Pyro's
+AdagradRMSProp, whose step size at iteration k is eta * k^(-1/2 + delta) / (1 + sqrt(s_k)),
+with s_k a running average of squared gradients:
+    eta                   overall step-size scale
+    t                     weight of the newest squared gradient in s_k (0 < t <= 1)
+    delta                 small exponent adjustment to the step-size decay (e.g. 1e-16)
+
+Optimiser (opt="scheduled", the default for viper) — Adam with a StepLR schedule:
+    initial_lr, betas     Adam learning rate and moment coefficients
+    lr_step_size          epochs between learning-rate decays
+    lr_decay_factor       multiplier applied at each decay
+
+Minibatching and length:
+    minibatch_fraction    minibatch size as a fraction of the dataset (preferred), or
+    minibatch_size        absolute minibatch size; halved until it fits the data
+    num_particles         Monte Carlo samples per ELBO estimate
+    min_epochs            never stop before this many epochs
+    max_epochs            always stop after this many epochs
+
+Stopping rule (optional; omitted keys use ModelHandler.do_inference defaults):
+    convergence_criterion "elbo_min" (default): stop once the number of epochs since
+                              the lowest loss exceeds sqrt(current epoch).
+                          "elbo_snr": compare the mean loss over the last `window`
+                              epochs with the `window` before; stop when
+                              |difference| / sd(last window) < snr_threshold and the
+                              current epoch is not a loss spike.
+                          "grad_norm": stop when the mean minibatch gradient norm
+                              falls below grad_norm_tol.
+    window                epochs per comparison window for elbo_snr (default 50)
+    snr_threshold         elbo_snr threshold (default 0.1); larger stops earlier
+    grad_norm_tol         grad_norm threshold (default 1e-3)
+
+The same train_config keys apply to local inference (train_model_locally).
+"""
 import gc
 import os
 import time
@@ -100,7 +174,9 @@ def load_rds(path):
 MODEL_TYPES = ("single_view", "shared", "viper")
 
 # Per-model settings used when the caller does not override them. These
-# reproduce what each model's original helpers did.
+# reproduce what each model's original helpers did. orthogonal_projection only
+# has an effect for "viper" (see ModelHandler); the other values are kept as the
+# original helpers set them.
 _MODEL_DEFAULTS = {
     "single_view": {"opt": "adagrad",   "orthogonal_projection": False},
     "shared":      {"opt": "adagrad",   "orthogonal_projection": True},
@@ -109,14 +185,22 @@ _MODEL_DEFAULTS = {
 
 
 def _check_model_type(model_type):
+    """Raise ValueError unless model_type is one of MODEL_TYPES."""
     if model_type not in MODEL_TYPES:
         raise ValueError(f"model_type must be one of {MODEL_TYPES}, got {model_type!r}")
 
 
-def process_data(sim_data, sim_data_test, training_split, training_size, seed=123,
-                 model_type="viper"):
+def process_data(sim_data, sim_data_test=None, training_split=False, training_size=0.8,
+                 seed=123, model_type="viper"):
     """Train/test split, drop zero-variance columns, and standardise each view
     and the outcome using training-set statistics.
+
+    The test set comes from one of two places:
+      - training_split=False (default): sim_data_test, a separately simulated
+        test set. training_size and seed are ignored.
+      - training_split=True: a random split of sim_data, with training_size the
+        fraction of observations used for training and seed the random seed.
+        sim_data_test is ignored.
 
     Parameters
     ----------
@@ -127,6 +211,10 @@ def process_data(sim_data, sim_data_test, training_split, training_size, seed=12
         Separate test set; required when training_split=False.
     training_split : bool
         True splits sim_data at random; False uses sim_data_test as the test set.
+    training_size : float
+        Training fraction when training_split=True.
+    seed : int
+        Random seed for the split when training_split=True.
 
     Returns
     -------
@@ -150,7 +238,8 @@ def process_data(sim_data, sim_data_test, training_split, training_size, seed=12
         train_y = y[train_idx]
         test_y  = y[test_idx]
     else:
-        assert sim_data_test is not None, "sim_data_test required when training_split=False"
+        assert sim_data_test is not None, \
+            "sim_data_test is required when training_split=False (or set training_split=True)"
         test_X_l_list = sim_data_test["X_l"]
         test_y        = sim_data_test["y"]
         train_idx = torch.arange(n)
@@ -185,8 +274,11 @@ def process_data(sim_data, sim_data_test, training_split, training_size, seed=12
     test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
                                  *test_X_l_list_clean, test_y_data)
 
-    # Simulated structures, with score rows restricted to the training set
-    if model_type == "single_view":
+    # Simulated structures, with score rows restricted to the training set.
+    # Real data have no simulated truth (Z is None): leave these empty.
+    if sim_data.get("Z") is None:
+        SIM_decomp = train_SIM_decomp = None
+    elif model_type == "single_view":
         SIM_decomp = extract_sim_decomp_single_view(sim_data)
         train_SIM_decomp = SIM_decomp     # rows are selected in evaluation via train_idx
     elif model_type == "shared":
@@ -595,6 +687,7 @@ svd_init_shared = compute_svd_init
 
 
 def process_data_shared(sim_data, sim_data_test, training_split, training_size, seed=123):
+    """process_data with model_type="shared"."""
     return process_data(sim_data, sim_data_test, training_split, training_size, seed,
                         model_type="shared")
 
@@ -603,6 +696,7 @@ def train_model_shared(model_config, train_config, train_subset,
                        model_out_filename, opt="adagrad", verbose=False, write=True,
                        device="cpu", optuna_trial=None, optuna_step_offset=0,
                        svd_init=False):
+    """train_model with model_type="shared"."""
     return train_model(model_config, train_config, train_subset, model_out_filename,
                        model_type="shared", opt=opt, verbose=verbose, write=write,
                        device=device, svd_init=svd_init, optuna_trial=optuna_trial,
@@ -611,6 +705,7 @@ def train_model_shared(model_config, train_config, train_subset,
 
 def train_model_locally_shared(factor_model, train_config, data_subset,
                                opt="adagrad", verbose=False, device="cpu"):
+    """train_model_locally with model_type="shared"."""
     return train_model_locally(factor_model, train_config, data_subset,
                                model_type="shared", opt=opt, verbose=verbose, device=device)
 
@@ -619,6 +714,7 @@ def evaluate_fitted_model_shared(rep_config, data_package,
                                  train_handler, test_handler,
                                  global_train_state, local_train_state,
                                  N_POSTERIOR_SAMPLES, metric_out_filename):
+    """evaluate_fitted_model with model_type="shared"."""
     return evaluate_fitted_model(rep_config, data_package, train_handler, test_handler,
                                  global_train_state, local_train_state,
                                  N_POSTERIOR_SAMPLES, model_type="shared")
@@ -626,6 +722,7 @@ def evaluate_fitted_model_shared(rep_config, data_package,
 
 def load_model_shared(model_out_filename, model_config, n_train, train_config,
                       opt="adagrad", device="cpu"):
+    """load_model with model_type="shared"."""
     return load_model(model_out_filename, model_config, n_train, train_config,
                       model_type="shared", opt=opt, device=device)
 
@@ -1073,6 +1170,7 @@ def run_cv_grid_shared(X_l_raw_list, y_raw, model_config, train_grid, train_grid
               flush=True)
 
     def _flush(rs):
+        """Write the rows so far to checkpoint_path, if one was given."""
         if checkpoint_path is None:
             return
         os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)

@@ -12,6 +12,20 @@ from torch.utils.data import DataLoader
 from constants import Sites, Params
 
 class ModelHandler:
+    """Runs stochastic variational inference for one of the factor models and
+    draws posterior samples from the fit.
+
+    A handler is either a training handler (mode="train"), which fits the
+    model's global parameters and training-set scores with model.forward /
+    model.guide, or a prediction handler (mode="predict"), which infers scores
+    for new observations with model.predict_forward / model.predict_guide while
+    the global parameters stay fixed. The model object carries the training
+    history (loss_history, total_epochs, ... for training; local_loss_history,
+    local_epochs, ... for prediction).
+
+    Usually built by run_methods.train_model / train_model_locally rather than
+    directly.
+    """
     def __init__(self,
                  mode,
                  model,
@@ -24,6 +38,24 @@ class ModelHandler:
                  local = False,
                  device = "cpu"
                  ):
+        """
+        Parameters
+        ----------
+        mode : "train" or "predict"
+        model : MatrixDecomp, SupMultiviewShared or SupMultiviewDecomp
+        guide : optional guide replacing the model's own (e.g. an AutoNormal)
+        opt : Pyro optimiser; ignored when opt_scheduler is given
+        loss : ELBO objective, e.g. Trace_ELBO(num_particles=2)
+        orthogonal_projection : for models with view-specific factors
+            (SupMultiviewDecomp), project the view-specific scores onto the
+            orthogonal complement of the shared signal when training converges.
+            Has no effect for the other models.
+        inference_class : optional pre-built inference object used instead of SVI
+        opt_scheduler : Pyro learning-rate scheduler (e.g. pyro.optim.StepLR),
+            stepped once per epoch; replaces opt
+        local : unused
+        device : "cpu", "mps" or "cuda"
+        """
         assert mode in ("train", "predict"), \
             "Argument 'mode' must be set to 'train' or 'predict'. If any new observations are present, set 'predict'."
             
@@ -61,9 +93,12 @@ class ModelHandler:
         self.learning_rate_vec = []
         
     def get_param_values(self):
+        """Placeholder; not implemented."""
         return
-    
+
     def _set_model_n(self, n):
+        """Record the dataset size on the model (n for training, n_predict for
+        prediction); the guide uses it to size the per-observation parameters."""
         if self.mode == "train": self.model.n = n
         elif self.mode == "predict": self.model.n_predict = n
     
@@ -91,7 +126,44 @@ class ModelHandler:
                     verbose = False,
                     optuna_trial = None,
                     optuna_step_offset = 0):
-        
+        """Fit the model by SVI over minibatches until the stopping rule is met.
+
+        Each epoch makes one pass over shuffled minibatches (the last partial
+        batch is dropped). After each epoch the loss and the mean change in the
+        variational parameters are appended to the model's history. Training
+        stops when epoch > min_epochs and the loss has converged under
+        convergence_criterion, or after `epochs` epochs.
+
+        Parameters
+        ----------
+        train_dataset : TensorDataset(idx, X_1, ..., X_L, y); for a censored
+            outcome, TensorDataset(idx, X_1, ..., X_L, cens, y). In predict mode
+            y is never passed to the model.
+        inference_type : "svi" or "svgd"
+        min_epochs, epochs : minimum and maximum number of epochs
+        minibatch_flag : must be True (full-batch training is not implemented)
+        minibatch_size : observations per minibatch
+        variational_diff_func : summary of per-parameter change norms recorded
+            each epoch (default: mean)
+        convergence_criterion :
+            "elbo_min"  — epochs since the lowest loss exceed sqrt(current epoch)
+            "elbo_snr"  — |mean(last window) - mean(previous window)| / sd(last
+                          window) < snr_threshold, and the current epoch's loss is
+                          at most (1 + spike_tol) x the median of the last window
+            "grad_norm" — mean minibatch gradient norm < grad_norm_tol
+        window, snr_threshold, spike_tol : elbo_snr settings
+        grad_norm_tol : grad_norm setting
+        verbose : print progress every 10 epochs and on termination
+        optuna_trial, optuna_step_offset : report the per-datum loss to an Optuna
+            trial each epoch so unpromising trials can be pruned
+        max_iter, tol, variational_tol, device : unused
+
+        Returns
+        -------
+        The Pyro inference object (e.g. SVI). The fitted parameters are in the
+        Pyro param store, which is also attached to the model as model.params.
+        """
+
         # min_epochs = 10
         
         # if minibatch_flag == False, then do not minibatch, data loader not necessary
@@ -127,6 +199,7 @@ class ModelHandler:
         ###
         # Projection matrix
         def projection_by_qr(tens):
+            """Projection matrix onto the column space of tens."""
             Q, _ = torch.linalg.qr(tens)
             return Q @ Q.T
         # def proj_onto_perp(P, tens):
@@ -395,7 +468,24 @@ class ModelHandler:
                 X_list,
                 num_samples,
                 return_sites):
-        X_list_dev = [x.to(self.device) for x in X_list]
+        """Draw posterior samples of the requested sites.
+
+        Samples the guide num_samples times and runs the model forward for
+        each draw. The outcome is not observed, so outcome sites (y, y_pred)
+        are posterior predictive draws.
+
+        Parameters
+        ----------
+        X_list : list of (n, p_l) tensors — the observations this handler was
+            fitted on (training set for "train", new observations for "predict")
+        num_samples : number of posterior draws
+        return_sites : site names to return, e.g. [Sites.Z, Sites.y_pred]
+
+        Returns
+        -------
+        dict mapping each site name to a tensor with leading dimension num_samples
+        """
+        X_list_dev =[x.to(self.device) for x in X_list]
         if self.model.model_type == "MatrixDecomp":
             n = X_list_dev[0].shape[0]
             predictive = Predictive(self.forward,
