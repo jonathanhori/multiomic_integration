@@ -175,7 +175,7 @@ class SupMultiviewShared(PyroModule):
         sigma2_beta = pyro.sample(Sites.sigma2_beta,
                                   dist.InverseGamma(self._t(self.a_sigma_beta), self._t(self.b_sigma_beta)).expand([self.k]).to_event(1))
         beta = pyro.sample(Sites.beta,
-                           dist.Normal(torch.zeros(self.k, device=self.device), sigma2_beta).to_event(1)).squeeze(0)
+                           dist.Normal(torch.zeros(self.k, device=self.device), torch.sqrt(sigma2_beta)).to_event(1)).squeeze(0)
 
         if self.outcome == "gaussian":
             sigma2_y = pyro.sample(Sites.sigma2_y,
@@ -262,7 +262,7 @@ class SupMultiviewShared(PyroModule):
         sigma2_beta = pyro.sample(Sites.sigma2_beta,
                                   dist.InverseGamma(self._t(self.a_sigma_beta), self._t(self.b_sigma_beta)).expand([self.k]).to_event(1))
         beta = pyro.sample(Sites.beta,
-                           dist.Normal(torch.zeros(self.k, device=self.device), sigma2_beta).to_event(1)).squeeze(0)
+                           dist.Normal(torch.zeros(self.k, device=self.device), torch.sqrt(sigma2_beta)).to_event(1)).squeeze(0)
 
         if self.outcome == "gaussian":
             sigma2_y = pyro.sample(Sites.sigma2_y,
