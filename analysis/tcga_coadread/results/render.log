@@ -1,0 +1,58 @@
+
+Starting python3 kernel...Done
+
+Executing 'tcga_coadread.ipynb'
+  Cell 1/30...Done
+  Cell 2/30...Done
+  Cell 3/30...Done
+  Cell 4/30...Done
+  Cell 5/30...Done
+  Cell 6/30...Done
+  Cell 7/30...Done
+  Cell 8/30...Done
+  Cell 9/30...Done
+  Cell 10/30...Done
+  Cell 11/30...Done
+  Cell 12/30...Done
+  Cell 13/30...Done
+  Cell 14/30...Done
+  Cell 15/30...Done
+  Cell 16/30...Done
+  Cell 17/30...Done
+  Cell 18/30...Done
+  Cell 19/30...Done
+  Cell 20/30...Done
+  Cell 21/30...Done
+  Cell 22/30...Done
+  Cell 23/30...Done
+  Cell 24/30...Done
+  Cell 25/30...Done
+  Cell 26/30...Done
+  Cell 27/30...Done
+  Cell 28/30...Done
+  Cell 29/30...Done
+  Cell 30/30...Done
+
+[1mpandoc [22m
+  to: html
+  output-file: tcga_coadread.html
+  standalone: true
+  embed-resources: true
+  section-divs: true
+  html-math-method: mathjax
+  wrap: none
+  default-image-extension: png
+  toc: true
+  toc-depth: 3
+  
+[1mmetadata[22m
+  document-css: false
+  link-citations: true
+  date-format: long
+  lang: en
+  title: 'TCGA colorectal cancer: tumour mutational burden from expression and methylation'
+  subtitle: 'Supervised shared-factor model — data processing, training, prediction, interpretation, and comparison'
+  jupyter: python3
+  
+Output created: tcga_coadread.html
+

@@ -1,0 +1,953 @@
+---
+title: "TCGA colorectal cancer: tumour mutational burden from expression and methylation"
+subtitle: "Supervised shared-factor model — data processing, training, prediction, interpretation, and comparison"
+jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
+---
+
+**Question.** How well do gene expression and promoter DNA methylation predict
+tumour mutational burden (TMB) in colorectal cancer, and which coordinated
+expression–methylation programmes drive the prediction?
+
+**Data.** TCGA colon and rectal adenocarcinoma (COAD/READ), PanCancer Atlas 2018
+release from cBioPortal (`data/tcga/coadread_tcga_pan_can_atlas_2018`). Two data
+views — RNA-seq gene expression and TSS200 promoter methylation — and the
+outcome $y = \log(1 + \text{TMB})$, where TMB is the number of nonsynonymous
+mutations per megabase.
+
+**Model.** The supervised shared-factor model (`SupMultiviewShared`): each view
+$X^{(l)}$ is explained by shared factor scores $Z$ through view-specific loadings,
+$\mathbf x_i^{(l)} = \Lambda^{(l)}\mathbf z_i + \boldsymbol\epsilon_i^{(l)}$, and the
+outcome is $y_i = \boldsymbol\beta^\top\mathbf z_i + e_i$, so the factors are shaped by
+both views and the outcome. Notation follows `docs/main(1).tex`; metric
+definitions are in `docs/evaluation_metrics.md`.
+
+**Where things are.** This is a real-data analysis, kept apart from the
+simulations: inputs come from `data/`, and every output of this notebook is
+written to `analysis/tcga_coadread/results/` (tables, fitted model) and
+`analysis/tcga_coadread/figures/` (plots). The comparison with other methods
+over several train/test splits is run by `compare_methods.py` in this folder.
+
+## Setup
+
+```{python}
+import os
+import sys
+import importlib
+
+os.environ["R_HOME"] = "/Library/Frameworks/R.framework/Resources"
+sys.path.insert(1, os.path.expanduser("~/multiomic_integration/python"))
+for _mod in ("coadread_data", "multiview_shared", "run_methods", "handler",
+             "data_utils", "constants", "factor_interpretation"):
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
+
+import numpy as np
+import pandas as pd
+import torch
+import pyro
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+
+from coadread_data import load_coadread, make_view_list, make_feature_names
+from run_methods import process_data, train_model, train_model_locally
+from factor_interpretation import (
+    summarize_factors, plot_pve, plot_factor_loadings, plot_factor_features,
+    plot_factor_outcome, tabulate_top_features, factor_strength,
+)
+from data_utils import summarise_post_samples
+from constants import Sites, Params
+
+HERE     = os.path.expanduser("~/multiomic_integration/analysis/tcga_coadread")
+RESULTS  = os.path.join(HERE, "results")
+FIGURES  = os.path.join(HERE, "figures")
+CLINICAL = os.path.expanduser("~/multiomic_integration/data/tcga/coadread_tcga_pan_can_atlas_2018")
+os.makedirs(RESULTS, exist_ok=True)
+os.makedirs(FIGURES, exist_ok=True)
+
+def save_fig(fig, name):
+    fig.savefig(os.path.join(FIGURES, name), dpi=150, bbox_inches="tight")
+
+def save_table(df, name, index=True):
+    df.to_csv(os.path.join(RESULTS, name), index=index)
+    return df
+```
+
+## Settings
+
+```{python}
+VIEWS        = ["expr", "meth_tss200"]
+VIEW_NAMES   = ["Expression", "TSS200 methylation"]
+N_RNA_GENES  = 2000        # most variable expression genes (chosen on training samples)
+N_METH_GENES = 1000        # most variable TSS200 methylation genes
+SPLIT_SEED   = 42          # the train/test split (also split 1 of compare_methods.py)
+K            = 20          # factors fitted; the shrinkage prior switches off unneeded ones
+N_POSTERIOR_SAMPLES = 300
+VERBOSE      = False
+
+MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0}
+TRAIN_CONFIG = {
+    "eta":                   0.25,
+    "delta":                 1e-16,
+    "t":                     0.1,
+    "num_particles":         1,
+    "minibatch_fraction":    0.15,
+    "min_epochs":            200,     # convergence_check.py: most of the loss decrease is over by 200
+    "max_epochs":            2000,
+    "convergence_criterion": "elbo_snr",
+    "window":                50,
+    "snr_threshold":         2,
+}
+SAVE_STEM = os.path.join(RESULTS, f"model_{'_'.join(VIEWS)}_k{K}")
+```
+
+## 1. Data
+
+### Loading and preprocessing
+
+`load_coadread` builds the analysis dataset in these steps:
+
+1. **Samples.** Keep tumour samples present in all three sources: RNA-seq,
+   methylation, and clinical data with a recorded TMB.
+2. **Expression.** RNA-seq RSEM values, log2(RSEM + 1) as released.
+3. **Promoter methylation.** Probes (HM27/HM450) annotated to the 200 bp
+   upstream of a transcription start site (TSS200) and to exactly one gene are
+   averaged per gene and sample (beta values in [0, 1]). Genes are restricted to
+   those also measured by RNA-seq.
+4. **Train/test split.** 80% / 20% at random (seed `SPLIT_SEED`).
+5. **Imputation and gene selection on the training samples only.** Missing
+   values are filled with training-sample gene means, and the `N_RNA_GENES` and
+   `N_METH_GENES` genes with the largest training-sample variance are kept, so
+   the test samples do not influence preprocessing.
+6. **Outcome.** $y = \log(1 + \text{TMB})$, because TMB is strongly right-skewed.
+
+```{python}
+data = load_coadread(top_rna_genes=N_RNA_GENES, top_meth_genes=N_METH_GENES,
+                     log1p_tmb=True, train_frac=0.8, random_seed=SPLIT_SEED,
+                     preprocess_on_train_only=True)
+gene_names = make_feature_names(data, VIEWS)
+
+n_train, n_test = len(data["sample_ids_train"]), len(data["sample_ids_test"])
+print(f"Samples: {n_train + n_test} ({n_train} train, {n_test} test)")
+for name, X, genes in zip(VIEW_NAMES, make_view_list(data, VIEWS, "train"), gene_names):
+    n_unique = len(set(genes))
+    print(f"  {name}: {X.shape[1]} features"
+          + (f" ({X.shape[1] - n_unique} gene symbols appear twice in the source file)"
+             if n_unique < X.shape[1] else ""))
+pd.Series(data["overlap_summary"], name="genes").to_frame()
+```
+
+### Clinical variables
+
+Clinical variables are not used by the model; they are joined here to describe
+the cohort and to interpret the factors. MSI status uses the MANTIS score
+thresholds suggested by cBioPortal (MSI > 0.6, indeterminate 0.4–0.6, stable < 0.4).
+
+```{python}
+samples = pd.read_csv(os.path.join(CLINICAL, "data_clinical_sample.txt"), sep="\t", skiprows=4)
+patients = pd.read_csv(os.path.join(CLINICAL, "data_clinical_patient.txt"), sep="\t", skiprows=4)
+clin = (samples[["SAMPLE_ID", "PATIENT_ID", "CANCER_TYPE_DETAILED", "TISSUE_SOURCE_SITE_CODE",
+                 "ANEUPLOIDY_SCORE", "MSI_SCORE_MANTIS", "MSI_SENSOR_SCORE", "TMB_NONSYNONYMOUS"]]
+        .merge(patients[["PATIENT_ID", "SUBTYPE", "SEX", "AGE"]], on="PATIENT_ID", how="left")
+        .set_index("SAMPLE_ID"))
+clin["MSI_STATUS"] = pd.cut(clin["MSI_SCORE_MANTIS"], [-np.inf, 0.4, 0.6, np.inf],
+                            labels=["stable", "indeterminate", "MSI"])
+clin["SITE"] = clin["CANCER_TYPE_DETAILED"].str.replace(" Adenocarcinoma", "")
+clin["split"] = "train"
+clin.loc[clin.index.isin(data["sample_ids_test"]), "split"] = "test"
+clin = clin.loc[data["sample_ids_train"] + data["sample_ids_test"]]
+clin["log1p_TMB"] = np.log1p(clin["TMB_NONSYNONYMOUS"])
+
+cohort = pd.concat({
+    "n": clin.groupby("split").size(),
+    "TMB median": clin.groupby("split")["TMB_NONSYNONYMOUS"].median(),
+    "MSI (%)": clin.groupby("split")["MSI_STATUS"].apply(lambda s: 100 * (s == "MSI").mean()),
+    "rectal (%)": clin.groupby("split")["SITE"].apply(lambda s: 100 * s.str.contains("Rectal").mean()),
+    "age median": clin.groupby("split")["AGE"].median(),
+}, axis=1).round(1)
+save_table(cohort, "cohort_summary.csv")
+```
+
+```{python}
+save_table(pd.crosstab(clin["SUBTYPE"].fillna("missing"), clin["split"]), "subtype_counts.csv")
+```
+
+### The outcome
+
+TMB is heavily right-skewed: most tumours carry a few mutations per megabase,
+while a hypermutated minority — mostly microsatellite-unstable (MSI) tumours —
+carry tens to hundreds. The log transform makes the outcome closer to the
+Gaussian model's assumption; the strong link to MSI status is what the model
+should be able to pick up from expression and methylation.
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(15, 3.8))
+axes[0].hist(clin["TMB_NONSYNONYMOUS"], bins=60, color="gray")
+axes[0].set(xlabel="TMB (mutations / Mb)", ylabel="Samples", title="TMB")
+axes[1].hist(clin["log1p_TMB"], bins=40, color="gray")
+axes[1].set(xlabel="log(1 + TMB)", title="Modelled outcome")
+sns.scatterplot(data=clin, x="MSI_SCORE_MANTIS", y="log1p_TMB", hue="MSI_STATUS",
+                s=12, ax=axes[2])
+axes[2].set(xlabel="MSI MANTIS score", ylabel="log(1 + TMB)", title="TMB vs. MSI score")
+plt.tight_layout()
+save_fig(fig, "outcome_distribution.png")
+plt.show()
+```
+
+### The views
+
+Distribution of the selected features' values (training samples) and of their
+variances. Expression is on the log2 scale; methylation is a proportion.
+
+```{python}
+fig, axes = plt.subplots(1, 4, figsize=(17, 3.5))
+for v, (X, name) in enumerate(zip(make_view_list(data, VIEWS, "train"), VIEW_NAMES)):
+    vals = X.numpy()
+    axes[2 * v].hist(vals.ravel()[::7], bins=60, color="gray")
+    axes[2 * v].set(title=f"{name}: values", xlabel="value")
+    axes[2 * v + 1].hist(vals.var(axis=0), bins=60, color="gray")
+    axes[2 * v + 1].set(title=f"{name}: feature variances", xlabel="variance")
+plt.tight_layout()
+save_fig(fig, "view_distributions.png")
+plt.show()
+```
+
+## 2. Processing for the model
+
+`process_data` prepares the views the same way as for every model and
+comparison method: drops all-zero columns, standardises each feature to mean 0
+and sd 1 using training statistics (applied unchanged to the test samples), and
+standardises the outcome the same way. Predictions are transformed back to the
+log(1 + TMB) scale for reporting.
+
+```{python}
+real = lambda split, y: {"X_l": make_view_list(data, VIEWS, split=split), "y": y,
+                         "K": torch.tensor(K), "Z": None}
+train_subset, test_subset, dp = process_data(
+    real("train", data["y"]), real("test", data["y_test"]), model_type="shared")
+y_mean, y_sd = float(data["y"].mean()), float(data["y"].std())
+feature_names = [[g for g, keep in zip(genes, f.tolist()) if keep]
+                 for genes, f in zip(gene_names, dp["X_l_list_column_filters"])]
+print("Model input:", [tuple(x.shape) for x in dp["train_X_l_list_clean"]],
+      "train;", [tuple(x.shape) for x in dp["test_X_l_list_clean"]], "test")
+```
+
+## 3. Training
+
+The model is fitted to the training samples by stochastic variational
+inference, starting from the SVD of the stacked views. Training runs for at
+least `min_epochs` epochs and then stops when the loss has stopped improving
+relative to its noise (`elbo_snr`). `min_epochs = 200` comes from
+`convergence_check.py` (section 3b): with the stopping rule alone the fit stopped
+near epoch 100, while the loss was still falling steeply; by epoch 200 most of
+the decrease is over (a further 9% by epoch 1 600, with no change in test R²). The fitted model is saved to `results/` (see *Saved outputs*).
+
+```{python}
+pyro.clear_param_store()
+pyro.set_rng_seed(SPLIT_SEED)
+factor_model, train_handler, global_state = train_model(
+    MODEL_CONFIG, TRAIN_CONFIG, train_subset, model_out_filename=SAVE_STEM,
+    model_type="shared", verbose=VERBOSE, svd_init=True,
+)
+print(f"Global training: {factor_model.total_epochs} epochs, {global_state['inference_time']:.0f}s")
+
+# Fitted global parameters, read before local inference adds its own parameters.
+L = len(VIEWS)
+psi_hat = [(pyro.param(Params.b_psi_l.format(l=l)) / (pyro.param(Params.a_psi_l.format(l=l)) - 1)).detach()
+           for l in range(L)]
+Z_loc   = pyro.param(Params.loc_Z).detach().double()
+Z_scale = pyro.param(Params.scale_Z).detach().double()
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+axes[0].plot(np.array(factor_model.loss_history[1:]) / n_train)
+axes[0].set(xlabel="Epoch", ylabel="Negative ELBO per sample", title="Training loss")
+axes[1].plot(factor_model.var_param_convergence_history[1:])
+axes[1].set(xlabel="Epoch", ylabel="Mean parameter change", title="Variational parameter change")
+plt.tight_layout()
+save_fig(fig, "training_loss.png")
+plt.show()
+```
+
+### 3b. Is training long enough?
+
+`convergence_check.py` refits this model on the same split with fixed training
+lengths (the stopping rule switched off) and records the training loss, the test
+performance, and how much the fitted signal $\hat Z\hat\Lambda^\top$ changes
+between lengths. With the stopping rule alone the fit stopped near epoch 100,
+while the loss was still falling steeply (23% lower by epoch 200). After 200 the
+gains are small (about 9% more by epoch 1 600), so `min_epochs` is 200 above. Test
+R² hardly changes with training length, so the gap to the penalised regressions
+(section 7) is not a convergence problem; longer training mainly narrows the
+predictive intervals.
+
+```{python}
+conv_path = os.path.join(RESULTS, "convergence_check.csv")
+if os.path.exists(conv_path):
+    conv = pd.read_csv(conv_path)
+    display(conv[["epochs", "final_loss_per_sample", "test_r2", "coverage_95", "width_95",
+                  "active_factors", "signal_change_vs_previous"]].round(3))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
+    for e in conv["epochs"]:
+        curve = pd.read_csv(os.path.join(RESULTS, f"convergence_loss_{e}.csv"))
+        axes[0].plot(curve["epoch"], curve["loss_per_sample"], label=f"{e} epochs", lw=1)
+    axes[0].set(xlabel="Epoch", ylabel="Negative ELBO per sample", yscale="log",
+                title="Training loss for each training length")
+    axes[0].legend(fontsize=8)
+    axes[1].plot(conv["epochs"], conv["test_r2"], marker="o", label="test R²")
+    axes[1].set(xscale="log", xlabel="Training epochs", ylabel="Test R²",
+                title="Test performance vs. training length")
+    ax2 = axes[1].twinx()
+    ax2.plot(conv["epochs"], conv["width_95"], marker="s", color="tab:orange", label="95% interval width")
+    ax2.set_ylabel("95% interval width", color="tab:orange")
+    plt.tight_layout()
+    save_fig(fig, "convergence_check.png")
+    plt.show()
+else:
+    print("Run convergence_check.py to produce this section.")
+```
+
+## 4. Prediction on the test samples
+
+**Local inference.** For the test samples the global parameters are frozen and
+only their factor scores are inferred, from their expression and methylation
+alone; their TMB is never used.
+
+```{python}
+factor_model, test_handler, local_state = train_model_locally(
+    factor_model, TRAIN_CONFIG, test_subset, model_out_filename=SAVE_STEM,
+    model_type="shared", verbose=VERBOSE,
+)
+print(f"Local inference: {factor_model.local_epochs} epochs, {local_state['inference_time']:.0f}s")
+```
+
+**Metrics** (log(1 + TMB) scale): MSE; $R^2 = 1 - \text{SSE}/\text{SST}$ on the
+test samples (0 = no better than the mean, 1 = perfect); and the coverage and
+mean width of the 95% posterior predictive intervals (good intervals cover about
+95% while staying narrow).
+
+```{python}
+post_test = test_handler.predict(dp["test_X_l_list_clean"], N_POSTERIOR_SAMPLES, [Sites.y_pred])
+pred = summarise_post_samples(post_test[Sites.y_pred].squeeze().cpu() * y_sd + y_mean)
+y_true = data["y_test"].reshape(-1)
+resid = pred["mean"] - y_true
+test_metrics = pd.Series({
+    "MSE":             float((resid ** 2).mean()),
+    "R2":              float(1 - (resid ** 2).sum() / ((y_true - y_true.mean()) ** 2).sum()),
+    "coverage_95":     float(((y_true >= pred["q2.5"]) & (y_true <= pred["q97.5"])).float().mean()),
+    "width_95":        float((pred["q97.5"] - pred["q2.5"]).mean()),
+    "global_epochs":   factor_model.total_epochs,
+    "global_runtime_s": global_state["inference_time"],
+    "local_runtime_s": local_state["inference_time"],
+}, name="value")
+save_table(test_metrics.round(4).to_frame(), "test_metrics.csv")
+```
+
+```{python}
+predictions = pd.DataFrame({
+    "sample_id": data["sample_ids_test"], "y_true": y_true.numpy(),
+    "y_pred": pred["mean"].numpy(), "q2.5": pred["q2.5"].numpy(), "q97.5": pred["q97.5"].numpy(),
+}).set_index("sample_id").join(clin[["MSI_STATUS", "SUBTYPE"]])
+save_table(predictions, "test_predictions.csv")
+
+fig, ax = plt.subplots(figsize=(5.5, 5))
+colours = {"stable": "tab:blue", "indeterminate": "tab:gray", "MSI": "tab:red"}
+for status, grp in predictions.groupby("MSI_STATUS", observed=True):
+    ax.errorbar(grp["y_true"], grp["y_pred"],
+                yerr=[grp["y_pred"] - grp["q2.5"], grp["q97.5"] - grp["y_pred"]],
+                fmt="o", ms=3, elinewidth=0.4, alpha=0.6, color=colours.get(status, "black"),
+                label=status)
+lims = [predictions[["y_true", "q2.5"]].min().min(), predictions[["y_true", "q97.5"]].max().max()]
+ax.plot(lims, lims, "k--", lw=1)
+ax.set(xlabel="Observed log(1 + TMB)", ylabel="Predicted (95% interval)",
+       title=f"Test samples: R² = {test_metrics['R2']:.2f}")
+ax.legend(title="MSI status")
+plt.tight_layout()
+save_fig(fig, "test_predictions.png")
+plt.show()
+```
+
+## 5. How strong is the TMB signal in the data?
+
+For a direction in factor space, its **strength** is its signal summed over all
+$P$ features relative to the noise (eigenvalues of
+$M = \sum_l \Lambda^{(l)\top}\Psi^{(l)-1}\Lambda^{(l)}$, measured on the scale of
+the fitted signal). A direction stronger than $\sqrt{P/n}$ stands out in the
+data even without the outcome, so unsupervised methods can find it; a strength
+above about 1 is needed to infer a new sample's score from its features. The
+red line is the strength along the direction the model uses to predict TMB.
+(This estimate was checked against simulations with known truth, where it was
+within about 30%.)
+
+```{python}
+Lambda_fit = [pyro.param(Params.loc_Lambda_l.format(l=l)).detach().squeeze() for l in range(L)]
+beta_fit = pyro.param(Params.loc_beta).detach().reshape(-1)
+Z_second_moment = Z_loc.T @ Z_loc / n_train + torch.diag((Z_scale ** 2).mean(0))
+strength = factor_strength(Lambda_fit, psi_hat, beta_fit, Z_second_moment=Z_second_moment)
+P = sum(x.shape[1] for x in dp["train_X_l_list_clean"])
+threshold = np.sqrt(P / n_train)
+
+save_table(pd.Series({
+    "outcome_direction_strength": strength["outcome_strength"],
+    "detection_threshold_sqrt_P_over_n": threshold,
+    "ratio": strength["outcome_strength"] / threshold,
+    "directions_above_threshold": int((strength["eigenvalues"] > threshold).sum()),
+}, name="value").round(2).to_frame(), "factor_strength_summary.csv")
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.bar(np.arange(1, K + 1), strength["eigenvalues"], color="lightgray", label="factor directions")
+ax.axhline(strength["outcome_strength"], color="tab:red",
+           label=f"TMB-predictive direction ({strength['outcome_strength']:.0f})")
+ax.axhline(threshold, color="black", ls="--", label=f"detection threshold √(P/n) = {threshold:.1f}")
+ax.axhline(1, color="black", ls=":", label="prediction threshold (1)")
+ax.set(yscale="log", xlabel="Factor direction (by strength)", ylabel="Strength",
+       title="Factor strength relative to the noise")
+ax.legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "factor_strength.png")
+plt.show()
+```
+
+## 6. Factor interpretation
+
+Interpretation uses the posterior means of the training samples' scores
+$\hat Z$, the loadings $\hat\Lambda^{(l)}$ and the outcome effects
+$\hat{\boldsymbol\beta}$. Factors are rotated with multiview varimax (one rotation
+for both views, each view weighted equally) so each factor loads strongly on a
+few genes; predictions are unchanged by the rotation. Factor numbers below refer
+to the rotated factors.
+
+```{python}
+sites = [Sites.Z, Sites.beta] + [Sites.Lambda_l.format(l=l) for l in range(L)]
+post_train = train_handler.predict(dp["train_X_l_list_clean"], N_POSTERIOR_SAMPLES, sites)
+post_train = {k: v.cpu() for k, v in post_train.items()}
+Z_hat      = post_train[Sites.Z].mean(0)
+Lambda_hat = [post_train[Sites.Lambda_l.format(l=l)].mean(0).squeeze() for l in range(L)]
+beta_hat   = post_train[Sites.beta].mean(0).squeeze()
+y_train    = dp["train_y_clean"].squeeze()
+```
+
+### Factor summary
+
+Each row is a rotated factor, sorted by the share of the data it explains.
+`PVE(data)` is the share of all the data's variance; `β` and its 95% interval
+give the factor's effect on standardised log(1 + TMB) (`*` = interval excludes
+zero); `β-R²(y)` is the share of the outcome's variance the factor explains.
+Column definitions are in `sim/python_integration.qmd`.
+
+```{python}
+factor_summary = summarize_factors(
+    X_list=dp["train_X_l_list_clean"], Z=Z_hat, Lambda_list=Lambda_hat,
+    beta=beta_hat, y=y_train, beta_samples=post_train[Sites.beta],
+    view_names=VIEW_NAMES, plot=True, verbose=True, show="post",
+)
+per_factor = factor_summary["post"]["per_factor"].copy()
+save_table(per_factor.round(4), "factor_summary.csv", index=False)
+active = per_factor.loc[per_factor["pve_data"] > 0.01, "factor"].tolist()     # 1-based
+by_outcome = per_factor.sort_values("beta_r2_y", ascending=False)["factor"].tolist()
+print(f"{len(active)} factors explain more than 1% of the data:", active)
+print("Factors ranked by outcome variance explained:", by_outcome[:6])
+```
+
+### Loadings
+
+Rotated loadings for each view: rows are genes, ordered by the factor they load
+on most strongly; each factor's genes form a block. Saved as `loadings.png`.
+
+```{python}
+_ = plot_factor_loadings(Lambda_hat, view_names=VIEW_NAMES, rotate=True, sort_features=True,
+                         title="Rotated loadings", save_path=os.path.join(FIGURES, "loadings.png"))
+```
+
+### Genes within each factor
+
+For the factors most associated with TMB, the genes with the largest rotated
+loadings in either view, coloured by view. A factor that combines expression and
+methylation genes describes a coordinated expression–methylation programme.
+Saved as `factor_genes.png`; the full lists are in `top_genes_<view>.csv`.
+
+```{python}
+top_outcome = [k - 1 for k in by_outcome[:6]]
+factor_genes = plot_factor_features(
+    Lambda_hat, factors=top_outcome, n_top_features=15, view_names=VIEW_NAMES,
+    feature_names_list=feature_names, rotate=True,
+    title="Top genes in the factors most associated with TMB",
+    save_path=os.path.join(FIGURES, "factor_genes.png"),
+)
+save_table(factor_genes, "factor_genes_top_outcome_factors.csv", index=False)
+
+for name, tbl in zip(VIEW_NAMES, tabulate_top_features(Lambda_hat, feature_names_list=feature_names,
+                                                        n_top_factors=len(active), n_top_features=20,
+                                                        rotate=True)):
+    save_table(tbl, f"top_genes_{name.split()[0].lower()}.csv")
+```
+
+### Factor scores and TMB
+
+Training samples ordered by each factor's score, with their log(1 + TMB). A
+trend means the factor tracks TMB. Saved as `scores_vs_tmb.png`.
+
+```{python}
+plot_factor_outcome(
+    factor_summary["Z_rot"], data["y"].numpy(), top_factors=top_outcome, n_factors_show=6,
+    outcome_label="log(1 + TMB)", title="log(1 + TMB) along each factor's scores",
+    factor_summary=factor_summary, save_path=os.path.join(FIGURES, "scores_vs_tmb.png"),
+)
+```
+
+### What the factors capture: association with clinical variables
+
+To see what each active factor represents, its (rotated) training scores are
+compared with clinical variables the model never saw: Spearman correlation for
+numeric variables, and the share of score variance explained by group
+membership ($\eta^2$ from one-way ANOVA) for categorical ones. A factor strongly
+tied to tissue source site, for example, would point to a batch effect rather
+than biology. Saved as `clinical_associations.csv` and `.png`.
+
+```{python}
+scores = pd.DataFrame(factor_summary["Z_rot"], index=data["sample_ids_train"],
+                      columns=[f"F{k}" for k in range(1, K + 1)])[[f"F{k}" for k in active]]
+clin_train = clin.loc[data["sample_ids_train"]]
+
+def eta_squared(score, groups):
+    ok = groups.notna()
+    s, g = score[ok], groups[ok]
+    return float(((s.groupby(g).transform("mean") - s.mean()) ** 2).sum() / ((s - s.mean()) ** 2).sum())
+
+numeric = {"log(1+TMB)": clin_train["log1p_TMB"], "MSI score": clin_train["MSI_SCORE_MANTIS"],
+           "aneuploidy": clin_train["ANEUPLOIDY_SCORE"], "age": clin_train["AGE"]}
+categorical = {"subtype": clin_train["SUBTYPE"], "colon vs rectum": clin_train["SITE"],
+               "source site": clin_train["TISSUE_SOURCE_SITE_CODE"], "sex": clin_train["SEX"]}
+assoc = pd.DataFrame({
+    **{f"ρ {k}": [spearmanr(scores[f], v, nan_policy="omit")[0] for f in scores] for k, v in numeric.items()},
+    **{f"η² {k}": [eta_squared(scores[f], v) for f in scores] for k, v in categorical.items()},
+}, index=scores.columns)
+save_table(assoc.round(3), "clinical_associations.csv")
+
+fig, ax = plt.subplots(figsize=(10, 0.45 * len(assoc) + 1.5))
+sns.heatmap(assoc, annot=True, fmt=".2f", cmap="RdBu_r", center=0, vmin=-1, vmax=1,
+            cbar_kws={"label": "ρ (numeric) / η² (categorical)"}, ax=ax)
+ax.set(title="Rotated factor scores vs. clinical variables (training samples)")
+plt.tight_layout()
+save_fig(fig, "clinical_associations.png")
+plt.show()
+```
+
+The factor most associated with TMB, by molecular subtype and MSI status
+(saved as `top_factor_by_subtype.png`):
+
+```{python}
+f_top = f"F{by_outcome[0]}"
+plot_df = clin_train.assign(score=scores[f_top] if f_top in scores else factor_summary["Z_rot"][:, by_outcome[0] - 1])
+fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
+sns.boxplot(data=plot_df, x="SUBTYPE", y="score", ax=axes[0], color="lightgray")
+axes[0].set(xlabel="", ylabel=f"{f_top} score", title=f"{f_top} by molecular subtype")
+axes[0].tick_params(axis="x", rotation=30)
+sns.scatterplot(data=plot_df, x="score", y="log1p_TMB", hue="MSI_STATUS", s=12, ax=axes[1])
+axes[1].set(xlabel=f"{f_top} score", ylabel="log(1 + TMB)", title=f"{f_top} vs. TMB")
+plt.tight_layout()
+save_fig(fig, "top_factor_by_subtype.png")
+plt.show()
+```
+
+## 7. Comparison with other methods
+
+`compare_methods.py` fits every method to the same five random 80/20 splits
+(split 1 is the split used above), with the same genes and standardisation:
+
+| Method | Description |
+|---|---|
+| `shared` | this model |
+| `mofa` | MOFA2 (unsupervised, $K = 20$) + OLS of TMB on its factors |
+| `pca_ols` | PCA of the stacked views ($K = 20$) + OLS |
+| `ridge` | ridge regression on all genes, penalty by 5-fold CV |
+| `elastic_net` | elastic net on all genes, penalty and mix by 5-fold CV |
+| `mean` | the training mean (R² ≈ 0 reference) |
+
+Re-run with `python analysis/tcga_coadread/compare_methods.py` (about 40
+minutes; it resumes where it stopped).
+
+```{python}
+comp_path = os.path.join(RESULTS, "method_comparison_splits.csv")
+if os.path.exists(comp_path):
+    comp = pd.read_csv(comp_path)
+    order = ["shared", "mofa", "pca_ols", "ridge", "elastic_net", "mean"]
+    summary = (comp.groupby("method")[["r2", "mse", "coverage_95", "width_95", "test_rse", "runtime"]]
+                   .agg(["mean", "std"]).reindex([m for m in order if m in set(comp["method"])]))
+    print(f"{comp['seed'].nunique()} splits")
+    display(save_table(summary.round(3), "method_comparison_summary.csv"))
+else:
+    comp = None
+    print("No comparison results yet: run compare_methods.py")
+```
+
+```{python}
+if comp is not None:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
+    sns.pointplot(data=comp, x="method", y="r2", order=[m for m in order if m in set(comp["method"])],
+                  errorbar="se", join=False, color="black", ax=axes[0])
+    sns.stripplot(data=comp, x="method", y="r2", order=[m for m in order if m in set(comp["method"])],
+                  hue="seed", palette="tab10", size=5, ax=axes[0], legend=False)
+    axes[0].set(xlabel="", ylabel="Test R²", title="Test R² per split (mean ± SE)")
+    paired = comp.pivot(index="seed", columns="method", values="r2")
+    if "shared" in paired:
+        diffs = paired.drop(columns="shared").sub(paired["shared"], axis=0).mul(-1)
+        sns.stripplot(data=diffs.melt(var_name="method", value_name="d"), x="method", y="d", ax=axes[1])
+        axes[1].axhline(0, color="black", lw=0.8)
+        axes[1].set(xlabel="", ylabel="R²(shared) − R²(method)",
+                    title="Shared model minus each method, per split (> 0: shared better)")
+    plt.tight_layout()
+    save_fig(fig, "method_comparison.png")
+    plt.show()
+```
+
+### 7b. Comparing the factors
+
+Since the factor model's value here is interpretation rather than prediction,
+this section compares the **factors** of the three factor methods — the shared
+model, MOFA and PCA, each with 20 factors — fitted in `compare_methods.py`. Every
+method's loadings get the same post-processing (multiview varimax rotation,
+scores rotated with them), so differences come from the fits. Unless stated,
+results are for split 1 (the split used above); stability uses all five splits.
+
+| Measure | Question | Better |
+|---|---|---|
+| Outcome concentration | Is TMB carried by one or two factors, or spread over many? Share of the factors' outcome R² in the top factor, and number of factors needed for 80% of it | concentrated: easier to interpret |
+| Clinical alignment | For each clinical variable, the strongest association among a method's active factors (Spearman $|\rho|$ or $\eta^2$) | higher, except source site (a batch proxy) |
+| Multiview coupling | Number of active factors with at least 20% of their loading energy in each view | depends on the biology; shows whether factors combine views |
+| Loading concentration | Share of a factor's loading energy in its top 5% of genes, averaged over active factors | higher: fewer genes to read |
+| Stability | For each active factor, the best correlation of its loadings with a factor refitted on another split (genes matched by name), averaged | higher: reproducible |
+
+"Active" factors explain more than 1% of the data's variance. Factor numbers in
+this section come from rotating each method's saved loadings and need not match
+the numbering of section 6.
+
+```{python}
+from factor_interpretation import _rotate_loadings
+
+FACTOR_METHODS = ["shared", "mofa", "pca_ols"]
+METHOD_LABEL = {"shared": "shared model", "mofa": "MOFA", "pca_ols": "PCA"}
+SEEDS = sorted(int(d.replace("seed", "")) for d in os.listdir(os.path.join(RESULTS, "splits")))
+split_dir = lambda seed: os.path.join(RESULTS, "splits", f"seed{seed}")
+
+def load_factors(method, seed):
+    """Rotated factors of one method on one split, plus genes and training samples."""
+    f = np.load(os.path.join(split_dir(seed), f"{method}_factors.npz"))
+    loadings = [f[f"loadings_view{l}"] for l in range(L)]
+    rotated, R = _rotate_loadings(loadings)
+    Z = f["Z_train"] @ R
+    beta = R.T @ f["beta"]
+    genes = [open(os.path.join(split_dir(seed), f"genes_view{l}.txt")).read().split("\n") for l in range(L)]
+    samples = open(os.path.join(split_dir(seed), "train_samples.txt")).read().split("\n")
+    n, P_ = Z.shape[0], sum(len(g) for g in genes)
+    energy = np.sum(Z ** 2, 0) * sum(np.sum(Lv ** 2, 0) for Lv in rotated)
+    return {"loadings": rotated, "Z": Z, "beta": beta, "genes": genes, "samples": samples,
+            "active": np.where(energy / (n * P_) > 0.01)[0]}
+
+have_factors = all(os.path.exists(os.path.join(split_dir(sd), f"{m}_factors.npz"))
+                   for m in FACTOR_METHODS for sd in SEEDS)
+print("Factor outputs for all methods and splits:", have_factors)
+```
+
+```{python}
+def factor_measures(fac, y_train, clin_train):
+    Z, act, loadings = fac["Z"], fac["active"], fac["loadings"]
+    # beta is on the standardised outcome scale, so divide by that scale's sum of squares
+    y_std = (y_train - y_train.mean()) / y_train.std(ddof=1)
+    r2 = fac["beta"] ** 2 * np.sum(Z ** 2, 0) / np.sum(y_std ** 2)    # outcome R² per factor
+    r2s = np.sort(r2)[::-1]
+    view_energy = np.array([np.sum(Lv ** 2, 0) for Lv in loadings])   # (L, K)
+    view_share = view_energy / view_energy.sum(0)
+    stacked = np.vstack(loadings)
+    top = max(1, int(0.05 * stacked.shape[0]))
+    conc = np.sort(stacked ** 2, 0)[::-1][:top].sum(0) / (stacked ** 2).sum(0)
+    out = {
+        "active factors": len(act),
+        "outcome R² (all factors)": r2.sum(),
+        "top factor share of outcome R²": r2s[0] / r2s.sum(),
+        "factors for 80% of outcome R²": int(np.searchsorted(np.cumsum(r2s) / r2s.sum(), 0.8) + 1),
+        "factors using both views": int(np.sum((view_share[:, act] >= 0.2).all(0))),
+        "loading concentration (top 5% genes)": conc[act].mean(),
+    }
+    scores = pd.DataFrame(Z[:, act], index=fac["samples"])
+    for name, col in [("MSI score", "MSI_SCORE_MANTIS"), ("aneuploidy", "ANEUPLOIDY_SCORE"), ("age", "AGE")]:
+        out[f"max |ρ| {name}"] = max(abs(spearmanr(scores[k], clin_train[col], nan_policy="omit")[0]) for k in scores)
+    for name, col in [("subtype", "SUBTYPE"), ("colon vs rectum", "SITE"), ("source site (batch)", "TISSUE_SOURCE_SITE_CODE")]:
+        out[f"max η² {name}"] = max(eta_squared(scores[k], clin_train[col]) for k in scores)
+    return out
+
+if have_factors:
+    rows = []
+    for seed in SEEDS:
+        for m in FACTOR_METHODS:
+            fac = load_factors(m, seed)
+            ct = clin.loc[fac["samples"]]
+            y_tr = ct["log1p_TMB"].values
+            rows.append({"seed": seed, "method": METHOD_LABEL[m], **factor_measures(fac, y_tr, ct)})
+    factor_comp = pd.DataFrame(rows)
+    save_table(factor_comp.round(4), "factor_comparison_per_split.csv", index=False)
+    display(save_table(factor_comp.drop(columns="seed").groupby("method").agg(["mean", "std"]).T.round(3),
+                       "factor_comparison_summary.csv"))
+```
+
+**Stability across splits.** Each split selects its genes on its own training
+samples, so loadings are compared on the genes two splits share. For each active
+factor of split 1, the best absolute correlation with any factor of the other
+split is recorded; the figure shows these over the four other splits.
+
+```{python}
+def best_match(fac_a, fac_b, factors_a):
+    """Best |correlation| of each of fac_a's factors with any of fac_b's, on shared genes."""
+    va, vb = [], []
+    for l in range(L):
+        common = sorted(set(fac_a["genes"][l]) & set(fac_b["genes"][l]))
+        ia = {g: i for i, g in enumerate(fac_a["genes"][l])}
+        ib = {g: i for i, g in enumerate(fac_b["genes"][l])}
+        va.append(fac_a["loadings"][l][[ia[g] for g in common]])
+        vb.append(fac_b["loadings"][l][[ib[g] for g in common]])
+    A, B = np.vstack(va), np.vstack(vb)
+    A = (A - A.mean(0)) / A.std(0); B = (B - B.mean(0)) / B.std(0)
+    C = np.abs(A.T @ B) / A.shape[0]
+    return C[factors_a].max(1)
+
+if have_factors:
+    stab = []
+    for m in FACTOR_METHODS:
+        ref = load_factors(m, SPLIT_SEED)
+        y_ref = clin.loc[ref["samples"], "log1p_TMB"].values
+        r2_ref = ref["beta"] ** 2 * np.sum(ref["Z"] ** 2, 0)
+        top_outcome_factor = int(np.argmax(r2_ref))
+        for seed in [sd for sd in SEEDS if sd != SPLIT_SEED]:
+            other = load_factors(m, seed)
+            for k, c in zip(ref["active"], best_match(ref, other, ref["active"])):
+                stab.append({"method": METHOD_LABEL[m], "seed": seed, "factor": k + 1, "best |corr|": c,
+                             "top outcome factor": k == top_outcome_factor})
+    stab = pd.DataFrame(stab)
+    save_table(stab, "factor_stability.csv", index=False)
+    display(stab.groupby("method").agg(**{
+        "mean best |corr|, active factors": ("best |corr|", "mean"),
+        "top outcome factor": ("best |corr|", lambda s: s[stab.loc[s.index, "top outcome factor"]].mean()),
+    }).round(3))
+
+    fig, ax = plt.subplots(figsize=(7, 3.6))
+    sns.boxplot(data=stab, x="method", y="best |corr|", color="lightgray", ax=ax)
+    sns.stripplot(data=stab[stab["top outcome factor"]], x="method", y="best |corr|",
+                  color="tab:red", size=6, ax=ax, label="top outcome factor")
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles[:1], labels[:1], loc="lower left")
+    ax.set(xlabel="", ylabel="Best |correlation| with a refit",
+           title="Factor stability across train/test splits")
+    plt.tight_layout()
+    save_fig(fig, "factor_stability.png")
+    plt.show()
+```
+
+**Do the methods find the same factors?** Correlation of the training scores of
+the shared model's active factors with each other method's active factors
+(split 1, same samples). A row with a high value means that factor has a
+counterpart in the other method.
+
+```{python}
+if have_factors:
+    ref = load_factors("shared", SPLIT_SEED)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 0.4 * len(ref["active"]) + 2))
+    for ax, m in zip(axes, ["mofa", "pca_ols"]):
+        other = load_factors(m, SPLIT_SEED)
+        C = np.abs(np.corrcoef(ref["Z"][:, ref["active"]].T, other["Z"][:, other["active"]].T)
+                   [:len(ref["active"]), len(ref["active"]):])
+        sns.heatmap(pd.DataFrame(C, index=[f"F{k + 1}" for k in ref["active"]],
+                                 columns=[f"{METHOD_LABEL[m]} {k + 1}" for k in other["active"]]),
+                    vmin=0, vmax=1, cmap="viridis", ax=ax, cbar=ax is axes[-1])
+        ax.set(title=f"shared model vs. {METHOD_LABEL[m]} (|corr| of scores)", ylabel="shared model factor")
+    plt.tight_layout()
+    save_fig(fig, "factor_correspondence.png")
+    plt.show()
+```
+
+### 7c. Do the methods find the same factors?
+
+Stability (above) compares a method with itself. Here the shared model's
+factors are compared with MOFA's and PCA's on the same training samples, in
+three ways that do not depend on how factors happen to be rotated or ordered:
+
+- **Subspaces:** canonical correlations between the spaces spanned by each
+  method's active training scores. Values near 1 mean the same variation is
+  captured, however it is divided into factors.
+- **Individual factors:** for each shared-model factor (after the same varimax
+  rotation for every method), its best absolute correlation with a factor of the
+  other method.
+- **The outcome direction:** correlation of the methods' fitted outcome
+  predictions $\hat Z\hat{\boldsymbol\beta}$ on the training samples, and of their
+  test predictions.
+
+```{python}
+def cancor(A, B):
+    """Canonical correlations between the column spaces of A and B."""
+    Qa, _ = np.linalg.qr(A - A.mean(0)); Qb, _ = np.linalg.qr(B - B.mean(0))
+    return np.linalg.svd(Qa.T @ Qb, compute_uv=False)
+
+if have_factors:
+    rows = []
+    for seed in SEEDS:
+        sh = load_factors("shared", seed)
+        for m in ["mofa", "pca_ols"]:
+            ot = load_factors(m, seed)
+            cc = cancor(sh["Z"][:, sh["active"]], ot["Z"][:, ot["active"]])
+            C = np.abs(np.corrcoef(sh["Z"][:, sh["active"]].T, ot["Z"][:, ot["active"]].T)
+                       [:len(sh["active"]), len(sh["active"]):])
+            rows.append({
+                "seed": seed, "compared with": METHOD_LABEL[m],
+                "active factors (shared, other)": f"{len(sh['active'])}, {len(ot['active'])}",
+                "canonical corr > 0.9": int((cc > 0.9).sum()),
+                "median best factor |r|": np.median(C.max(1)),
+                "factors matched > 0.9": int((C.max(1) > 0.9).sum()),
+                "corr of fitted Zβ": np.corrcoef(sh["Z"] @ sh["beta"], ot["Z"] @ ot["beta"])[0, 1],
+            })
+    display(save_table(pd.DataFrame(rows).round(3), "factor_correspondence.csv", index=False))
+
+    tp = pd.read_csv(os.path.join(RESULTS, "method_predictions.csv"))
+    tp = tp[tp["seed"] == SPLIT_SEED].pivot(index="sample_id", columns="method", values="y_pred")
+    print("Correlation of test predictions (split 1):")
+    display(save_table(tp[["shared", "mofa", "pca_ols", "ridge", "elastic_net"]].corr().round(3),
+                       "test_prediction_correlations.csv"))
+```
+
+On this data the three factor methods recover essentially the same decomposition:
+the shared model's factor space lies almost entirely within PCA's and matches
+MOFA's factor by factor, and their predictions correlate about 0.99. With
+`outcome_weight = 1` the outcome does not move the factors away from the
+dominant structure of the views.
+
+### 7d. Where is the predictive signal that the factor models miss?
+
+All factor methods reach the same R², below ridge. Two checks locate the gap:
+how PCA + OLS performs as the number of components grows, and whether the part
+of ridge's test prediction lying outside the shared model's factor space
+predicts the part of TMB outside it. (Computed on the five splits'
+preprocessed matrices; saved as `pca_components_vs_r2.csv`.)
+
+```{python}
+pc_path = os.path.join(RESULTS, "pca_components_vs_r2.csv")
+if os.path.exists(pc_path):
+    pc = pd.read_csv(pc_path, index_col=0)
+    display(pc.round(3))
+    comp_cols = [c for c in pc.columns if c.startswith("PCA+OLS")]
+    ks = [int(c.split("=")[1]) for c in comp_cols]
+    fig, ax = plt.subplots(figsize=(6.5, 3.6))
+    ax.errorbar(ks, pc[comp_cols].mean(), yerr=pc[comp_cols].std() / np.sqrt(len(pc)),
+                marker="o", label="PCA + OLS")
+    ax.axhline(pc["ridge"].mean(), color="tab:red", ls="--", label="ridge")
+    ax.axhline(pc["shared (K=20)"].mean(), color="tab:green", ls=":", label="shared model (K = 20)")
+    ax.set(xscale="log", xlabel="Number of principal components", ylabel="Test R² (mean ± SE)",
+           title="Prediction vs. number of components")
+    ax.legend()
+    plt.tight_layout()
+    save_fig(fig, "pca_components_vs_r2.png")
+    plt.show()
+```
+
+PCA + OLS approaches ridge only with about 150–300 components, and ridge's
+out-of-factor-space prediction correlates about 0.6 with the out-of-space part
+of TMB. So TMB's predictive information is spread over many weak directions
+beyond the dominant ~20: the factor models' shortfall is the number of factors
+they keep, not convergence or the choice of coefficients within their factor
+space. A model could capture more of it with more factors — but the shrinkage
+prior prunes factors that explain little of the views, which is where a larger
+outcome weight could let the outcome decide which weak factors to keep.
+
+## 8. Summary of findings
+
+Numbers refer to the October 2026 run (split seed 42, `min_epochs = 200`;
+comparisons over five splits). Gene-level readings are interpretations of the
+loadings and should be checked against the literature and, where possible,
+gene-set analysis.
+
+**Prediction.** On the held-out samples the shared model explains about 44% of
+the variance in log(1 + TMB) (five-split mean 0.44), with 95% intervals covering
+about 92–93% of test samples. Training longer than 200 epochs lowers the loss
+further but does not change test R² (section 3b).
+
+**The TMB signal is strong in the data.** The direction the model uses to
+predict TMB stands out from the noise far more (well over 100×) than the
+threshold at which an unsupervised method could find it, so the outcome-related
+variation is not hidden in these views (`docs/supervision_regimes.md`).
+
+**What the factors capture** (rotated factors; clinical association heatmap and
+gene panels):
+
+- **F3**, the factor most associated with TMB (about 20% of the outcome's
+  variance), is promoter hypermethylation across many genes (e.g. WNT3, MCC,
+  NRG2, PTGER3); its scores rise with TMB and the MSI score, fall with
+  aneuploidy, and differ strongly by molecular subtype — consistent with the CpG
+  island methylator phenotype that accompanies microsatellite instability.
+- **F1**, the second most TMB-associated factor (negative effect), is promoter
+  methylation of intestinal and metabolic genes (e.g. XDH, PCK1, HSD17B2, with
+  negative loadings); its scores fall with the MSI score. It is also associated
+  with tissue source site (η² 0.27), so part of it may be batch.
+- **F10** is expression of chromosome 20q genes (e.g. EIF6, RALY, HM13) and
+  tracks aneuploidy — consistent with 20q copy-number gain in chromosomally
+  unstable tumours, which tend to have low TMB.
+- **F18** is interferon-γ / antigen-presentation expression (CXCL9, TAP2, HLA
+  class II) — consistent with the immune infiltration of hypermutated tumours.
+- **F12** (AGR2, TFF3, XBP1) suggests secretory/mucinous differentiation, **F5**
+  (GPA33, TSPAN1, DHRS9) intestinal epithelial differentiation, and **F8** is
+  almost entirely explained by sex.
+- **F17** is the factor most associated with tissue source site (η² 0.42) and has
+  no coherent gene programme among its top genes: likely a batch effect.
+
+**Comparison of predictions.** Ridge (R² 0.63) and elastic net (0.59) predict TMB
+clearly better than every factor method; the shared model (0.44) performs like
+the unsupervised PCA + OLS (0.45) and MOFA + OLS (0.43). With
+`outcome_weight = 1` the outcome contributes one likelihood term per sample
+against 3 000 feature terms, so the factors are driven almost entirely by the
+views' variance, as in unsupervised methods; and summarising 3 000 features in
+20 factors discards predictive detail that a penalised regression keeps.
+
+**Comparison of factors** (sections 7b–7c). The three factor methods recover
+essentially the same factors (subspace canonical correlations above 0.9; factor
+matches with MOFA |r| ≈ 0.98; predictions correlate 0.99). The shared model's
+factors are about as interpretable and reproducible as MOFA's, with no clear
+advantage:
+
+- **Stability:** shared model and MOFA factors reappear almost exactly when
+  refitted on other splits (mean best correlation 0.94; 0.98 for the main TMB
+  factor); PCA's are less stable (0.84; 0.75 for its main TMB factor).
+- **Outcome concentration:** the shared model puts slightly more of TMB into
+  its top factor (48% of the factors' outcome R², vs 34% for MOFA) and needs
+  fewer factors for 80% of it (4.4 vs 5.4); PCA is similar on average but varies
+  much more between splits.
+- **Clinical alignment:** all three find factors related to MSI, aneuploidy and
+  subtype; PCA's best matches are slightly stronger, and the shared model's and
+  MOFA's are similar. The strongest association with tissue source site is the
+  same for the shared model and MOFA (η² 0.32) and higher for PCA (0.38).
+
+So on this data the supervised model behaves much like MOFA, which is expected
+when the outcome has almost no weight in the fit.
+
+**Where the gap to ridge comes from** (section 7d). PCA + OLS reaches ridge's R²
+only with about 150–300 components: TMB's predictive information is spread over
+many weak directions beyond the ~20 that the factor models keep. Closing the gap
+needs more factors, and — because the shrinkage prior prunes factors that
+explain little of the views — probably a larger outcome weight so the outcome
+can keep the weak predictive ones. A cross-validated sweep over the outcome
+weight and the number of factors is the natural next experiment.
+
+## Saved outputs
+
+```{python}
+for folder in (RESULTS, FIGURES):
+    print(os.path.relpath(folder, HERE) + "/")
+    for f in sorted(os.listdir(folder)):
+        if os.path.isfile(os.path.join(folder, f)):
+            print("   ", f)
+```
