@@ -1,20 +1,80 @@
 ---
 title: "SupMultiviewShared — single-condition pipeline"
 jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
 ---
 
-Runs the full pipeline for the shared-factor multiview model on one simulated
-dataset: load → process → train → local inference → prediction → evaluation →
-factor interpretation. Every step goes through the helpers in
-`python/run_methods.py` (with `model_type="shared"`) and
-`python/factor_interpretation.py`.
+This notebook runs the full analysis pipeline for the **multiview shared-factor
+model** (`SupMultiviewShared`) on one simulated dataset, and explains each step
+and its output. Every step calls the shared helpers in `python/run_methods.py`
+(with `model_type="shared"`) and `python/factor_interpretation.py`, so the same
+code runs here, in the simulation sweeps, and in the single-view notebook.
 
-- Sweeps over replicates and scenarios: `python/sim_run_shared_parallel.py`,
-  `python/outcome_weight_sweep.py`
-- Experiments (outcome weight, convergence/initialisation, CV/Optuna, PVE
-  diagnostics): `sim/exploration/`
-- The previous version of this notebook (including the SupMultiviewDecomp
-  sections): `sim/archive/python_integration_2026-06.qmd`
+| Where | What |
+|---|---|
+| `sim/python_factorization.qmd` | the same pipeline for the single-view model |
+| `sim/python_viper.qmd` | the same pipeline for VIPER (shared + view-specific factors) |
+| `python/sim_run_shared_parallel.py`, `python/outcome_weight_sweep.py` | this pipeline over many replicates and scenarios |
+| `sim/exploration/` | focused experiments (outcome weight, stopping rules, CV/Optuna, diagnostics) |
+| `sim/archive/python_integration_2026-06.qmd` | the previous version of this notebook |
+
+## The model
+
+Notation follows the methods document (`docs/main(1).tex`). Each observation
+$i = 1, \dots, n$ is measured in $L$ data views (e.g. omics layers), with $p_l$
+features $\mathbf{x}_i^{(l)} \in \mathbb{R}^{p_l}$ in view $l$ (stacked over
+observations, $X^{(l)} \in \mathbb{R}^{n \times p_l}$), plus a continuous outcome $y_i$:
+
+$$
+\mathbf{x}_i^{(l)} = \Lambda^{(l)} \mathbf{z}_i + \boldsymbol\epsilon_i^{(l)}, \qquad
+\boldsymbol\epsilon_i^{(l)} \sim N_{p_l}\big(0, \Psi^{(l)}\big), \qquad l = 1, \dots, L,
+$$
+$$
+y_i = \boldsymbol\beta^\top \mathbf{z}_i + e_i, \qquad e_i \sim N(0, \sigma_y^2),
+$$
+
+with $\Psi^{(l)} = \operatorname{diag}(\psi^{(l)}_1, \dots, \psi^{(l)}_{p_l})$. The
+$K$ factor scores $\mathbf{z}_i \sim N_K(0, I)$ (stacked, $Z \in \mathbb{R}^{n \times K}$)
+are **shared** by every view and by the outcome; each view has its own joint
+loadings $\Lambda^{(l)}$ ($p_l \times K$). A factor therefore describes variation
+common to the views, and because $y$ also depends on $\mathbf{z}_i$, the factors are
+pulled toward directions that predict the outcome. The shared signal in view $l$
+is $J^{(l)} = Z\Lambda^{(l)\top}$.
+
+This is the methods document's model without the view-specific term
+$\Gamma^{(l)}\boldsymbol\phi_i^{(l)}$ (VIPER, `sim/python_viper.qmd`, includes it).
+The view means $\boldsymbol\mu^{(l)}$ and the intercept $\beta_0$ are not fitted:
+every feature and the outcome are centred (and scaled) first, so they are 0.
+
+The joint loadings have the **multiplicative gamma process (MGP)** prior,
+$\Lambda^{(l)}_{jk} \sim N\big(0, \rho^{(l)-1}_{jk}\tau^{(l)-1}_{k}\big)$ with
+$\tau^{(l)}_k = \prod_{m=1}^{k}\delta^{(l)}_m$: each successive factor is shrunk
+more strongly, so factors the data do not support collapse to zero. We
+deliberately fit more factors than the truth ($K + k_\delta$) and let the prior
+switch off the extras.
+
+The posterior is approximated by **stochastic variational inference (SVI)**:
+a mean-field variational family is fitted by maximising the ELBO over
+minibatches. The *global* latent variables ($\Lambda^{(l)}$, $\Psi^{(l)}$,
+$\boldsymbol\beta$, $\sigma_y^2$ and the shrinkage parameters) are shared by all
+observations; the *local* ones are each observation's scores $\mathbf{z}_i$.
+
+## Pipeline at a glance
+
+| Step | Helper | Produces |
+|---|---|---|
+| Load | `load_rds` | `sim_data`: tensors from the R simulation (views, y, true Z and Λ_l, K) |
+| Process | `process_data` | standardised train/test datasets and a `data_package` used later |
+| Train | `train_model` | fitted global parameters and training-set scores |
+| Local inference | `train_model_locally` | test-set scores, inferred from the views only |
+| Evaluate | `evaluate_fitted_model` | metric tables and posterior samples |
+| Interpret | `factor_interpretation` | variance explained, loadings, scores, outcome effects |
 
 ## Setup
 
@@ -46,21 +106,41 @@ from run_methods import (
 from factor_interpretation import (
     summarize_factors, plot_pve, plot_r2, plot_factor_loadings,
     plot_factor_scores_2d, plot_factor_outcome, tabulate_top_features,
+    plot_factor_features, plot_covariance_reconstruction,
 )
+from data_utils import standardised_true_loadings
 from constants import Sites
 ```
 
 ## Settings
 
-All choices for this run live in this cell.
+Every choice for this run is in the next cell; nothing below it needs editing.
+
+- `rep_config` picks the simulated dataset: sample size `n`, features per view
+  `p_l`, signal-to-noise ratios of the features (`snr_x`, $\mathrm{SNR}_X$) and
+  outcome (`snr_y`, $\mathrm{SNR}_y = \boldsymbol\beta^\top\boldsymbol\beta/\sigma_y^2$),
+  replicate, loading sparsity, and `k_delta`, the number of factors fitted beyond
+  the true $K$.
+- `USE_MISALIGNED` / `ALIGN_LABEL` switch to the misaligned scenarios, where the
+  outcome depends on factors that explain little of the views' variance
+  (see `docs/mofa_comparison_simulations.md`).
+- `train_config` controls the optimiser (AdagradRMSProp: `eta`, `delta`, `t`),
+  minibatching, the epoch limits and the stopping rule; local inference uses the
+  same settings. Every key is described at the top of `python/run_methods.py`.
+- `OUTCOME_WEIGHT` multiplies the outcome's log-likelihood. The views contribute
+  $\sum_l p_l$ terms per observation and the outcome one, so values above 1 give
+  the outcome more influence on the factors (`sim/exploration/shared_outcome_weight.qmd`).
+- `SVD_INIT` starts the scores and loadings at the top-$K$ SVD of the stacked views.
+- `VERBOSE` prints training progress every 10 epochs.
+- `SAVE_STEM` saves the fitted model and metrics (see *Saving results* at the end);
+  `None` keeps everything in memory.
 
 ```{python}
 MODEL_TYPE = "shared"
 DATA_ROOT  = "~/multiomic_integration/sim/data"
 
-# Simulation condition. Set USE_MISALIGNED=True to load the asymmetric
-# variance/outcome data (docs/mofa_comparison_simulations.md); ALIGN_LABEL is one of
-# "symmetric", "mild_misalignment", "strong_misalignment", "anti_aligned".
+# Simulation condition. ALIGN_LABEL is one of "symmetric", "mild_misalignment",
+# "strong_misalignment", "anti_aligned" (used only when USE_MISALIGNED is True).
 USE_MISALIGNED = False
 ALIGN_LABEL    = "anti_aligned"
 rep_config = {
@@ -72,8 +152,11 @@ rep_config = {
 DEVICE = torch.device("cpu")
 
 N_POSTERIOR_SAMPLES = 300
+OUTCOME_WEIGHT      = 1.0
 SVD_INIT            = True
+VERBOSE             = False
 FIG_DIR             = None     # set to a folder path to save interpretation figures
+SAVE_STEM           = None     # e.g. "~/multiomic_integration/sim/results/integration_shared/notebook/example"
 
 train_config = {
     "eta":                   0.25,
@@ -81,16 +164,25 @@ train_config = {
     "t":                     0.1,
     "num_particles":         1,
     "minibatch_fraction":    0.15,
-    "min_epochs":            200,
+    "min_epochs":            100,
     "max_epochs":            500,
     "convergence_criterion": "elbo_snr",
     "window":                50,
-    "snr_threshold":         5,
+    "snr_threshold":         2,
 }
+# min_epochs=100 / snr_threshold=2 (Oct 2026): training stops at ~135-140 epochs at the
+# same loss and metrics as min_epochs=200 / snr_threshold=5; a threshold of 5 with a
+# lower minimum stopped while the loss was still falling. elbo_snr cannot stop before
+# 2 * window = 100 epochs.
 local_config = {**train_config}
 ```
 
 ## Load data
+
+Simulated datasets are generated in R (`sim/generate_data.Rmd`) and saved as
+`.rds` files, one training and one test file per replicate. `load_rds` reads one
+into a dictionary of tensors: `X_l` (the $L$ views $X^{(l)}$, each $n \times p_l$),
+`y`, and the true `Z`, `Lambda_l` ($\Lambda^{(l)}$), `K` and `L` used to generate them.
 
 ```{python}
 cond_dir = (f"n{rep_config['n']}p{rep_config['p_l']}"
@@ -111,35 +203,64 @@ sim_data      = load_rds(rds_path("train"))
 sim_data_test = load_rds(rds_path("test"))
 
 print("L =", int(sim_data["L"]), " K =", int(sim_data["K"]),
-      " n =", sim_data["X_l"][0].shape[0], " p =", sim_data["X_l"][0].shape[1])
+      " n =", sim_data["X_l"][0].shape[0], " p per view =", sim_data["X_l"][0].shape[1])
 ```
 
 ## Process data
 
+`process_data` prepares the data the same way for every model:
+
+1. Uses the separate simulated test set (the default, `training_split=False`).
+   With `training_split=True` it would instead split the training file at random,
+   keeping a `training_size` fraction for training.
+2. In each view, drops all-zero columns, then standardises each feature to mean 0
+   and sd 1 using **training** means and sds; the test set is scaled with the
+   same training statistics. The outcome is standardised the same way.
+3. Wraps each set in a `TensorDataset(index, X_1, ..., X_L, y)` for minibatching.
+
+It also returns `data_package`, which keeps the standardised data, the scaling
+statistics and the true simulated structures for evaluation.
+
 ```{python}
 train_subset, test_subset, data_package = process_data(
-    sim_data, sim_data_test,
-    training_split=False, training_size=0.8, seed=123,
-    model_type=MODEL_TYPE,
+    sim_data, sim_data_test, model_type=MODEL_TYPE,
 )
 print("train n:", len(train_subset), " test n:", len(test_subset))
 ```
 
 ## Train
 
+`train_model` builds the model and fits it to the training set by SVI. Each epoch
+is one pass over shuffled minibatches; training stops when the stopping rule in
+`train_config` is met (here `elbo_snr`: the loss has stopped changing relative to
+its noise) or at `max_epochs`, but never before `min_epochs`.
+
+It returns the fitted model, the training handler (used later to draw posterior
+samples) and `global_state` (run times, epochs, loss history).
+
 ```{python}
 K_FIT = int(sim_data["K"]) + rep_config["k_delta"]
-model_config = {"k": K_FIT, "dense_model": False, "outcome_weight": 1.0}
+model_config = {"k": K_FIT, "dense_model": False, "outcome_weight": OUTCOME_WEIGHT}
+
+if SAVE_STEM is not None:
+    SAVE_STEM = os.path.expanduser(SAVE_STEM)
+    os.makedirs(os.path.dirname(SAVE_STEM), exist_ok=True)
 
 pyro.clear_param_store()
 factor_model, train_handler, global_state = train_model(
     model_config, train_config, train_subset,
-    model_type=MODEL_TYPE, write=False, verbose=True,
-    device=DEVICE, svd_init=SVD_INIT,
+    model_out_filename=SAVE_STEM, write=SAVE_STEM is not None,
+    model_type=MODEL_TYPE, verbose=VERBOSE, device=DEVICE, svd_init=SVD_INIT,
 )
+print(f"Fitted K = {K_FIT} factors (true K = {int(sim_data['K'])})")
 print(f"Global training: {factor_model.total_epochs} epochs, "
       f"{global_state['inference_time']:.1f}s")
 ```
+
+The left panel is the negative ELBO summed over each epoch's minibatches; it
+should fall steeply and then flatten. The right panel is the average change in
+the variational parameters from one epoch to the next, which should shrink
+toward a small, noisy floor.
 
 ```{python}
 fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
@@ -154,12 +275,15 @@ plt.show()
 
 ## Local inference on the test set
 
-Infers test-set scores from X only, with the global parameters frozen.
+To predict for new observations we need their factor scores. `train_model_locally`
+freezes every global parameter learned above and fits only the test
+observations' scores, **from their views alone** — the test outcome is never
+used. This mirrors prediction for a new patient whose outcome is unknown.
 
 ```{python}
 factor_model, test_handler, local_state = train_model_locally(
-    factor_model, local_config, test_subset,
-    model_type=MODEL_TYPE, verbose=True, device=DEVICE,
+    factor_model, local_config, test_subset, model_out_filename=SAVE_STEM,
+    model_type=MODEL_TYPE, verbose=VERBOSE, device=DEVICE,
 )
 print(f"Local inference: {factor_model.local_epochs} epochs, "
       f"{local_state['inference_time']:.1f}s")
@@ -167,22 +291,74 @@ print(f"Local inference: {factor_model.local_epochs} epochs, "
 
 ## Evaluate
 
+`evaluate_fitted_model` draws `N_POSTERIOR_SAMPLES` from the fitted posterior on
+the training set (scores, loadings, β, ...) and on the test set (test scores and
+predicted outcomes), then compares them with the simulated truth. All metrics
+are on the standardised scale. The metric table has one row per view; the
+outcome columns are the same on every row.
+
+| Column | Meaning | Best possible |
+|---|---|---|
+| `joint_rse` | relative squared error of the view's shared signal $J^{(l)} = Z\Lambda^{(l)\top}$ on the training set: $\lVert \hat J^{(l)} - J^{(l)} \rVert_F^2 / \lVert J^{(l)} \rVert_F^2$, with $\hat J^{(l)} = \hat Z \hat\Lambda^{(l)\top}$ from posterior means | 0 |
+| `outcome_mse` | test-set MSE of the posterior mean prediction of $y$ | $1/(1+\mathrm{SNR}_y)$, the noise share of $y$ |
+| `outcome_95p_coverage` | share of test outcomes inside their 95% posterior predictive intervals | 0.95 |
+| `outcome_95p_width` | mean width of those intervals; the outcome noise alone gives about $3.92/\sqrt{1+\mathrm{SNR}_y}$ | as narrow as coverage allows |
+| `test_rse` | relative squared error of $\hat Z_{new} \hat\Lambda^{(l)\top}$ against the **observed** test view $X^{(l)}_{new}$ (includes noise) | about $1/(1+\mathrm{SNR}_X)$, the noise share of $X$ |
+
+The remaining columns record the simulation condition and run times in seconds
+(`svd_time` is the SVD initialisation).
+
 ```{python}
 eval_table, cov_table, post_samples, post_samples_test = evaluate_fitted_model(
     rep_config, data_package, train_handler, test_handler,
     global_state, local_state,
     N_POSTERIOR_SAMPLES, model_type=MODEL_TYPE,
 )
+print(f"Reference values: outcome_mse ≈ {1 / (1 + rep_config['snr_y']):.3f}, "
+      f"outcome_95p_width ≈ {3.92 / np.sqrt(1 + rep_config['snr_y']):.2f}, "
+      f"test_rse ≈ {1 / (1 + rep_config['snr_x']):.3f}")
 eval_table
 ```
 
+The covariance table checks how well the loadings recover the dependence
+structure: for each pair of views $(l, m)$, `cov_frob` is the mean squared
+entrywise error of the implied covariance $\hat\Lambda^{(l)}\hat\Lambda^{(m)\top}$ against
+the truth. `within` rows are a view's own covariance; `cross` rows are the
+covariance *between* views, which only shared factors can produce.
+
 ```{python}
-cov_table
+cov_table[["view_l", "view_m", "cov_type", "cov_frob"]]
+```
+
+### Covariance reconstruction
+
+The implied covariance $\hat\Lambda^{(l)}\hat\Lambda^{(m)\top}$ for every pair of
+views against the true $\Lambda^{(l)}\Lambda^{(m)\top}$, both on the standardised scale. The
+covariance does not change when the factors are rotated, so no factor matching
+is needed. The heatmaps show an evenly spaced subset of features per view,
+ordered within each view by the true factor each feature loads on most (from
+most positive to most negative loading), so each factor appears as a block;
+black lines separate the views. Off-diagonal panels are covariance *between*
+views. The scatter compares all off-diagonal entries; points on the dashed line
+are reconstructed exactly. The table gives, per view pair, the correlation of
+estimated and true entries and their mean squared error.
+
+```{python}
+plot_covariance_reconstruction(
+    [post_samples[Sites.Lambda_l.format(l=l)].mean(dim=0).squeeze() for l in range(data_package["L"])],
+    standardised_true_loadings(data_package),
+    view_names=[f"View {l}" for l in range(data_package["L"])],
+    save_path=None,
+)
 ```
 
 ## Prediction
 
-Posterior mean prediction against the observed (standardised) outcome.
+Posterior mean predictions against the observed (standardised) outcome. Training
+predictions use scores fitted with the outcome observed; test predictions use
+scores inferred from the views only, so the test panel is the honest measure of
+predictive performance. Points scatter around the dashed identity line by
+roughly the outcome noise.
 
 ```{python}
 pred_train = post_samples[Sites.y].mean(dim=0).squeeze()
@@ -202,7 +378,17 @@ plt.show()
 
 ## Factor interpretation
 
-Posterior means of the scores, loadings and outcome effects on the training set.
+Interpretation uses posterior means of the training-set scores $\hat Z$,
+loadings $\hat\Lambda^{(l)}$ and outcome effects $\hat{\boldsymbol\beta}$, with the observed
+training outcome.
+
+Factor models are only identified up to rotation: $Z\Lambda^{(l)\top} = (ZR)(\Lambda^{(l)} R)^\top$
+for any orthogonal $R$. **Varimax** picks the rotation that makes each factor's
+loadings as sparse as possible (a few large loadings, many near zero), which
+usually makes factors easier to read. With several views one rotation $R$ is
+found for all views jointly, weighting each view equally regardless of its
+number of features. Scores rotate as $ZR$ and outcome effects as $R^\top\boldsymbol\beta$;
+predictions are unchanged.
 
 ```{python}
 L = data_package["L"]
@@ -220,6 +406,24 @@ def fig_path(name):
 
 ### Factor summary
 
+`summarize_factors` prints one table before and one after varimax rotation. The
+header gives the share of the data explained by all factors together (total
+model R², overall and per view) and of the outcome explained by $\hat Z\hat{\boldsymbol\beta}$
+(total outcome R²). Each row is a factor, sorted by how much of the data it explains:
+
+| Column | Meaning |
+|---|---|
+| `ESS` | signal energy summed over views, $\sum_l \lVert \mathbf{z}_{\cdot k}\rVert^2\lVert\boldsymbol\lambda^{(l)}_k\rVert^2$, with $\mathbf{z}_{\cdot k}$ the $k$th column of $Z$ and $\boldsymbol\lambda^{(l)}_k$ of $\Lambda^{(l)}$ |
+| `PVE(factor)` / `PVE(model)` / `PVE(data)` | ESS as a share of all factors' signal / of the variance the model explains / of the total data variance |
+| `R²(MOFA)` | MOFA-style R²: $1 - \sum_l\lVert X^{(l)} - \mathbf{z}_{\cdot k}\boldsymbol\lambda^{(l)\top}_k\rVert_F^2 / \sum_l\lVert X^{(l)}\rVert_F^2$, the share of the data this factor's rank-1 signal reconstructs on its own |
+| `β`, `95% CI` | posterior mean outcome effect and 95% credible interval (`*` = excludes zero) |
+| `β-PVE` | share of the predicted outcome's variation due to this factor |
+| `β-R²(y)` | share of the observed outcome's variance explained by this factor |
+
+Factors with near-zero ESS have been switched off by the shrinkage prior; the
+number of factors with non-trivial ESS estimates the number of shared factors in
+the data.
+
 ```{python}
 factor_summary = summarize_factors(
     X_list=X_list_interp, Z=Z_interp, Lambda_list=Lambda_list_interp,
@@ -232,6 +436,10 @@ top_factors = (factor_summary["post"]["per_factor"]["factor"].values - 1).tolist
 
 ### Proportion of variance explained
 
+Share of the loadings' total sum of squares carried by each factor, per view and
+combined, before and after rotation. Rotation redistributes variance across
+factors but does not change the total.
+
 ```{python}
 pve = plot_pve(Lambda_list_interp, view_names=view_names,
                title="PVE per factor — SupMultiviewShared (unrotated)")
@@ -241,6 +449,10 @@ pve_rot = plot_pve(Lambda_list_interp, view_names=view_names, rotate=True,
 
 ### R² per factor
 
+MOFA-style R² per factor and view: how much of each view each factor's rank-1
+signal reconstructs on its own. A factor active in several views is a shared
+source of variation.
+
 ```{python}
 r2 = plot_r2(X_list_interp, Z_interp, Lambda_list_interp, view_names=view_names,
              title="R² per factor — SupMultiviewShared")
@@ -248,15 +460,44 @@ r2 = plot_r2(X_list_interp, Z_interp, Lambda_list_interp, view_names=view_names,
 
 ### Loadings
 
+Varimax-rotated loadings, one panel per view: rows are features, columns are
+factors. Features are ordered by the factor they load on most strongly (from
+most positive to most negative), so each factor's features form a block.
+Columns with no block are factors switched off by the shrinkage prior.
+
 ```{python}
 Lambda_rot_list = plot_factor_loadings(
-    Lambda_list_interp, view_names=view_names, rotate=True,
+    Lambda_list_interp, view_names=view_names, rotate=True, sort_features=True,
     title="Factor loadings — SupMultiviewShared (varimax-rotated)",
     save_path=fig_path("loadings.png"),
 )
 ```
 
+### Features within each factor
+
+For each active factor (data PVE above 1% after rotation, in the order of the
+factor summary), the features with the largest rotated loadings across all
+views, coloured by view. A shared factor draws on features from several views;
+the sign shows the direction of each feature's association with the factor.
+
+```{python}
+per_factor = factor_summary["post"]["per_factor"]
+active_factors = (per_factor.loc[per_factor["pve_data"] > 0.01, "factor"] - 1).tolist()
+print(f"{len(active_factors)} active factors:", [k + 1 for k in active_factors])
+
+factor_features = plot_factor_features(
+    Lambda_list_interp, factors=active_factors, n_top_features=15,
+    view_names=view_names, rotate=True,
+    title="Top features per active factor — SupMultiviewShared (varimax-rotated)",
+    save_path=fig_path("factor_features.png"),
+)
+```
+
 ### Scores
+
+Scatterplots of the most active factors' scores, coloured by the outcome. A
+colour gradient along a factor's axis means that factor carries outcome
+information.
 
 ```{python}
 plot_factor_scores_2d(
@@ -265,6 +506,9 @@ plot_factor_scores_2d(
     layout="sequential", cmap="plasma", save_path=fig_path("scores_heatmap.png"),
 )
 ```
+
+Outcome values with observations ordered by each factor's (rotated) score. A
+trend means the factor is associated with the outcome; a flat band means it is not.
 
 ```{python}
 plot_factor_outcome(
@@ -275,6 +519,9 @@ plot_factor_outcome(
 ```
 
 ### Outcome effects before and after rotation
+
+Posterior mean $\beta_k$ for each factor, unrotated and varimax-rotated
+($R^\top\boldsymbol\beta$). Rotation typically concentrates the outcome effect on fewer factors.
 
 ```{python}
 beta_np = beta_interp.double().numpy()
@@ -291,6 +538,9 @@ plt.show()
 
 ### Top features per factor
 
+For each of the most active factors, the features with the largest absolute
+rotated loadings in each view (`f<j>` is feature column *j* after filtering).
+
 ```{python}
 top_feature_tables = tabulate_top_features(
     Lambda_list_interp, n_top_factors=min(8, K_FIT), n_top_features=10, rotate=True,
@@ -298,4 +548,38 @@ top_feature_tables = tabulate_top_features(
 for l, tbl in enumerate(top_feature_tables):
     print(f"\nView {l} — top features per factor (by |loading|, varimax-rotated):")
     display(tbl)
+```
+
+## Saving results
+
+With `SAVE_STEM` set, the run is written to disk with these files (the stem is a
+path without extension):
+
+| File | Written by | Contents |
+|---|---|---|
+| `<stem>.pth` | `train_model` | dict: `inference_time`, `svd_time`, `epochs`, `loss_history`, `param_convergence_history`, `config` (train_config), `model_state_dict` (Pyro param store state), `optimizer_state` |
+| `<stem>_paramstore.pth` | `train_model` | the Pyro param store (all variational parameters) |
+| `<stem>_local.pth`, `<stem>_local_paramstore.pth` | `train_model_locally` | the same for local inference on the test set |
+| `<stem>_metrics.csv`, `<stem>_cov.csv` | cell below | the metric and covariance tables above |
+
+A saved global fit can be restored without retraining with
+`load_model(stem, model_config, n_train, train_config, model_type="shared")`,
+then used for local inference and evaluation as above.
+
+The simulation sweeps use the same files and naming:
+
+| Script | Models | Metrics |
+|---|---|---|
+| `python/sim_run_shared_parallel.py` | `sim/results/integration_shared/models/shared_n{n}p{p}_snr{x}.{y}_sparse{s}_deltak{k}_rep{r}*.pth` | `sim/results/integration_shared/metrics/<same stem>.csv` and `_cov.csv` (with the training settings as columns) |
+| same, misaligned scenarios | `sim/results/integration_shared_misaligned/models/shared_asym_n{n}p{p}_align{label}_deltak{k}_rep{r}*.pth` | `sim/results/integration_shared_misaligned/metrics/` |
+| `python/outcome_weight_sweep.py` | not saved | `sim/results/integration_shared_misaligned/outcome_weight_sweep.csv` |
+
+```{python}
+if SAVE_STEM is not None:
+    eval_table.to_csv(SAVE_STEM + "_metrics.csv", index=False)
+    cov_table.to_csv(SAVE_STEM + "_cov.csv", index=False)
+    print("Saved:", *sorted(f for f in os.listdir(os.path.dirname(SAVE_STEM) or ".")
+                            if f.startswith(os.path.basename(SAVE_STEM))), sep="\n  ")
+else:
+    print("SAVE_STEM is None — nothing written.")
 ```

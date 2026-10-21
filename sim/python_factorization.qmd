@@ -1,17 +1,72 @@
 ---
 title: "MatrixDecomp — single-condition pipeline"
 jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
 ---
 
-Runs the full pipeline for the single-view supervised factor model on one
-simulated dataset: load → process → train → local inference → prediction →
-evaluation → factor interpretation. Every step goes through the helpers in
-`python/run_methods.py` (with `model_type="single_view"`) and
-`python/factor_interpretation.py`.
+This notebook runs the full analysis pipeline for the **single-view supervised
+factor model** (`MatrixDecomp`) on one simulated dataset, and explains each step
+and its output. Every step calls the shared helpers in `python/run_methods.py`
+(with `model_type="single_view"`) and `python/factor_interpretation.py`, so the
+same code runs here, in the simulation sweeps, and in the multiview notebooks.
 
-- Sweeps over replicates and conditions: `python/matrixdecomp_hyperparam_run.py`
-- Experiments (PVE attribution, shrinkage diagnostics): `sim/exploration/`
-- The previous version of this notebook: `sim/archive/python_factorization_2026-06.qmd`
+| Where | What |
+|---|---|
+| `sim/python_integration.qmd` | the same pipeline for the multiview shared-factor model |
+| `python/matrixdecomp_hyperparam_run.py` | this pipeline over many replicates and settings |
+| `sim/exploration/` | focused experiments (variance attribution, shrinkage, …) |
+| `sim/archive/python_factorization_2026-06.qmd` | the previous version of this notebook |
+
+## The model
+
+Notation follows the methods document (`docs/main(1).tex`), in the single-view
+case $L = 1$ with the view superscript dropped. For observation $i = 1, \dots, n$
+with $p$ features $\mathbf{x}_i \in \mathbb{R}^p$ (stacked, $X \in \mathbb{R}^{n \times p}$)
+and a continuous outcome $y_i$:
+
+$$
+\mathbf{x}_i = \Lambda \mathbf{z}_i + \boldsymbol\epsilon_i, \qquad
+\boldsymbol\epsilon_i \sim N_p(0, \Psi), \qquad
+y_i = \boldsymbol\beta^\top \mathbf{z}_i + e_i, \qquad e_i \sim N(0, \sigma_y^2),
+$$
+
+with $\Psi = \operatorname{diag}(\psi_1, \dots, \psi_p)$ and $K$ latent factor
+scores $\mathbf{z}_i \sim N_K(0, I)$ (stacked, $Z \in \mathbb{R}^{n \times K}$) shared
+by the features and the outcome. $\Lambda$ ($p \times K$) holds the **loadings** and
+$\boldsymbol\beta$ the effect of each factor on the outcome; the signal is
+$J = Z\Lambda^\top$. Because $y$ also depends on $\mathbf{z}_i$, the fitted factors are
+pulled toward directions in $X$ that predict the outcome (the model is *supervised*).
+The mean $\boldsymbol\mu$ and intercept $\beta_0$ are not fitted: every feature and
+the outcome are centred (and scaled) first, so they are 0.
+
+The loadings have the **multiplicative gamma process (MGP)** prior,
+$\Lambda_{jk} \sim N\big(0, \rho^{-1}_{jk}\tau^{-1}_{k}\big)$ with
+$\tau_k = \prod_{m=1}^{k}\delta_m$: each successive factor is shrunk more strongly,
+so factors the data do not support collapse to zero. We deliberately fit more
+factors than the truth ($K + k_\delta$) and let the prior switch off the extras.
+
+The posterior is approximated by **stochastic variational inference (SVI)**:
+a mean-field variational family is fitted by maximising the ELBO over
+minibatches. The *global* latent variables ($\Lambda$, $\Psi$, $\boldsymbol\beta$,
+$\sigma_y^2$ and the shrinkage parameters) are shared by all observations; the
+*local* ones are each observation's scores $\mathbf{z}_i$.
+
+## Pipeline at a glance
+
+| Step | Helper | Produces |
+|---|---|---|
+| Load | `load_rds` | `sim_data`: tensors from the R simulation (X, y, true Z and Λ, K) |
+| Process | `process_data` | standardised train/test datasets and a `data_package` used later |
+| Train | `train_model` | fitted global parameters and training-set scores |
+| Local inference | `train_model_locally` | test-set scores, inferred from X only |
+| Evaluate | `evaluate_fitted_model` | metric table and posterior samples |
+| Interpret | `factor_interpretation` | variance explained, loadings, scores, outcome effects |
 
 ## Setup
 
@@ -42,13 +97,29 @@ from run_methods import (
 from factor_interpretation import (
     summarize_factors, plot_pve, plot_r2, plot_factor_loadings,
     plot_factor_scores_2d, plot_factor_outcome, tabulate_top_features,
+    plot_factor_features, plot_covariance_reconstruction,
 )
+from data_utils import standardised_true_loadings
 from constants import Sites
 ```
 
 ## Settings
 
-All choices for this run live in this cell.
+Every choice for this run is in the next cell; nothing below it needs editing.
+
+- `rep_config` picks the simulated dataset: sample size `n`, number of features
+  `p_l`, signal-to-noise ratios of the features (`snr_x`, $\mathrm{SNR}_X$) and
+  outcome (`snr_y`, $\mathrm{SNR}_y = \boldsymbol\beta^\top\boldsymbol\beta/\sigma_y^2$),
+  replicate, loading sparsity, and `k_delta`, the number of factors fitted beyond
+  the true $K$.
+- `train_config` controls the optimiser (AdagradRMSProp: `eta`, `delta`, `t`),
+  minibatching, the epoch limits and the stopping rule. Every key is described
+  at the top of `python/run_methods.py`.
+- `local_config` is the same for local inference, except that local inference
+  stops on the default rule (`elbo_min`), as it has for this model.
+- `VERBOSE` prints training progress every 10 epochs.
+- `SAVE_STEM` saves the fitted model and metrics (see *Saving results* at the end);
+  `None` keeps everything in memory.
 
 ```{python}
 MODEL_TYPE = "single_view"
@@ -65,7 +136,9 @@ TRAINING_SPLIT = False
 DEVICE              = torch.device("cpu")
 N_POSTERIOR_SAMPLES = 500
 SVD_INIT            = False
+VERBOSE             = False
 FIG_DIR             = None     # set to a folder path to save interpretation figures
+SAVE_STEM           = None     # e.g. "~/multiomic_integration/sim/results/matrixdecomp/notebook/example"
 
 train_config = {
     "eta":                   1.0,
@@ -73,16 +146,24 @@ train_config = {
     "t":                     0.1,
     "num_particles":         2,
     "minibatch_size":        32,
-    "min_epochs":            200,
+    "min_epochs":            100,
     "max_epochs":            1000,
     "convergence_criterion": "elbo_snr",
     "snr_threshold":         1,
 }
 # Local inference has used the default stopping rule (elbo_min) for this model.
+# elbo_min stops shortly after min_epochs; test metrics were the same for
+# min_epochs between 25 and 200 (Oct 2026), and global training is ended by the
+# elbo_snr rule (~520 epochs), not by min_epochs.
 local_config = {**train_config, "convergence_criterion": "elbo_min"}
 ```
 
 ## Load data
+
+Simulated datasets are generated in R (`sim/generate_data.Rmd`) and saved as
+`.rds` files, one training and one test file per replicate. `load_rds` reads one
+into a dictionary of tensors: `X_l` (a list holding the single $n \times p$
+view), `y`, and the true `Z`, `Lambda_l` and `K` used to generate them.
 
 ```{python}
 cond_dir = (f"n{rep_config['n']}p{rep_config['p_l']}"
@@ -103,30 +184,59 @@ print("K =", int(sim_data["K"]),
 
 ## Process data
 
+`process_data` prepares the data the same way for every model:
+
+1. Takes the separate simulated test set (`training_split=False`), or, when
+   `TRAINING_SPLIT` is True, splits the training file at random, keeping a
+   `training_size` fraction (default 0.8) for training.
+2. Drops all-zero columns, then standardises each feature to mean 0 and sd 1
+   using **training** means and sds; the test set is scaled with the same
+   training statistics. The outcome is standardised the same way.
+3. Wraps each set in a `TensorDataset(index, X, y)` for minibatching.
+
+It also returns `data_package`, which keeps the standardised data, the scaling
+statistics and the true simulated structures for evaluation.
+
 ```{python}
 train_subset, test_subset, data_package = process_data(
-    sim_data, sim_data_test,
-    training_split=TRAINING_SPLIT, training_size=0.8, seed=123,
-    model_type=MODEL_TYPE,
+    sim_data, sim_data_test, training_split=TRAINING_SPLIT, model_type=MODEL_TYPE,
 )
 print("train n:", len(train_subset), " test n:", len(test_subset))
 ```
 
 ## Train
 
+`train_model` builds the model and fits it to the training set by SVI. Each epoch
+is one pass over shuffled minibatches; training stops when the stopping rule in
+`train_config` is met (here `elbo_snr`: the loss has stopped changing relative to
+its noise) or at `max_epochs`.
+
+It returns the fitted model, the training handler (used later to draw posterior
+samples) and `global_state` (run time, epochs, loss history).
+
 ```{python}
 K_FIT = int(sim_data["K"]) + rep_config["k_delta"]
 model_config = {"k": K_FIT, "dense_model": False}
 
+if SAVE_STEM is not None:
+    SAVE_STEM = os.path.expanduser(SAVE_STEM)
+    os.makedirs(os.path.dirname(SAVE_STEM), exist_ok=True)
+
 pyro.clear_param_store()
 factor_model, train_handler, global_state = train_model(
     model_config, train_config, train_subset,
-    model_type=MODEL_TYPE, write=False, verbose=True,
-    device=DEVICE, svd_init=SVD_INIT,
+    model_out_filename=SAVE_STEM, write=SAVE_STEM is not None,
+    model_type=MODEL_TYPE, verbose=VERBOSE, device=DEVICE, svd_init=SVD_INIT,
 )
+print(f"Fitted K = {K_FIT} factors (true K = {int(sim_data['K'])})")
 print(f"Global training: {factor_model.total_epochs} epochs, "
       f"{global_state['inference_time']:.1f}s")
 ```
+
+The left panel is the negative ELBO summed over each epoch's minibatches; it
+should fall steeply and then flatten. The right panel is the average change in
+the variational parameters from one epoch to the next, which should shrink
+toward a small, noisy floor.
 
 ```{python}
 fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
@@ -141,12 +251,15 @@ plt.show()
 
 ## Local inference on the test set
 
-Infers test-set scores from X only, with the global parameters frozen.
+To predict for new observations we need their factor scores. `train_model_locally`
+freezes every global parameter learned above and fits only the test
+observations' scores, **from their features alone** — the test outcome is never
+used. This mirrors prediction for a new patient whose outcome is unknown.
 
 ```{python}
 factor_model, test_handler, local_state = train_model_locally(
-    factor_model, local_config, test_subset,
-    model_type=MODEL_TYPE, verbose=True, device=DEVICE,
+    factor_model, local_config, test_subset, model_out_filename=SAVE_STEM,
+    model_type=MODEL_TYPE, verbose=VERBOSE, device=DEVICE,
 )
 print(f"Local inference: {factor_model.local_epochs} epochs, "
       f"{local_state['inference_time']:.1f}s")
@@ -154,18 +267,58 @@ print(f"Local inference: {factor_model.local_epochs} epochs, "
 
 ## Evaluate
 
+`evaluate_fitted_model` draws `N_POSTERIOR_SAMPLES` from the fitted posterior on
+the training set (scores, loadings, β, ...) and on the test set (test scores and
+predicted outcomes), then compares them with the simulated truth. All metrics
+are on the standardised scale.
+
+| Column | Meaning | Best possible |
+|---|---|---|
+| `structure_rse` | relative squared error of the training signal $J = Z\Lambda^\top$: $\lVert \hat J - J \rVert_F^2 / \lVert J \rVert_F^2$, with $\hat J$ the posterior mean signal | 0 |
+| `structure_95p_cov` | share of true signal entries inside their 95% posterior intervals | 0.95 |
+| `cov_norm_frob` | mean squared entrywise error of the implied covariance $\hat\Lambda\hat\Lambda^\top$ vs. the truth | 0 |
+| `outcome_mse` | test-set MSE of the posterior mean prediction of $y$ | $1/(1+\mathrm{SNR}_y)$, the noise share of $y$ |
+| `outcome_95p_cov` | share of test outcomes inside their 95% posterior predictive intervals | 0.95 |
+| `test_rse` | relative squared error of $\hat Z_{new} \hat\Lambda^\top$ against the **observed** test data $X_{new}$ (includes noise) | about $1/(1+\mathrm{SNR}_X)$, the noise share of $X$ |
+
+The remaining columns record the simulation condition and run times in seconds.
+
 ```{python}
 eval_table, _, post_samples, post_samples_test = evaluate_fitted_model(
     rep_config, data_package, train_handler, test_handler,
     global_state, local_state,
     N_POSTERIOR_SAMPLES, model_type=MODEL_TYPE,
 )
-eval_table
+print(f"Reference values: outcome_mse ≈ {1 / (1 + rep_config['snr_y']):.3f}, "
+      f"test_rse ≈ {1 / (1 + rep_config['snr_x']):.3f}")
+eval_table.T
+```
+
+### Covariance reconstruction
+
+The implied covariance $\hat\Lambda\hat\Lambda^\top$ against the true
+$\Lambda\Lambda^\top$, both on the standardised scale (`cov_norm_frob` above is
+their mean squared difference). The covariance does not change when the factors
+are rotated, so no factor matching is needed. The heatmaps show an evenly spaced
+subset of features, ordered by the true factor each feature loads on most (from
+most positive to most negative loading), so each factor appears as a block. The
+scatter compares all off-diagonal entries; points on the dashed line are
+reconstructed exactly. The table gives their correlation and mean squared error.
+
+```{python}
+plot_covariance_reconstruction(
+    [post_samples[Sites.Lambda_l.format(l=0)].mean(dim=0).squeeze()],
+    standardised_true_loadings(data_package),
+)
 ```
 
 ## Prediction
 
-Posterior mean prediction against the observed (standardised) outcome.
+Posterior mean predictions against the observed (standardised) outcome. Training
+predictions use scores fitted with the outcome observed; test predictions use
+scores inferred from the features only, so the test panel is the honest measure
+of predictive performance. Points scatter around the dashed identity line by
+roughly the outcome noise.
 
 ```{python}
 pred_train = post_samples[Sites.y].mean(dim=0).squeeze()
@@ -185,7 +338,15 @@ plt.show()
 
 ## Factor interpretation
 
-Posterior means of the scores, loadings and outcome effects on the training set.
+Interpretation uses posterior means of the training-set scores $\hat Z$,
+loadings $\hat\Lambda$ and outcome effects $\hat{\boldsymbol\beta}$, with the observed
+training outcome.
+
+Factor models are only identified up to rotation: $Z\Lambda^\top = (ZR)(\Lambda R)^\top$
+for any orthogonal $R$. **Varimax** picks the rotation that makes each factor's
+loadings as sparse as possible (a few large loadings, many near zero), which
+usually makes factors easier to read. Scores rotate as $ZR$ and outcome effects
+as $R^\top\boldsymbol\beta$; predictions are unchanged.
 
 ```{python}
 X_list_interp      = data_package["train_X_l_list_clean"]
@@ -200,6 +361,23 @@ def fig_path(name):
 
 ### Factor summary
 
+`summarize_factors` prints one table before and one after varimax rotation. The
+header gives the share of the data explained by all factors together (total
+model R²) and of the outcome explained by $\hat Z\hat{\boldsymbol\beta}$ (total outcome R²).
+Each row is a factor, sorted by how much of the data it explains:
+
+| Column | Meaning |
+|---|---|
+| `ESS` | signal energy $\lVert \mathbf{z}_{\cdot k}\rVert^2\lVert\boldsymbol\lambda_k\rVert^2$, with $\mathbf{z}_{\cdot k}$ the $k$th column of $Z$ and $\boldsymbol\lambda_k$ of $\Lambda$ |
+| `PVE(factor)` / `PVE(model)` / `PVE(data)` | ESS as a share of all factors' signal / of the variance the model explains / of the total data variance |
+| `R²(MOFA)` | MOFA-style R²: $1 - \lVert X - \mathbf{z}_{\cdot k}\boldsymbol\lambda_k^\top\rVert_F^2 / \lVert X\rVert_F^2$, the share of the data this factor's rank-1 signal reconstructs on its own |
+| `β`, `95% CI` | posterior mean outcome effect and 95% credible interval (`*` = excludes zero) |
+| `β-PVE` | share of the predicted outcome's variation due to this factor |
+| `β-R²(y)` | share of the observed outcome's variance explained by this factor |
+
+Factors with near-zero ESS have been switched off by the shrinkage prior; the
+number of factors with non-trivial ESS estimates the number of factors in the data.
+
 ```{python}
 factor_summary = summarize_factors(
     X_list=X_list_interp, Z=Z_interp, Lambda_list=Lambda_list_interp,
@@ -212,6 +390,10 @@ top_factors = (factor_summary["post"]["per_factor"]["factor"].values - 1).tolist
 
 ### Proportion of variance explained
 
+Share of the loadings' total sum of squares carried by each factor, before and
+after rotation. Rotation redistributes variance across factors but does not
+change the total.
+
 ```{python}
 pve = plot_pve(Lambda_list_interp, title="PVE per factor — MatrixDecomp (unrotated)")
 pve_rot = plot_pve(Lambda_list_interp, rotate=True,
@@ -220,6 +402,9 @@ pve_rot = plot_pve(Lambda_list_interp, rotate=True,
 
 ### R² per factor
 
+MOFA-style R² per factor: how much of the data each factor's rank-1 signal
+reconstructs on its own.
+
 ```{python}
 r2 = plot_r2(X_list_interp, Z_interp, Lambda_list_interp,
              title="R² per factor — MatrixDecomp")
@@ -227,15 +412,42 @@ r2 = plot_r2(X_list_interp, Z_interp, Lambda_list_interp,
 
 ### Loadings
 
+Varimax-rotated loadings: rows are features, columns are factors. Features are
+ordered by the factor they load on most strongly (from most positive to most
+negative), so each factor's features form a block. Columns with no block are
+factors switched off by the shrinkage prior.
+
 ```{python}
 Lambda_rot_list = plot_factor_loadings(
-    Lambda_list_interp, rotate=True,
+    Lambda_list_interp, rotate=True, sort_features=True,
     title="Factor loadings — MatrixDecomp (varimax-rotated)",
     save_path=fig_path("loadings.png"),
 )
 ```
 
+### Features within each factor
+
+For each active factor (data PVE above 1% after rotation, in the order of the
+factor summary), the features with the largest rotated loadings. The sign shows
+the direction of each feature's association with the factor.
+
+```{python}
+per_factor = factor_summary["post"]["per_factor"]
+active_factors = (per_factor.loc[per_factor["pve_data"] > 0.01, "factor"] - 1).tolist()
+print(f"{len(active_factors)} active factors:", [k + 1 for k in active_factors])
+
+factor_features = plot_factor_features(
+    Lambda_list_interp, factors=active_factors, n_top_features=15, rotate=True,
+    title="Top features per active factor — MatrixDecomp (varimax-rotated)",
+    save_path=fig_path("factor_features.png"),
+)
+```
+
 ### Scores
+
+Pairwise scatterplots of the most active factors' scores, coloured by the
+outcome. A colour gradient along a factor's axis means that factor carries
+outcome information.
 
 ```{python}
 plot_factor_scores_2d(
@@ -244,6 +456,9 @@ plot_factor_scores_2d(
     save_path=fig_path("scores.png"),
 )
 ```
+
+Outcome values with observations ordered by each factor's (rotated) score. A
+trend means the factor is associated with the outcome; a flat band means it is not.
 
 ```{python}
 plot_factor_outcome(
@@ -254,6 +469,9 @@ plot_factor_outcome(
 ```
 
 ### Outcome effects before and after rotation
+
+Posterior mean $\beta_k$ for each factor, unrotated and varimax-rotated
+($R^\top\boldsymbol\beta$). Rotation typically concentrates the outcome effect on fewer factors.
 
 ```{python}
 beta_np = beta_interp.double().numpy()
@@ -270,9 +488,42 @@ plt.show()
 
 ### Top features per factor
 
+For each of the most active factors, the features with the largest absolute
+rotated loadings (`f<j>` is feature column *j* after filtering).
+
 ```{python}
 top_feature_tables = tabulate_top_features(
     Lambda_list_interp, n_top_factors=min(8, K_FIT), n_top_features=10, rotate=True,
 )
 display(top_feature_tables[0])
+```
+
+## Saving results
+
+With `SAVE_STEM` set, the run is written to disk with these files (the stem is a
+path without extension):
+
+| File | Written by | Contents |
+|---|---|---|
+| `<stem>.pth` | `train_model` | dict: `inference_time`, `svd_time`, `epochs`, `loss_history`, `param_convergence_history`, `config` (train_config), `model_state_dict` (Pyro param store state), `optimizer_state` |
+| `<stem>_paramstore.pth` | `train_model` | the Pyro param store (all variational parameters) |
+| `<stem>_local.pth`, `<stem>_local_paramstore.pth` | `train_model_locally` | the same for local inference on the test set |
+| `<stem>_metrics.csv` | cell below | the metric table above |
+
+A saved global fit can be restored without retraining with
+`load_model(stem, model_config, n_train, train_config, model_type="single_view")`,
+then used for local inference and evaluation as above.
+
+The simulation sweep `python/matrixdecomp_hyperparam_run.py` saves metrics only
+(no models), one CSV per condition, replicate and setting, in
+`sim/results/matrixdecomp/metrics/{condition}_k{K}_rep{r}_{model settings}_{train settings}.csv`,
+plus all of them combined in `all_metrics_concat.csv`.
+
+```{python}
+if SAVE_STEM is not None:
+    eval_table.to_csv(SAVE_STEM + "_metrics.csv", index=False)
+    print("Saved:", *sorted(f for f in os.listdir(os.path.dirname(SAVE_STEM) or ".")
+                            if f.startswith(os.path.basename(SAVE_STEM))), sep="\n  ")
+else:
+    print("SAVE_STEM is None — nothing written.")
 ```
