@@ -3,7 +3,8 @@ factor_interpretation.py
 
 Reusable helpers for interpreting latent factors from MatrixDecomp and
 SupMultiviewShared models: proportion of variance explained (PVE), MOFA-style
-R² per factor, loading heatmaps, score scatter plots, and feature tables.
+R² per factor, loading heatmaps, score scatter plots, feature tables, and
+covariance reconstruction against simulated truth.
 
 All functions accept numpy arrays or torch Tensors and work for both single-
 view (pass a one-element list) and multiview (pass a list per view) inputs.
@@ -66,6 +67,15 @@ def _rotate_loadings(Lambda_list: List) -> tuple:
 
 
 # ── Proportion of Variance Explained ─────────────────────────────────────────
+
+def _dominant_factor_order(Lambda: np.ndarray) -> np.ndarray:
+    """Row order grouping features by their dominant factor (largest |loading|),
+    factors in column order; within each group, from the most positive to the
+    most negative loading on that factor."""
+    dominant = np.abs(Lambda).argmax(axis=1)
+    signed = Lambda[np.arange(Lambda.shape[0]), dominant]
+    return np.lexsort((-signed, dominant))
+
 
 def compute_pve(Lambda_list: List) -> dict:
     """
@@ -264,6 +274,7 @@ def plot_factor_loadings(
     n_factors: Optional[int] = None,
     title: Optional[str] = None,
     save_path: Optional[str] = None,
+    sort_features: bool = False,
 ) -> List[np.ndarray]:
     """
     Heatmap of factor loadings, one panel per view.
@@ -275,6 +286,11 @@ def plot_factor_loadings(
     rotate      : if True, apply varimax rotation first
     n_factors   : if set, display only the first n_factors columns
     title       : figure title
+    sort_features : if True, order the rows of each view by the feature's
+                  dominant factor (largest |loading|), then by that loading's
+                  size, so each factor's features form a visible block. Only
+                  the display order changes; the returned matrices keep the
+                  original feature order.
 
     Returns
     -------
@@ -298,6 +314,8 @@ def plot_factor_loadings(
     rot_suffix = " (varimax)" if rotate else ""
 
     for ax, name, L_rot in zip(axes.flatten(), view_names, rotated_list):
+        if sort_features:
+            L_rot = L_rot[_dominant_factor_order(L_rot)]
         sns.heatmap(L_rot, cmap="coolwarm", center=0, ax=ax,
                     xticklabels=True, yticklabels=False)
         ax.set_title(f"{name} loadings{rot_suffix}")
@@ -988,3 +1006,244 @@ def tabulate_top_features(
         results.append(wide)
 
     return results
+
+
+def plot_covariance_reconstruction(
+    est_Lambda_list: List,
+    true_Lambda_list: List,
+    view_names: Optional[List[str]] = None,
+    max_features_per_view: int = 100,
+    title: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Compare the covariance implied by the fitted loadings with the simulated truth.
+
+    Builds the block covariance across all views, C = Lambda Lambda^T with
+    Lambda the stacked per-view loadings, for the estimate and the truth. The
+    diagonal blocks are within-view covariance; the off-diagonal blocks are
+    covariance between views, which only shared factors produce. Lambda Lambda^T
+    is unchanged by rotating the factors, so no factor matching is needed.
+
+    Plots true | estimated | estimated - true heatmaps on an evenly spaced
+    subset of features per view, ordered within each view by the feature's
+    dominant true factor (lines mark view boundaries), and a scatter of
+    estimated vs. true entries over all features.
+
+    Parameters
+    ----------
+    est_Lambda_list  : list of (p_l, K) array-like — posterior mean loadings
+    true_Lambda_list : list of (p_l, K_true) array-like — true loadings on the same
+                       standardised scale (data_utils.standardised_true_loadings)
+    view_names       : optional view labels
+    max_features_per_view : features per view shown in the heatmaps
+
+    Returns
+    -------
+    DataFrame with one row per view pair: view_l, view_m, block ("within" or
+    "cross"), corr (correlation of estimated and true entries) and mse (mean
+    squared entrywise error, the cov_frob evaluation metric).
+    """
+    est = [_np(L) for L in est_Lambda_list]
+    true = [_np(L) for L in true_Lambda_list]
+    L = len(est)
+    if view_names is None:
+        view_names = [f"View {l}" for l in range(L)]
+
+    # Per-block agreement over all features
+    rows, scatter = [], {"within": ([], []), "cross": ([], [])}
+    for l in range(L):
+        for m in range(l, L):
+            c_est, c_true = est[l] @ est[m].T, true[l] @ true[m].T
+            if l == m:      # off-diagonal entries only: the diagonal also carries noise variance
+                mask = ~np.eye(c_est.shape[0], dtype=bool)
+                c_est, c_true = c_est[mask], c_true[mask]
+            block = "within" if l == m else "cross"
+            rows.append({
+                "view_l": l, "view_m": m, "block": block,
+                "corr": float(np.corrcoef(c_est.ravel(), c_true.ravel())[0, 1]),
+                "mse":  float(np.mean((c_est - c_true) ** 2)),
+            })
+            scatter[block][0].append(c_true.ravel())
+            scatter[block][1].append(c_est.ravel())
+
+    # Heatmaps on an evenly spaced feature subset, ordered within each view by
+    # each feature's dominant true factor so the factor blocks are visible.
+    idx = []
+    for Lam in true:
+        sub = np.linspace(0, Lam.shape[0] - 1, min(max_features_per_view, Lam.shape[0])).astype(int)
+        idx.append(sub[_dominant_factor_order(Lam[sub])])
+    est_sub  = np.vstack([Lam[i] for Lam, i in zip(est, idx)])
+    true_sub = np.vstack([Lam[i] for Lam, i in zip(true, idx)])
+    C_true, C_est = true_sub @ true_sub.T, est_sub @ est_sub.T
+    bounds = np.cumsum([len(i) for i in idx])[:-1]
+
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5),
+                             gridspec_kw={"width_ratios": [1, 1, 1, 0.9]})
+    vmax = np.abs(C_true).max()
+    for ax, mat, label, lim in [
+        (axes[0], C_true,         "True",                vmax),
+        (axes[1], C_est,          "Estimated",           vmax),
+        (axes[2], C_est - C_true, "Estimated − true",    vmax),
+    ]:
+        im = ax.imshow(mat, cmap="RdBu_r", vmin=-lim, vmax=lim, interpolation="nearest")
+        for b in bounds:
+            ax.axhline(b - 0.5, color="black", lw=0.8)
+            ax.axvline(b - 0.5, color="black", lw=0.8)
+        ticks = np.concatenate([[0], bounds]) + np.array([len(i) for i in idx]) / 2
+        ax.set_xticks(ticks, view_names, rotation=0)
+        ax.set_yticks(ticks, view_names, rotation=90, va="center")
+        ax.set_title(label)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = axes[3]
+    for block, colour in [("cross", "tab:orange"), ("within", "tab:blue")]:
+        if scatter[block][0]:
+            x, y = np.concatenate(scatter[block][0]), np.concatenate(scatter[block][1])
+            sub = np.random.default_rng(0).choice(len(x), size=min(20000, len(x)), replace=False)
+            ax.scatter(x[sub], y[sub], s=2, alpha=0.3, color=colour, label=f"{block}-view")
+    lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
+    ax.plot(lims, lims, color="black", ls="--", lw=1)
+    ax.set(xlabel="True covariance", ylabel="Estimated covariance",
+           title="Entries (all features, off-diagonal)")
+    ax.legend(markerscale=5)
+
+    fig.suptitle(title or "Covariance reconstruction (ΛΛᵀ, standardised scale)")
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return pd.DataFrame(rows)
+
+
+def plot_factor_features(
+    Lambda_list: List,
+    factors: Optional[List[int]] = None,
+    n_factors: int = 5,
+    n_top_features: int = 15,
+    view_names: Optional[List[str]] = None,
+    feature_names_list: Optional[List] = None,
+    rotate: bool = True,
+    title: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    The features that define each factor: one panel per factor showing its
+    largest loadings across all views as horizontal bars, coloured by view.
+
+    Parameters
+    ----------
+    Lambda_list        : list of (p_l, K) array-like — loadings per view
+    factors            : 0-based factor indices to show, in order; defaults to
+                         the n_factors factors with the largest total sum of
+                         squared loadings
+    n_top_features     : features per panel, chosen by |loading| over all views
+    view_names         : optional view labels
+    feature_names_list : feature names per view; defaults to "f0", "f1", …
+    rotate             : if True, apply (multiview) varimax first, as in
+                         summarize_factors, so factor numbers match its tables
+
+    Returns
+    -------
+    Long DataFrame of the plotted loadings: factor (1-based), view, feature, loading.
+    """
+    arrays = [_np(L) for L in Lambda_list]
+    if rotate:
+        arrays, _ = _rotate_loadings(arrays)
+    L_views = len(arrays)
+    if view_names is None:
+        view_names = [f"View {l}" for l in range(L_views)]
+    if feature_names_list is None:
+        feature_names_list = [[f"f{i}" for i in range(L.shape[0])] for L in arrays]
+    if factors is None:
+        ssl = sum(np.sum(L ** 2, axis=0) for L in arrays)
+        factors = list(np.argsort(ssl)[::-1][:n_factors])
+
+    # All features of all views, with their view and name
+    loadings = np.vstack(arrays)                                   # (sum p_l, K)
+    views    = np.concatenate([[l] * L.shape[0] for l, L in enumerate(arrays)])
+    names    = np.concatenate([np.asarray(n, dtype=object) for n in feature_names_list])
+    colours  = sns.color_palette("tab10", L_views)
+
+    n_cols = min(len(factors), 5)
+    n_rows = int(np.ceil(len(factors) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.6 * n_cols, 0.28 * n_top_features * n_rows + 1.2),
+                             squeeze=False)
+    rows = []
+    for ax, k in zip(axes.flatten(), factors):
+        top = np.argsort(np.abs(loadings[:, k]))[::-1][:n_top_features]
+        top = top[np.argsort(loadings[top, k])]                    # smallest at bottom
+        labels = [f"{names[i]} ({view_names[views[i]]})" if L_views > 1 else str(names[i])
+                  for i in top]
+        ax.barh(range(len(top)), loadings[top, k], color=[colours[views[i]] for i in top])
+        ax.axvline(0, color="black", lw=0.6)
+        ax.set_yticks(range(len(top)), labels, fontsize=7)
+        ax.set_title(f"Factor {k + 1}")
+        ax.set_xlabel("Loading" + (" (varimax)" if rotate else ""))
+        rows += [{"factor": int(k + 1), "view": view_names[views[i]],
+                  "feature": names[i], "loading": float(loadings[i, k])} for i in top[::-1]]
+    for ax in axes.flatten()[len(factors):]:
+        ax.set_visible(False)
+    if L_views > 1:
+        handles = [plt.Rectangle((0, 0), 1, 1, color=colours[l]) for l in range(L_views)]
+        fig.legend(handles, view_names, loc="lower center", ncol=L_views, fontsize=8,
+                   bbox_to_anchor=(0.5, -0.04))
+
+    fig.suptitle(title or "Top features per factor")
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return pd.DataFrame(rows)
+
+
+def factor_strength(
+    Lambda_list: List,
+    psi_list: List,
+    beta=None,
+    Z_second_moment=None,
+) -> dict:
+    """
+    Strength of the factors relative to the noise, summed over all features.
+
+    For loadings Lambda^(l) and noise variances psi^(l), the matrix
+        M = sum_l Lambda^(l)T diag(psi^(l))^-1 Lambda^(l)       (K x K)
+    measures how strongly each factor direction stands out from the noise. Its
+    eigenvalues are the strengths of the factor directions; along a unit
+    direction v the strength is v^T M v. Two thresholds interpret them, with P
+    the total number of features and n the number of observations:
+      - strength > sqrt(P / n): the direction can be detected without the
+        outcome (spiked-covariance / BBP detection threshold for PCA);
+      - strength >~ 1: a new observation's score along it can be inferred from
+        its features (posterior variance about 1 / (1 + strength)).
+    Both are unchanged by rescaling features, so standardised data are fine.
+
+    Fitted models only identify the signal Z Lambda^T: the scale of Z and of
+    Lambda can trade off. Pass Z_second_moment (E[z z^T] under the fit, e.g.
+    mean of loc_Z loc_Z^T plus diag of mean scale_Z^2) to measure strength on
+    the scale of the signal: M is replaced by S^1/2 M S^1/2 and beta by S^1/2 beta.
+
+    Parameters
+    ----------
+    Lambda_list     : list of (p_l, K) loadings per view
+    psi_list        : list of (p_l,) noise variances per view
+    beta            : (K,) outcome effects (optional)
+    Z_second_moment : (K, K) second moment of the scores (optional)
+
+    Returns
+    -------
+    dict with "eigenvalues" (descending, numpy), and, when beta is given,
+    "outcome_strength": strength along the direction beta (beta^T M beta / beta^T beta).
+    """
+    M = sum(_t(L).double().T @ (_t(L).double() / _t(s).double()[:, None])
+            for L, s in zip(Lambda_list, psi_list))
+    b = _t(beta).double().reshape(-1) if beta is not None else None
+    if Z_second_moment is not None:
+        w, V = torch.linalg.eigh(_t(Z_second_moment).double())
+        root = V @ torch.diag(w.clamp(min=0).sqrt()) @ V.T
+        M = root @ M @ root
+        b = root @ b if b is not None else None
+    out = {"eigenvalues": torch.linalg.eigvalsh(M).flip(0).numpy()}
+    if b is not None:
+        out["outcome_strength"] = float(b @ M @ b / (b @ b))
+    return out

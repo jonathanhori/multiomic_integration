@@ -8,7 +8,9 @@ variable genes chosen on the training samples), imputation and standardisation
 preprocess_on_train_only=True) and run_methods.process_data.
 
 Methods
-    shared       supervised shared-factor model (SupMultiviewShared), K factors
+    shared       supervised shared-factor model (SupMultiviewShared), K factors,
+                 trained for 1000 epochs (final setting; see SHARED_TRAIN_CONFIG)
+    shared_ma    the same run, scored at the MA w25 p50 stopping rule's stop
     mofa         MOFA2 (unsupervised, K factors) + OLS of y on the factors   [fit_mofa.R]
     pca_ols      PCA of the stacked views (K components) + OLS
     ridge        ridge regression on the stacked views, penalty by 5-fold CV
@@ -27,13 +29,18 @@ Outputs (results/)
     splits/seed<k>/                the matrices exported for MOFA and its outputs, and
                                    <method>_factors.npz for shared, mofa and pca_ols:
                                    training scores, test scores, loadings per view, and
-                                   outcome coefficients (used by the factor comparison)
+                                   outcome coefficients (used by the factor comparison);
+                                   for shared / shared_ma also the loading sd, E[tau],
+                                   the param store (<method>_paramstore.pt) and the
+                                   training loss (shared_loss.csv) and the closed-form
+                                   test MSE every 25 epochs (shared_curve.csv)
 
 The script resumes: (split, method) pairs already in method_comparison_splits.csv
 are skipped.
 
 usage: python compare_methods.py
 """
+import copy
 import os
 import subprocess
 import sys
@@ -49,7 +56,9 @@ from sklearn.linear_model import ElasticNetCV, LinearRegression, RidgeCV
 
 sys.path.insert(1, os.path.expanduser("~/multiomic_integration/python"))
 from coadread_data import load_coadread, make_view_list
-from run_methods import process_data, train_model, train_model_locally
+from run_methods import process_data, train_model, train_model_locally, _minibatch_size
+from stopping_rules import ma_patience
+from viper_predict import expected_tau, closed_form_scores, guide_moments
 from data_utils import summarise_post_samples
 from constants import Sites, Params
 
@@ -62,14 +71,28 @@ VIEWS       = ["expr", "meth_tss200"]
 N_RNA, N_METH = 2000, 1000
 K           = 20
 N_POSTERIOR_SAMPLES = 300
-METHODS     = ["shared", "mofa", "pca_ols", "ridge", "elastic_net", "mean"]
+METHODS     = ["shared", "shared_ma", "mofa", "pca_ols", "ridge", "elastic_net", "mean"]
 
-SHARED_MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0}
+# Final VIPER-Shared setting from the November 2026 simulation studies
+# (sim/exploration/final_benchmark.qmd, config fg_eta0.22_t0.02_mb0.08): low-variance
+# guide start (initial guide sd of Lambda 0.01, of Z 0.1), AdagradRMSProp eta 0.22,
+# t 0.02, minibatch fraction 0.08, trained for exactly 1000 epochs. Each fit is also
+# scored at the epoch where the MA w25 p50 stopping rule (moving average over 25
+# epochs, patience 50, no minimum) would have stopped it: method "shared_ma".
+# Earlier settings: results/archive_default_guide/, results/archive_lowvar_old_optimizer/.
+GUIDE_START = {"init_scale_Lambda": 0.01, "init_scale_Z": 0.1}
+SHARED_MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0, **GUIDE_START}
 SHARED_TRAIN_CONFIG = {
-    "eta": 0.25, "delta": 1e-16, "t": 0.1, "num_particles": 1,
-    "minibatch_fraction": 0.15, "min_epochs": 200, "max_epochs": 2000,   # see convergence_check.py
+    "eta": 0.22, "delta": 1e-16, "t": 0.02, "num_particles": 1,
+    "minibatch_fraction": 0.08, "min_epochs": 1000, "max_epochs": 1000,
     "convergence_criterion": "elbo_snr", "window": 50, "snr_threshold": 2,
 }
+# Local inference of the test scores (loadings frozen): same optimiser, stopping rule
+# as before (elbo_snr after at least 200 epochs).
+LOCAL_TRAIN_CONFIG = {**SHARED_TRAIN_CONFIG, "min_epochs": 200, "max_epochs": 2000}
+MA_RULE = {"window": 25, "patience": 50, "min_epochs": 0}
+CHECKPOINT_EVERY = 5     # epochs; the MA fit is the last checkpoint at or before the stop
+CURVE_EVERY = 25         # epochs between closed-form test scores (the test MSE curve)
 
 
 def load_split(seed):
@@ -108,23 +131,121 @@ def ols_beta(Z_train, dp):
     return np.linalg.lstsq(np.asarray(Z_train), y, rcond=None)[0]
 
 
-def fit_shared(seed, train_subset, test_subset, dp):
-    pyro.clear_param_store()
-    pyro.set_rng_seed(seed)
-    t0 = time.time()
-    fm, th, _ = train_model(SHARED_MODEL_CONFIG, SHARED_TRAIN_CONFIG, train_subset,
-                            model_type="shared", write=False, svd_init=True)
-    Lambda = [pyro.param(Params.loc_Lambda_l.format(l=l)).detach().squeeze() for l in range(len(VIEWS))]
-    Z_train = pyro.param(Params.loc_Z).detach()
-    beta = pyro.param(Params.loc_beta).detach().reshape(-1)
-    fm, teh, _ = train_model_locally(fm, SHARED_TRAIN_CONFIG, test_subset, model_type="shared")
-    runtime = time.time() - t0
+def _score_shared(fm, test_subset, dp):
+    """Factor outputs and test predictions of the fit in the current param store."""
+    L = len(VIEWS)
+    store = pyro.get_param_store()
+    out = {
+        "Lambda": [pyro.param(Params.loc_Lambda_l.format(l=l)).detach().squeeze().clone() for l in range(L)],
+        "Lambda_sd": [pyro.param(Params.scale_Lambda_l.format(l=l)).detach().squeeze().clone() for l in range(L)],
+        "Z_train": pyro.param(Params.loc_Z).detach().clone(),
+        "beta": pyro.param(Params.loc_beta).detach().reshape(-1).clone(),
+        "tau": [t.numpy() for t in expected_tau(store, L)],
+    }
+    fm, teh, _ = train_model_locally(fm, LOCAL_TRAIN_CONFIG, test_subset, model_type="shared")
     post = teh.predict(dp["test_X_l_list_clean"], N_POSTERIOR_SAMPLES, [Sites.y_pred, Sites.Z_pred])
     s = summarise_post_samples(post[Sites.y_pred].squeeze().cpu())
-    Z_test = post[Sites.Z_pred].mean(0).squeeze().cpu()
-    save_factors(seed, "shared", Z_train, Z_test, Lambda, beta)
-    xhat = [Z_test @ L.T for L in Lambda]
-    return s["mean"], s["q2.5"], s["q97.5"], rse(dp["test_X_l_list_clean"], xhat), runtime
+    out["Z_test"] = post[Sites.Z_pred].mean(0).squeeze().cpu()
+    out["pred"] = (s["mean"], s["q2.5"], s["q97.5"])
+    out["test_rse"] = rse(dp["test_X_l_list_clean"], [out["Z_test"] @ Lv.T for Lv in out["Lambda"]])
+    return out
+
+
+def fit_shared_two_stops(k, seed, train_subset, test_subset, dp, rng_seed=None):
+    """Train the shared model for SHARED_TRAIN_CONFIG["max_epochs"] epochs in chunks of
+    CHECKPOINT_EVERY, and score two fits of the same run: the fit at the end ("1000")
+    and the last checkpoint at or before the epoch where the MA rule would have
+    stopped ("ma"; the end fit if the rule never fires). Returns {"1000": ..., "ma": ...}
+    (outputs of _score_shared plus epoch, train_seconds, param store state), the
+    per-epoch training loss, and the test curve: every CURVE_EVERY epochs, the test
+    MSE (standardised outcome) of the closed-form predictions from the guide
+    (viper_predict.closed_form_scores; cheaper than local SVI, used only for the curve).
+    If training fails with NaN parameters (ValueError) before the end, res["1000"] is
+    {"failed_at": epoch}; the MA fit is still scored if the rule fired before the
+    failure (otherwise res["ma"] is {"failed_at": epoch} too)."""
+    pyro.clear_param_store()
+    pyro.set_rng_seed(seed if rng_seed is None else rng_seed)   # rng_seed: replacement run after a failure
+    cfg = {**SHARED_TRAIN_CONFIG, "min_epochs": CHECKPOINT_EVERY, "max_epochs": CHECKPOINT_EVERY}
+    t0 = time.time()
+    fm, th, _ = train_model({**SHARED_MODEL_CONFIG, "k": k}, cfg, train_subset,
+                            model_type="shared", write=False, svd_init=True)
+    store = pyro.get_param_store()
+    y_test = dp["test_y_clean"].reshape(-1).double()
+    curve = []
+
+    def score_curve(ep):
+        cf = closed_form_scores(guide_moments(store, len(VIEWS)), dp["test_X_l_list_clean"])
+        curve.append({"epoch": ep, "test_mse_std": float(((cf["yhat"] - y_test) ** 2).mean()),
+                      "loss_per_sample": float(np.mean(fm.loss_history[-CHECKPOINT_EVERY:])) / len(train_subset)})
+
+    score_curve(CHECKPOINT_EVERY)
+    epoch, ma_stop, ma_ckpt = CHECKPOINT_EVERY, None, None
+    prev = (epoch, copy.deepcopy(store.get_state()), time.time() - t0)
+    failed_at = None
+    while epoch < SHARED_TRAIN_CONFIG["max_epochs"]:
+        try:
+            th.do_inference(train_dataset=train_subset, min_epochs=CHECKPOINT_EVERY, epochs=CHECKPOINT_EVERY,
+                            minibatch_flag=True, minibatch_size=_minibatch_size(cfg, len(train_subset)),
+                            variational_diff_func=np.mean, verbose=False,
+                            convergence_criterion=cfg["convergence_criterion"])
+        except ValueError as e:              # NaN parameters
+            failed_at = epoch
+            print(f"  K={k} seed {seed}: training failed after epoch {epoch}: {str(e).splitlines()[0][:100]}", flush=True)
+            break
+        epoch += CHECKPOINT_EVERY
+        if epoch % CURVE_EVERY == 0:
+            score_curve(epoch)
+        now = (epoch, copy.deepcopy(store.get_state()), time.time() - t0)
+        if ma_stop is None:
+            ma_stop = ma_patience(fm.loss_history, MA_RULE["min_epochs"], MA_RULE["window"], MA_RULE["patience"])
+            if ma_stop is not None:
+                ma_ckpt = now if ma_stop >= epoch else prev
+        prev = now
+    end = prev if failed_at is None else None
+    if ma_ckpt is None:
+        ma_ckpt = end
+    loss = np.asarray(fm.loss_history, float) / len(train_subset)
+    res = {}
+    for name, ckpt in (("1000", end), ("ma", ma_ckpt)):
+        if ckpt is None:
+            res[name] = {"failed_at": failed_at, "ma_stop": ma_stop}
+            continue
+        ep, state, secs = ckpt
+        pyro.clear_param_store()
+        store.set_state(copy.deepcopy(state))
+        res[name] = {**_score_shared(fm, test_subset, dp), "epoch": ep, "ma_stop": ma_stop,
+                     "train_seconds": secs, "state": state}
+    return res, loss, pd.DataFrame(curve)
+
+
+def save_shared(d, method, r):
+    """Factor outputs of one shared fit (both checkpoints use the same layout), with
+    the posterior sd of the loadings (scale_view<l>), E_q[tau] per view (tau_view<l>)
+    and the param store."""
+    os.makedirs(d, exist_ok=True)
+    np.savez(os.path.join(d, f"{method}_factors.npz"),
+             Z_train=r["Z_train"].numpy(), Z_test=r["Z_test"].numpy(), beta=r["beta"].numpy(),
+             epoch=r["epoch"],
+             **{f"loadings_view{l}": Lv.numpy() for l, Lv in enumerate(r["Lambda"])},
+             **{f"scale_view{l}": sd.numpy() for l, sd in enumerate(r["Lambda_sd"])},
+             **{f"tau_view{l}": t for l, t in enumerate(r["tau"])})
+    torch.save(r["state"], os.path.join(d, f"{method}_paramstore.pt"))
+
+
+def fit_shared(seed, train_subset, test_subset, dp):
+    """Both checkpoints of one K = K run for compare_methods: returns
+    {"shared": (m, lo, hi, test_rse, runtime, epoch), "shared_ma": (...)}."""
+    res, loss, curve = fit_shared_two_stops(K, seed, train_subset, test_subset, dp)
+    d = split_dir(seed)
+    pd.DataFrame({"epoch": np.arange(1, len(loss) + 1), "loss_per_sample": loss}).to_csv(
+        os.path.join(d, "shared_loss.csv"), index=False)
+    curve.assign(ma_stop=res["ma"]["ma_stop"]).to_csv(os.path.join(d, "shared_curve.csv"), index=False)
+    out = {}
+    for method, name in (("shared", "1000"), ("shared_ma", "ma")):
+        r = res[name]
+        save_shared(d, method, r)
+        out[method] = (*r["pred"], r["test_rse"], r["train_seconds"], r["epoch"])
+    return out
 
 
 def fit_mofa(seed, dp):
@@ -189,9 +310,13 @@ def main():
         data, train_subset, test_subset, dp = load_split(seed)
         y_mean, y_sd = float(data["y"].mean()), float(data["y"].std())
         y_true = data["y_test"].reshape(-1)
+        shared_out = None
         for method in todo:
-            if method == "shared":
-                m, lo, hi, test_rse, runtime = fit_shared(seed, train_subset, test_subset, dp)
+            epochs = np.nan
+            if method in ("shared", "shared_ma"):
+                if shared_out is None:          # one run gives both checkpoints
+                    shared_out = fit_shared(seed, train_subset, test_subset, dp)
+                m, lo, hi, test_rse, runtime, epochs = shared_out[method]
             elif method == "mofa":
                 m, lo, hi, test_rse, runtime = fit_mofa(seed, dp)
             else:
@@ -205,7 +330,7 @@ def main():
                 "r2": float(1 - (resid ** 2).sum() / ((y_true - y_true.mean()) ** 2).sum()),
                 "coverage_95": float(((y_true >= lo) & (y_true <= hi)).float().mean()) if not torch.isnan(lo).all() else np.nan,
                 "width_95": float((hi - lo).mean()) if not torch.isnan(lo).all() else np.nan,
-                "test_rse": test_rse, "runtime": runtime,
+                "test_rse": test_rse, "runtime": runtime, "epochs": epochs,
             }
             metrics = pd.concat([metrics, pd.DataFrame([row])], ignore_index=True)
             preds = pd.concat([preds, pd.DataFrame({

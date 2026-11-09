@@ -38,7 +38,8 @@ EPOCHS  = [100, 200, 400, 800, 1600]
 SEED    = 42
 VIEWS   = ["expr", "meth_tss200"]
 K       = 20
-MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0}
+MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0,
+                "init_scale_Lambda": 0.01, "init_scale_Z": 0.1}   # low-variance guide start
 BASE_TRAIN_CONFIG = {
     "eta": 0.25, "delta": 1e-16, "t": 0.1, "num_particles": 1,
     "minibatch_fraction": 0.15, "convergence_criterion": "elbo_snr",

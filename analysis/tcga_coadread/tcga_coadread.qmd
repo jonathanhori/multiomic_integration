@@ -92,19 +92,24 @@ K            = 20          # factors fitted; the shrinkage prior switches off un
 N_POSTERIOR_SAMPLES = 300
 VERBOSE      = False
 
-MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0}
+MODEL_CONFIG = {"k": K, "dense_model": False, "outcome_weight": 1.0,
+                "init_scale_Lambda": 0.01, "init_scale_Z": 0.1}   # low-variance guide start
+# Final VIPER-Shared setting from the simulation studies (sim/exploration/final_benchmark.qmd,
+# "chosen"): AdagradRMSProp eta 0.22, t 0.02, minibatch fraction 0.08, exactly 1000 epochs.
 TRAIN_CONFIG = {
-    "eta":                   0.25,
+    "eta":                   0.22,
     "delta":                 1e-16,
-    "t":                     0.1,
+    "t":                     0.02,
     "num_particles":         1,
-    "minibatch_fraction":    0.15,
-    "min_epochs":            200,     # convergence_check.py: most of the loss decrease is over by 200
-    "max_epochs":            2000,
+    "minibatch_fraction":    0.08,
+    "min_epochs":            1000,    # min = max: the stopping rule never fires
+    "max_epochs":            1000,
     "convergence_criterion": "elbo_snr",
     "window":                50,
     "snr_threshold":         2,
 }
+# Local inference of the test scores: same optimiser, elbo_snr stopping after >= 200 epochs.
+LOCAL_TRAIN_CONFIG = {**TRAIN_CONFIG, "min_epochs": 200, "max_epochs": 2000}
 SAVE_STEM = os.path.join(RESULTS, f"model_{'_'.join(VIEWS)}_k{K}")
 ```
 
@@ -242,12 +247,13 @@ print("Model input:", [tuple(x.shape) for x in dp["train_X_l_list_clean"]],
 ## 3. Training
 
 The model is fitted to the training samples by stochastic variational
-inference, starting from the SVD of the stacked views. Training runs for at
-least `min_epochs` epochs and then stops when the loss has stopped improving
-relative to its noise (`elbo_snr`). `min_epochs = 200` comes from
-`convergence_check.py` (section 3b): with the stopping rule alone the fit stopped
-near epoch 100, while the loss was still falling steeply; by epoch 200 most of
-the decrease is over (a further 9% by epoch 1 600, with no change in test R²). The fitted model is saved to `results/` (see *Saved outputs*).
+inference, starting from the SVD of the stacked views, for exactly 1000 epochs.
+The optimiser setting is the one chosen in the simulation studies
+(`sim/exploration/final_benchmark.qmd`): AdagradRMSProp with η 0.22, t 0.02,
+minibatches of 8% of the samples, and the low-variance guide start (initial
+guide sd 0.01 for the loadings, 0.1 for the scores). Section 3b compares this
+with stopping early by the MA w25 p50 rule. The fitted model is saved to
+`results/` (see *Saved outputs*).
 
 ```{python}
 pyro.clear_param_store()
@@ -277,43 +283,66 @@ save_fig(fig, "training_loss.png")
 plt.show()
 ```
 
-### 3b. Is training long enough?
+### 3b. 1000 epochs or the MA w25 p50 stop?
 
-`convergence_check.py` refits this model on the same split with fixed training
-lengths (the stopping rule switched off) and records the training loss, the test
-performance, and how much the fitted signal $\hat Z\hat\Lambda^\top$ changes
-between lengths. With the stopping rule alone the fit stopped near epoch 100,
-while the loss was still falling steeply (23% lower by epoch 200). After 200 the
-gains are small (about 9% more by epoch 1 600), so `min_epochs` is 200 above. Test
-R² hardly changes with training length, so the gap to the penalised regressions
-(section 7) is not a convergence problem; longer training mainly narrows the
-predictive intervals.
+In the simulations the final setting was run for 1000 epochs, and the
+moving-average patience rule MA w25 p50 (the mean training loss over the last 25
+epochs has not set a new minimum for 50 epochs) was the stopping rule singled
+out. `compare_methods.py` trains each split's model for 1000 epochs, saving the
+fit every 5 epochs, and scores two fits of the same run: the fit at epoch 1000
+(`shared`) and the last saved fit at or before the epoch where MA w25 p50 would
+have stopped (`shared_ma`). Both are scored with local inference of the test
+scores. Along the way, every 25 epochs, the test MSE of the closed-form
+predictions from the guide is recorded (`viper_predict.closed_form_scores`;
+cheaper than local inference, used only for these curves).
 
 ```{python}
-conv_path = os.path.join(RESULTS, "convergence_check.csv")
-if os.path.exists(conv_path):
-    conv = pd.read_csv(conv_path)
-    display(conv[["epochs", "final_loss_per_sample", "test_r2", "coverage_95", "width_95",
-                  "active_factors", "signal_change_vs_previous"]].round(3))
-    fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
-    for e in conv["epochs"]:
-        curve = pd.read_csv(os.path.join(RESULTS, f"convergence_loss_{e}.csv"))
-        axes[0].plot(curve["epoch"], curve["loss_per_sample"], label=f"{e} epochs", lw=1)
-    axes[0].set(xlabel="Epoch", ylabel="Negative ELBO per sample", yscale="log",
-                title="Training loss for each training length")
+SPLIT_LABEL = {seed: i for i, seed in enumerate([42, 1, 2, 3, 4], start=1)}
+curves = {}
+for seed in SPLIT_LABEL:
+    path = os.path.join(RESULTS, "splits", f"seed{seed}", "shared_curve.csv")
+    if os.path.exists(path):
+        curves[seed] = pd.read_csv(path)
+if curves:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
+    for seed, c in curves.items():
+        col = plt.cm.tab10(SPLIT_LABEL[seed] - 1)
+        axes[0].plot(c["epoch"], c["test_mse_std"], color=col, lw=1.3, label=f"split {SPLIT_LABEL[seed]}")
+        stop = c["ma_stop"].iloc[0]
+        if pd.notna(stop):
+            axes[0].plot(stop, np.interp(stop, c["epoch"], c["test_mse_std"]), "o", color=col, mec="k", ms=7)
+        loss = pd.read_csv(os.path.join(RESULTS, "splits", f"seed{seed}", "shared_loss.csv"))
+        axes[1].plot(loss["epoch"], loss["loss_per_sample"].rolling(25).mean(), color=col, lw=1.2)
+        if pd.notna(stop):
+            axes[1].axvline(stop, color=col, ls=":", lw=1)
+    axes[0].set(xlabel="Epoch", ylabel="Test MSE (standardised outcome)",
+                title="Test MSE over training (closed form); dots: MA w25 p50 stop")
     axes[0].legend(fontsize=8)
-    axes[1].plot(conv["epochs"], conv["test_r2"], marker="o", label="test R²")
-    axes[1].set(xscale="log", xlabel="Training epochs", ylabel="Test R²",
-                title="Test performance vs. training length")
-    ax2 = axes[1].twinx()
-    ax2.plot(conv["epochs"], conv["width_95"], marker="s", color="tab:orange", label="95% interval width")
-    ax2.set_ylabel("95% interval width", color="tab:orange")
+    axes[1].set(xlabel="Epoch", ylabel="Negative ELBO per sample (25-epoch mean)", yscale="log",
+                title="Training loss; dotted: MA w25 p50 stop")
     plt.tight_layout()
-    save_fig(fig, "convergence_check.png")
+    save_fig(fig, "stopping_curves.png")
     plt.show()
 else:
-    print("Run convergence_check.py to produce this section.")
+    print("Run compare_methods.py to produce this section.")
 ```
+
+```{python}
+comp_path = os.path.join(RESULTS, "method_comparison_splits.csv")
+if os.path.exists(comp_path):
+    stops = (pd.read_csv(comp_path).query("method in ['shared', 'shared_ma']")
+             .pivot(index="seed", columns="method", values=["epochs", "r2", "mse", "coverage_95", "width_95", "test_rse", "runtime"]))
+    stops = stops.rename(index=SPLIT_LABEL).sort_index().rename_axis("split")
+    stops.columns = [f"{m} {'(1000)' if meth == 'shared' else '(MA)'}" for m, meth in stops.columns]
+    display(save_table(stops.round(3), "stopping_comparison.csv"))
+```
+
+The MA rule stops between epochs 185 and 445 (mean 306), and the two fits predict
+equally well: mean test R² 0.436 at 1000 epochs and 0.438 at the MA stop, with
+the split-to-split differences in both directions (−0.011 to +0.015) and the same
+coverage (0.93). The closed-form test MSE is flat from about epoch 200 to 1000, so
+training beyond the MA stop neither helps nor hurts at K = 20; it only costs time
+(MA fits use about a third of the training time).
 
 ## 4. Prediction on the test samples
 
@@ -323,7 +352,7 @@ alone; their TMB is never used.
 
 ```{python}
 factor_model, test_handler, local_state = train_model_locally(
-    factor_model, TRAIN_CONFIG, test_subset, model_out_filename=SAVE_STEM,
+    factor_model, LOCAL_TRAIN_CONFIG, test_subset, model_out_filename=SAVE_STEM,
     model_type="shared", verbose=VERBOSE,
 )
 print(f"Local inference: {factor_model.local_epochs} epochs, {local_state['inference_time']:.0f}s")
@@ -567,21 +596,22 @@ plt.show()
 
 | Method | Description |
 |---|---|
-| `shared` | this model |
+| `shared` | this model, 1000 epochs |
+| `shared_ma` | the same run, at the MA w25 p50 stop (section 3b) |
 | `mofa` | MOFA2 (unsupervised, $K = 20$) + OLS of TMB on its factors |
 | `pca_ols` | PCA of the stacked views ($K = 20$) + OLS |
 | `ridge` | ridge regression on all genes, penalty by 5-fold CV |
 | `elastic_net` | elastic net on all genes, penalty and mix by 5-fold CV |
 | `mean` | the training mean (R² ≈ 0 reference) |
 
-Re-run with `python analysis/tcga_coadread/compare_methods.py` (about 40
-minutes; it resumes where it stopped).
+Re-run with `python analysis/tcga_coadread/compare_methods.py` (about an hour;
+it resumes where it stopped).
 
 ```{python}
 comp_path = os.path.join(RESULTS, "method_comparison_splits.csv")
 if os.path.exists(comp_path):
     comp = pd.read_csv(comp_path)
-    order = ["shared", "mofa", "pca_ols", "ridge", "elastic_net", "mean"]
+    order = ["shared", "shared_ma", "mofa", "pca_ols", "ridge", "elastic_net", "mean"]
     summary = (comp.groupby("method")[["r2", "mse", "coverage_95", "width_95", "test_rse", "runtime"]]
                    .agg(["mean", "std"]).reindex([m for m in order if m in set(comp["method"])]))
     print(f"{comp['seed'].nunique()} splits")
@@ -636,7 +666,7 @@ the numbering of section 6.
 from factor_interpretation import _rotate_loadings
 
 FACTOR_METHODS = ["shared", "mofa", "pca_ols"]
-METHOD_LABEL = {"shared": "shared model", "mofa": "MOFA", "pca_ols": "PCA"}
+METHOD_LABEL = {"shared": "shared model", "shared_ma": "shared model (MA stop)", "mofa": "MOFA", "pca_ols": "PCA"}
 SEEDS = sorted(int(d.replace("seed", "")) for d in os.listdir(os.path.join(RESULTS, "splits")))
 split_dir = lambda seed: os.path.join(RESULTS, "splits", f"seed{seed}")
 
@@ -858,89 +888,390 @@ if os.path.exists(pc_path):
 
 PCA + OLS approaches ridge only with about 150–300 components, and ridge's
 out-of-factor-space prediction correlates about 0.6 with the out-of-space part
-of TMB. So TMB's predictive information is spread over many weak directions
+of TMB. (This table was computed in October 2026; its shared-model column and
+the factor space come from the earlier default-guide fit, whose factor space is
+essentially the same as the current fit's, section 7c.) So TMB's predictive information is spread over many weak directions
 beyond the dominant ~20: the factor models' shortfall is the number of factors
 they keep, not convergence or the choice of coefficients within their factor
-space. A model could capture more of it with more factors — but the shrinkage
-prior prunes factors that explain little of the views, which is where a larger
-outcome weight could let the outcome decide which weak factors to keep.
+space. Section 7e tests this directly by fitting every factor method with more
+factors.
+
+### 7e. Fitting more factors
+
+The factor methods were refitted with K = 20, 50 and 100 factors on the same
+five splits (`k_sweep.py`; outcome weight 1, all other settings unchanged; the
+shared model trained for 1000 epochs and scored also at the MA w25 p50 stop, as
+in section 3b). The MGP prior computes the product of the shrinkage parameters
+in log space (at K = 100 the direct product underflowed in float32).
+
+On split 5 the shared model with K = 100 failed three times (random seeds 4, 5
+and 6): within the first 5 epochs the guide's noise-variance parameters became
+NaN. At K = 100 the first epoch's loss is about 1e12 per sample on every seed
+(against about 1e5 by epoch 5), and on this split that initial spike breaks the
+fit. So the shared model's K = 100 results cover 4 splits; the second table
+compares the methods on the splits where all of them have a fit.
+
+```{python}
+ks_dir = os.path.join(RESULTS, "k_sweep")
+ks = pd.read_csv(os.path.join(ks_dir, "k_sweep_splits.csv"))
+if "failed" in ks:
+    ks = ks[ks["failed"] != True]
+ks["label"] = ks["method"].map(METHOD_LABEL)
+ridge_r2 = pd.read_csv(os.path.join(RESULTS, "method_comparison_splits.csv")).query("method == 'ridge'")["r2"].mean()
+summ = ks.groupby(["label", "k"]).agg(r2_mean=("r2", "mean"), r2_sd=("r2", "std"),
+                                      test_rse=("test_rse", "mean"), coverage_95=("coverage_95", "mean"),
+                                      epochs=("epochs", "mean"), runtime=("runtime", "mean"))
+display(save_table(summ.round(3), "k_sweep_summary.csv"))
+# Mean test R² on the splits where every method has a fit at that K (a shared fit can fail)
+common = (ks.pivot_table(index=["k", "seed"], columns="label", values="r2").dropna()
+            .groupby("k").agg(["mean", "count"]).round(3))
+display(common)
+
+fig, ax = plt.subplots(figsize=(6.5, 3.8))
+for lab, g in summ.reset_index().groupby("label"):
+    ax.errorbar(g["k"], g["r2_mean"], yerr=g["r2_sd"] / np.sqrt(len(SEEDS)), marker="o", capsize=3, label=lab)
+ax.axhline(ridge_r2, color="tab:red", ls="--", label="ridge")
+ax.set(xlabel="Number of factors K", ylabel="Test R² (mean ± SE, 5 splits)", xticks=[20, 50, 100],
+       title="Prediction vs. number of factors")
+ax.legend()
+plt.tight_layout()
+save_fig(fig, "k_sweep_r2.png")
+plt.show()
+```
+
+Every method predicts better with more factors. On the common splits, test R²
+rises from K = 20 to 100 from 0.44 to 0.56 for the shared model (0.56 at the MA
+stop), 0.43 to 0.56 for MOFA and 0.45 to 0.59 for PCA (ridge 0.63). With the
+final setting the shared model is level with MOFA at every K and about 0.03 below
+PCA at K = 50 and 100. It reconstructs the test views slightly worse than both
+(test RSE 0.42 against 0.40–0.41 at K = 100).
+
+Test MSE over training for the shared model at each K (closed-form predictions
+every 25 epochs, mean over the five splits; thin lines: single splits), with the
+MA w25 p50 stops marked:
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(15, 3.8), sharey=True)
+for ax, k in zip(axes, [20, 50, 100]):
+    cs = []
+    for seed in SPLIT_LABEL:
+        path = os.path.join(ks_dir, f"seed{seed}", f"k{k}", "shared_curve.csv")
+        if not os.path.exists(path):
+            continue
+        c = pd.read_csv(path)
+        cs.append(c.set_index("epoch")["test_mse_std"].rename(seed))
+        ax.plot(c["epoch"], c["test_mse_std"], color="grey", lw=0.6, alpha=0.6)
+        stop = c["ma_stop"].iloc[0]
+        if pd.notna(stop):
+            ax.plot(stop, np.interp(stop, c["epoch"], c["test_mse_std"]), "o", color="#c0392b", mec="k", ms=5)
+    if cs:
+        m = pd.concat(cs, axis=1).mean(1)
+        ax.plot(m.index, m.values, color="black", lw=2, label="mean over splits")
+    ax.set(xlabel="Epoch", title=f"K = {k}")
+axes[0].set_ylabel("Test MSE (standardised outcome)")
+axes[0].plot([], [], "o", color="#c0392b", mec="k", label="MA w25 p50 stop")
+axes[0].legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "k_sweep_stopping_curves.png")
+plt.show()
+```
+
+The MA rule stops earlier as K grows (mean epoch 306, 284 and 240 at K = 20, 50
+and 100). At K = 20 and 50 the test MSE is flat after about epoch 200. At K = 100
+it is lowest around epoch 250 and then rises slowly (mean 0.413 at epoch 250,
+0.44 at 1000): with 100 factors, longer training starts to overfit, and the MA
+stop is close to the best point. Scored with local inference, the difference is
+small (test R² 0.561 at 1000 epochs, 0.564 at the MA stop), but the MA fits'
+intervals are better calibrated at K = 100 (coverage 0.96 against 0.93).
+
+### 7f. How many factors does the model select?
+
+The MGP prior's column shrinkage $\tau_{lk} = \prod_{h \le k} \delta_{lh}$ should
+switch off factors the data do not need, so the number of factors in use should
+level off as $K_{\max}$ grows. This uses the shared model's fits from `k_sweep.py`
+($K_{\max}$ = 20, 50, 100, 1000 epochs, five splits; split 1 and split 3 are
+plotted). For each fit, factors are ranked by their proportion of the
+training data's variance explained (PVE, $\|z_k\|^2 \sum_l \|\lambda_{lk}\|^2 / \mathrm{TSS}$);
+where the ranked PVE drops off shows how many factors are in use.
+
+```{python}
+SEL_SEEDS, SEL_K = [42, 2], [20, 50, 100]
+sel_path = lambda seed, k: os.path.join(ks_dir, f"seed{seed}", f"k{k}", "shared_factors.npz")
+
+def ranked_pve(f):
+    W, Z = np.vstack([f[f"loadings_view{l}"] for l in range(L)]), f["Z_train"]
+    return np.sort((Z ** 2).sum(0) * (W ** 2).sum(0) / (Z.shape[0] * W.shape[0]))[::-1]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), sharey=True)
+colors = dict(zip(SEL_K, plt.cm.viridis(np.linspace(0.1, 0.85, len(SEL_K)))))
+for ax, seed in zip(axes, SEL_SEEDS):
+    for k in SEL_K:
+        path = sel_path(seed, k)
+        if os.path.exists(path):
+            v = ranked_pve(np.load(path))
+            ax.plot(np.arange(1, k + 1), v, color=colors[k], lw=1.8, label=f"shared, $K_{{max}}$ = {k}")
+    for m, ls in [("mofa", "--"), ("pca_ols", ":")]:
+        v = ranked_pve(np.load(os.path.join(ks_dir, f"seed{seed}", "k100", f"{m}_factors.npz")))
+        ax.plot(np.arange(1, 101), v, color="grey", ls=ls, lw=1.2, label=f"{METHOD_LABEL[m]}, K = 100")
+    for thr in (0.01, 0.001):
+        ax.axhline(thr, color="k", lw=0.6, alpha=0.4)
+    ax.set(yscale="log", ylim=(1e-5, 0.2), xlabel="Factor rank (by PVE)",
+           title=f"Split {SPLIT_LABEL.get(seed, seed)}")
+axes[0].set_ylabel("PVE of the training data")
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "factor_selection_ranked_pve.png")
+plt.show()
+```
+
+```{python}
+rows = []
+for seed in SPLIT_LABEL:
+    for k in SEL_K:
+        path = sel_path(seed, k)
+        if not os.path.exists(path):
+            continue
+        v = ranked_pve(np.load(path))
+        c = np.cumsum(v) / v.sum()
+        rows.append({"split": SPLIT_LABEL.get(seed, seed), "K_max": k, "PVE (all factors)": v.sum(),
+                     "factors > 1%": int((v > 0.01).sum()), "factors > 0.1%": int((v > 0.001).sum()),
+                     "factors for 90% of explained": int(np.searchsorted(c, 0.9) + 1),
+                     "effective number": v.sum() ** 2 / (v ** 2).sum()})
+sel = pd.DataFrame(rows).merge(
+    ks.query("method == 'shared'")[["seed", "k", "r2", "coverage_95"]]
+      .assign(split=lambda d: d["seed"].map(SPLIT_LABEL)).drop(columns="seed")
+      .rename(columns={"k": "K_max", "r2": "test_r2"}), on=["split", "K_max"]).sort_values(["K_max", "split"])
+display(save_table(sel.round(3), "factor_selection.csv", index=False))
+display(sel.drop(columns="split").groupby("K_max").mean().round(3))
+```
+
+The column shrinkage itself, $E_q[\tau_{lk}] = \prod_{h \le k} a_{lh}/b_{lh}$ per view
+(the prior standard deviation of a loading in column $k$ is about
+$\tau_{lk}^{-1/2}$):
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+for ax, (l, view) in zip(axes, enumerate(["expression", "TSS200 methylation"])):
+    for k in SEL_K:
+        path = sel_path(SPLIT_SEED, k)
+        if os.path.exists(path):
+            ax.plot(np.arange(1, k + 1), np.load(path)[f"tau_view{l}"], color=colors[k], lw=1.8,
+                    label=f"$K_{{max}}$ = {k}")
+    ax.set(yscale="log", xlabel="Column k", title=f"{view} (split 1)")
+axes[0].set_ylabel(r"$E_q[\tau_{lk}]$")
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "factor_selection_tau.png")
+plt.show()
+```
+
+The ranked PVE has one clear break: it falls steeply over the first ~12
+factors (from about 8% to 1% each) and then declines slowly and smoothly, with no
+second elbow. In every fit 11–14 factors explain more than 1% of the data, at
+every $K_{\max}$; beyond those, the shared model keeps almost every column in use
+(all 50 at $K_{\max}$ = 50; 92–98 of 100 above 0.1% at $K_{\max}$ = 100). Total PVE
+grows from 0.48 to 0.59 to 0.68, and the number of factors for 90% of the
+explained variance from 14 to 30 to 54, so the MGP prior does not switch off
+columns as $K_{\max}$ grows.
+
+The column shrinkage shows why. At $K_{\max}$ = 20, $E[\tau_k]$ rises steadily along
+the columns (from about 3 to a few hundred) and tracks which factors are used
+(rank correlation with PVE −0.6 to −1.0). At $K_{\max}$ = 50 and 100 it no longer
+does: on most splits $E[\tau_k]$ swings over many orders of magnitude (at
+$K_{\max}$ = 100 from about 1e−20 to 1e17) without a trend, and its rank
+correlation with PVE is between −0.6 and +0.45. Trained for 1000 epochs with the
+final setting, the multiplicative gamma process does not act as a column
+selector at large $K_{\max}$ on this data. The number of factors "selected" is not
+a sharp property of the fit beyond the ~12 strong ones, and $K_{\max}$ is in
+effect the number of factors used.
+
+### 7g. Sparsity of the loadings
+
+The shared model's MGP prior is meant to make loadings sparse. Two questions:
+are its loadings sparser than MOFA's (whose default prior on the weights is a
+spike-and-slab) or PCA's (no sparsity), and do matched factors use the same
+features? Measures, per active factor, on loadings scaled by the factor's
+score standard deviation (K = 20 fits of `k_sweep.py`, all five splits):
+
+| Measure | Meaning |
+|---|---|
+| Effective number of features | $(\sum_j w_j^2)^2 / \sum_j w_j^4$: how many features the factor effectively uses (of 3 000) |
+| Features for 90% of energy | smallest number of features carrying 90% of $\sum_j w_j^2$ |
+| Hoyer sparsity | 0 for equal loadings on every feature, 1 for a single feature |
+
+```{python}
+def scaled_loadings(method, seed, rotate):
+    f = np.load(os.path.join(ks_dir, f"seed{seed}", "k20", f"{method}_factors.npz"))
+    W, Z = [f[f"loadings_view{l}"] for l in range(L)], f["Z_train"]
+    if rotate:
+        W, R = _rotate_loadings(W)
+        Z = Z @ R
+    W = np.vstack(W) * np.sqrt((Z ** 2).mean(0))
+    return W, Z, np.where((W ** 2).sum(0) / W.shape[0] > 0.01)[0]
+
+def hoyer(w):
+    p = len(w)
+    return (np.sqrt(p) - np.abs(w).sum() / np.sqrt((w ** 2).sum())) / (np.sqrt(p) - 1)
+
+rows = []
+for rotate in (False, True):
+    for seed in SEEDS:
+        for m in FACTOR_METHODS:
+            W, _, act = scaled_loadings(m, seed, rotate)
+            for k in act:
+                e = np.sort(W[:, k] ** 2)[::-1]
+                rows.append({"loadings": "varimax-rotated" if rotate else "as fitted",
+                             "method": METHOD_LABEL[m],
+                             "effective features": e.sum() ** 2 / (e ** 2).sum(),
+                             "features for 90% of energy": np.searchsorted(np.cumsum(e) / e.sum(), 0.9) + 1,
+                             "Hoyer sparsity": hoyer(W[:, k])})
+display(save_table(pd.DataFrame(rows).groupby(["loadings", "method"]).median().round(2),
+                   "loading_sparsity.csv"))
+```
+
+The shared model's posterior gives a second, Bayesian view: the share of each
+active factor's loadings whose 95% interval excludes zero (mean-field SVI
+understates posterior uncertainty, so this overstates how many are non-zero).
+
+```{python}
+rows = []
+for seed in SEEDS:
+    f = np.load(os.path.join(ks_dir, f"seed{seed}", "k20", "shared_factors.npz"))
+    W = np.vstack([f[f"loadings_view{l}"] for l in range(L)])
+    S = np.vstack([f[f"scale_view{l}"] for l in range(L)])
+    _, _, act = scaled_loadings("shared", seed, False)
+    excl = np.abs(W[:, act]) > 1.96 * S[:, act]
+    rows.append({"seed": seed, "active factors": len(act),
+                 "median share of loadings excluding 0": np.median(excl.mean(0)),
+                 "range over factors": f"{excl.mean(0).min():.2f}–{excl.mean(0).max():.2f}",
+                 "features with no loading excluding 0": int((~excl.any(1)).sum())})
+display(save_table(pd.DataFrame(rows).round(3), "shared_loading_intervals.csv", index=False))
+```
+
+Do matched factors use the same features? Each shared-model factor (rotated) is
+paired with the other method's factor whose scores correlate most with it, and
+their 150 largest loadings (top 5%) are compared:
+
+```{python}
+top = lambda w, n=150: set(np.argsort(-np.abs(w))[:n])
+rows = []
+for seed in SEEDS:
+    Ws, Zs, a_s = scaled_loadings("shared", seed, True)
+    for m in ["mofa", "pca_ols"]:
+        Wo, Zo, a_o = scaled_loadings(m, seed, True)
+        C = np.corrcoef(Zs[:, a_s].T, Zo[:, a_o].T)[:len(a_s), len(a_s):]
+        for i, k in enumerate(a_s):
+            j = a_o[np.argmax(np.abs(C[i]))]
+            ts, to = top(Ws[:, k]), top(Wo[:, j])
+            rows.append({"compared with": METHOD_LABEL[m], "score |r|": np.abs(C[i]).max(),
+                         "loading |r|": abs(np.corrcoef(Ws[:, k], Wo[:, j])[0, 1]),
+                         "top-150 overlap (Jaccard)": len(ts & to) / len(ts | to)})
+display(save_table(pd.DataFrame(rows).groupby("compared with").median().round(3),
+                   "matched_factor_features.csv"))
+```
+
+The shared model's loadings are not sparse. As fitted, each active factor
+effectively uses about 780 of the 3 000 features (MOFA 760, PCA 960); after
+varimax rotation the three methods are alike (about 480–510). For most factors
+about 60% of the loadings have 95% intervals excluding zero. The MGP prior's main
+effect is meant to be on whole factors (the cumulative product shrinks later
+columns); its per-loading part, Gamma(α/2, α/2) with α = 3, gives each loading a
+Student-t prior with 3 degrees of freedom: heavy-tailed, but not a prior that
+pulls most loadings to zero, unlike MOFA's spike-and-slab. Matched factors use
+largely the same features: their 150 leading genes overlap with a Jaccard index
+of 0.72 with MOFA (about 84% of the genes shared) and 0.53 with PCA (about 69%).
 
 ## 8. Summary of findings
 
-Numbers refer to the October 2026 run (split seed 42, `min_epochs = 200`;
-comparisons over five splits). Gene-level readings are interpretations of the
-loadings and should be checked against the literature and, where possible,
-gene-set analysis.
+Numbers refer to the November 2026 run with the final VIPER-Shared setting
+(low-variance guide start; AdagradRMSProp η 0.22, t 0.02, minibatch fraction
+0.08; 1000 epochs; split seed 42 above, five splits in the comparisons). The
+earlier runs are in `results/archive_default_guide/` and
+`results/archive_lowvar_old_optimizer/`. Gene-level readings are
+interpretations of the loadings and should be checked against the literature and,
+where possible, gene-set analysis.
 
-**Prediction.** On the held-out samples the shared model explains about 44% of
-the variance in log(1 + TMB) (five-split mean 0.44), with 95% intervals covering
-about 92–93% of test samples. Training longer than 200 epochs lowers the loss
-further but does not change test R² (section 3b).
+**Prediction.** On the held-out samples the shared model with K = 20 explains
+about 44% of the variance in log(1 + TMB) (five-split mean 0.436; 0.41 on split
+1), with 95% intervals covering about 93% of test samples. Stopping at the MA w25
+p50 rule (mean epoch 306) predicts as well (0.438) in about a third of the
+training time (section 3b).
 
 **The TMB signal is strong in the data.** The direction the model uses to
-predict TMB stands out from the noise far more (well over 100×) than the
-threshold at which an unsupervised method could find it, so the outcome-related
-variation is not hidden in these views (`docs/supervision_regimes.md`).
+predict TMB stands out from the noise far more (about 160×) than the threshold at
+which an unsupervised method could find it, so the outcome-related variation is
+not hidden in these views (`docs/supervision_regimes.md`).
 
-**What the factors capture** (rotated factors; clinical association heatmap and
-gene panels):
+**What the factors capture** (split 1, rotated factors; clinical association
+heatmap and gene panels):
 
-- **F3**, the factor most associated with TMB (about 20% of the outcome's
-  variance), is promoter hypermethylation across many genes (e.g. WNT3, MCC,
-  NRG2, PTGER3); its scores rise with TMB and the MSI score, fall with
-  aneuploidy, and differ strongly by molecular subtype — consistent with the CpG
-  island methylator phenotype that accompanies microsatellite instability.
-- **F1**, the second most TMB-associated factor (negative effect), is promoter
-  methylation of intestinal and metabolic genes (e.g. XDH, PCK1, HSD17B2, with
-  negative loadings); its scores fall with the MSI score. It is also associated
-  with tissue source site (η² 0.27), so part of it may be batch.
-- **F10** is expression of chromosome 20q genes (e.g. EIF6, RALY, HM13) and
-  tracks aneuploidy — consistent with 20q copy-number gain in chromosomally
-  unstable tumours, which tend to have low TMB.
-- **F18** is interferon-γ / antigen-presentation expression (CXCL9, TAP2, HLA
-  class II) — consistent with the immune infiltration of hypermutated tumours.
-- **F12** (AGR2, TFF3, XBP1) suggests secretory/mucinous differentiation, **F5**
-  (GPA33, TSPAN1, DHRS9) intestinal epithelial differentiation, and **F8** is
-  almost entirely explained by sex.
-- **F17** is the factor most associated with tissue source site (η² 0.42) and has
-  no coherent gene programme among its top genes: likely a batch effect.
+- **F3**, the factor most associated with TMB (28% of the outcome's variance),
+  is promoter hypermethylation across many genes (e.g. WNT3, NRG2, MCC, RNF182);
+  its scores rise with TMB (ρ 0.43) and the MSI score, fall with aneuploidy, and
+  differ by molecular subtype (η² 0.29): consistent with the CpG island
+  methylator phenotype that accompanies microsatellite instability.
+- **F1**, the second (negative effect, 13% of the outcome's variance), is
+  promoter methylation of intestinal and metabolic genes (e.g. XDH, HSD17B2,
+  MEP1A, TM4SF4, with negative loadings); its scores fall with the MSI score. It
+  is also associated with tissue source site (η² 0.28), so part of it may be
+  batch.
+- Smaller outcome effects: **F15**, secretory/mucinous differentiation (AGR2,
+  XBP1, CREB3L1); **F18**, interferon-γ / antigen presentation (HLA class II,
+  STAT1, IRF1, CD74, TAP1), consistent with the immune infiltration of
+  hypermutated tumours; **F11**, intestinal epithelial differentiation (TSPAN1,
+  DHRS9, GPA33).
+- **F9** is expression of chromosome 20q genes (e.g. RPN2, C20orf43, STAU1,
+  PSMA7) and tracks aneuploidy (ρ 0.40), consistent with 20q gain in
+  chromosomally unstable tumours; **F7** is stromal/collagen expression (COL1A2,
+  SPARC, PDGFRB); **F8** is almost entirely explained by sex.
+- **F6** (proliferation and RNA processing: SSRP1, NCL, MCM3, HNRNPs) and **F10**
+  (ribosomal protein genes) are the factors most associated with tissue source
+  site (η² 0.31 and 0.29): partly technical.
 
 **Comparison of predictions.** Ridge (R² 0.63) and elastic net (0.59) predict TMB
-clearly better than every factor method; the shared model (0.44) performs like
-the unsupervised PCA + OLS (0.45) and MOFA + OLS (0.43). With
-`outcome_weight = 1` the outcome contributes one likelihood term per sample
-against 3 000 feature terms, so the factors are driven almost entirely by the
-views' variance, as in unsupervised methods; and summarising 3 000 features in
-20 factors discards predictive detail that a penalised regression keeps.
+clearly better than every factor method with 20 factors; the shared model (0.44)
+performs like PCA + OLS (0.45) and MOFA + OLS (0.43), and the three methods'
+test predictions correlate 0.99.
 
 **Comparison of factors** (sections 7b–7c). The three factor methods recover
-essentially the same factors (subspace canonical correlations above 0.9; factor
-matches with MOFA |r| ≈ 0.98; predictions correlate 0.99). The shared model's
-factors are about as interpretable and reproducible as MOFA's, with no clear
-advantage:
+essentially the same factors (subspace canonical correlations above 0.9 for most
+factors; median best factor match with MOFA |r| 0.94; fitted outcome directions
+correlate 0.99–1.0). Differences:
 
-- **Stability:** shared model and MOFA factors reappear almost exactly when
-  refitted on other splits (mean best correlation 0.94; 0.98 for the main TMB
-  factor); PCA's are less stable (0.84; 0.75 for its main TMB factor).
-- **Outcome concentration:** the shared model puts slightly more of TMB into
-  its top factor (48% of the factors' outcome R², vs 34% for MOFA) and needs
-  fewer factors for 80% of it (4.4 vs 5.4); PCA is similar on average but varies
-  much more between splits.
+- **Stability:** the shared model's and MOFA's factors reappear when refitted on
+  other splits (mean best correlation 0.94; 0.99 and 0.98 for the main TMB
+  factor); PCA's are less stable (0.84; 0.75).
+- **Outcome concentration:** the shared model puts more of TMB into its top
+  factor (52% of the factors' outcome R², against 34% for MOFA) and needs fewer
+  factors for 80% of it (3.8 against 5.4). Its factors also fit the training
+  outcome better (R² 0.53 against 0.38 for MOFA and PCA) without predicting the
+  test outcome better.
 - **Clinical alignment:** all three find factors related to MSI, aneuploidy and
-  subtype; PCA's best matches are slightly stronger, and the shared model's and
-  MOFA's are similar. The strongest association with tissue source site is the
-  same for the shared model and MOFA (η² 0.32) and higher for PCA (0.38).
+  subtype, but the shared model's best matches are somewhat weaker (MSI score
+  |ρ| 0.32 against 0.37–0.42, aneuploidy 0.40 against 0.53).
 
-So on this data the supervised model behaves much like MOFA, which is expected
-when the outcome has almost no weight in the fit.
+**Where the gap to ridge comes from** (sections 7d–7e). PCA + OLS reaches
+ridge's R² only with about 150–300 components: TMB's predictive information is
+spread over many weak directions beyond the ~20 that the factor models keep.
+Fitting more factors helps every method: from K = 20 to 100, test R² rises from
+0.44 to 0.56 for the shared model, 0.43 to 0.56 for MOFA and 0.45 to 0.59 for PCA
+(on the splits where all fitted). With 100 factors the shared model fails on one
+of five splits (NaN in the first epochs, from an initial loss spike of about
+1e12 per sample), and test MSE starts to rise after about 250 epochs, which the
+MA stop avoids.
 
-**Where the gap to ridge comes from** (section 7d). PCA + OLS reaches ridge's R²
-only with about 150–300 components: TMB's predictive information is spread over
-many weak directions beyond the ~20 that the factor models keep. Closing the gap
-needs more factors, and — because the shrinkage prior prunes factors that
-explain little of the views — probably a larger outcome weight so the outcome
-can keep the weak predictive ones. A cross-validated sweep over the outcome
-weight and the number of factors is the natural next experiment.
+**Factors selected** (section 7f). The ranked PVE shows about 12 strong factors
+and then a smooth continuum of weak ones, with no second elbow. With the final
+setting the MGP prior does not switch columns off at large $K_{\max}$: almost
+every column stays in use, and the column shrinkage $E[\tau_k]$ is well behaved at
+$K_{\max}$ = 20 but erratic at 50 and 100. Beyond the ~12 strong factors, the
+number of factors is set by $K_{\max}$, not selected by the prior.
+
+**Sparsity** (section 7g). The shared model's loadings are not sparse: about as
+dense as MOFA's and PCA's, with most loadings' intervals excluding zero. Matched
+factors share most of their leading genes across methods. Calling the model
+sparse would need a prior that shrinks individual loadings towards zero (e.g. a
+smaller α, a horseshoe or a spike-and-slab).
 
 ## Saved outputs
 
