@@ -225,6 +225,9 @@ def _run_rep(rep_args):
 
         k_fit        = int(sim_data.get("K")) + k_delta
         model_config = {"k": k_fit, "dense_model": False}
+        # Optional (sim_run_shared_controlled.py); absent -> the model default of 1.
+        if rep_args.get("outcome_weight") is not None:
+            model_config["outcome_weight"] = rep_args["outcome_weight"]
 
         if os.path.isfile(model_out_filename + ".pth"):
             print(f"  rep {rep}: model found, re-running evaluation.")
@@ -272,6 +275,8 @@ def _run_rep(rep_args):
             "window":                train_config["window"],
             "snr_threshold":         train_config["snr_threshold"],
         }
+        if "outcome_weight" in model_config:
+            config_cols["outcome_weight"] = model_config["outcome_weight"]
         eval_table = eval_table.assign(**config_cols)
         if cov_table is not None:
             cov_table = cov_table.assign(**config_cols)

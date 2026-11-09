@@ -122,6 +122,8 @@ class ModelHandler:
                     snr_threshold = 0.1,
                     spike_tol = 0.1,
                     grad_norm_tol = 1e-3,
+                    ma_window = 50,
+                    ma_patience = 50,
                     device = "cpu",
                     verbose = False,
                     optuna_trial = None,
@@ -151,8 +153,12 @@ class ModelHandler:
                           window) < snr_threshold, and the current epoch's loss is
                           at most (1 + spike_tol) x the median of the last window
             "grad_norm" — mean minibatch gradient norm < grad_norm_tol
+            "ma_patience" — Tran, Nguyen & Dao (2021, arXiv:2103.01327, Alg. 4-7):
+                          the mean loss over the last ma_window epochs has not set
+                          a new minimum for ma_patience epochs
         window, snr_threshold, spike_tol : elbo_snr settings
         grad_norm_tol : grad_norm setting
+        ma_window, ma_patience : ma_patience settings
         verbose : print progress every 10 epochs and on termination
         optuna_trial, optuna_step_offset : report the per-datum loss to an Optuna
             trial each epoch so unpromising trials can be pruned
@@ -220,6 +226,8 @@ class ModelHandler:
 
             # Running loss history for elbo_snr criterion (local copy, avoids mode branching)
             _local_loss_history = []
+            # ma_patience state: best moving-average loss so far and epochs since it
+            _ma_best, _ma_count = math.inf, 0
             mean_grad_norm = math.inf
 
             for epoch in range(epochs):
@@ -344,9 +352,18 @@ class ModelHandler:
                 elif convergence_criterion == "grad_norm":
                     loss_converged = mean_grad_norm < grad_norm_tol
 
+                elif convergence_criterion == "ma_patience":
+                    if len(_local_loss_history) >= ma_window:
+                        ma = float(np.mean(_local_loss_history[-ma_window:]))
+                        if ma < _ma_best:
+                            _ma_best, _ma_count = ma, 0
+                        else:
+                            _ma_count += 1
+                    loss_converged = _ma_count >= ma_patience
+
                 else:
                     raise ValueError(f"Unknown convergence_criterion: {convergence_criterion!r}. "
-                                     "Choose 'elbo_min', 'elbo_snr', or 'grad_norm'.")
+                                     "Choose 'elbo_min', 'elbo_snr', 'grad_norm' or 'ma_patience'.")
 
                 if verbose and epoch % 10 == 0:
                     print("--------------------")

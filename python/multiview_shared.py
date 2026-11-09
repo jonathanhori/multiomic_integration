@@ -44,6 +44,9 @@ class SupMultiviewShared(PyroModule):
                  outcome_weight=1.0,
                  joint_scores_init=None,
                  joint_loadings_list_init=None,
+                 init_scale_Lambda=1.0,
+                 init_scale_Z=1.0,
+                 init_param=1.0,
                  device="cpu"):
         super().__init__()
 
@@ -83,6 +86,11 @@ class SupMultiviewShared(PyroModule):
 
         self.joint_scores_init = joint_scores_init
         self.joint_loadings_list_init = joint_loadings_list_init
+        # Initial guide standard deviations of Lambda_l and Z (training guide only).
+        # The defaults (1) give sampled reconstructions ~k units of noise variance
+        # on unit-variance data; smaller values start the guide at low variance.
+        self.init_scale_Lambda = init_scale_Lambda
+        self.init_scale_Z = init_scale_Z
 
         self.ortho_penalty = 0.0
         self.penalty_obj = None
@@ -102,7 +110,9 @@ class SupMultiviewShared(PyroModule):
         self.device = torch.device(device) if isinstance(device, str) else device
 
         self.inv_gamma_init_param = 2.1
-        self.init_param = 1.0
+        # Initial shape and rate of the MGP Gamma guides (delta, rho) and initial
+        # guide sd of beta. 0.1 was the value before 27 May 2026 (commit 49d239a).
+        self.init_param = init_param
 
     def _t(self, x):
         """Scalar float → device-placed tensor (avoids CPU/MPS log_prob mismatch)."""
@@ -147,15 +157,18 @@ class SupMultiviewShared(PyroModule):
             ])
             delta_lambda = pyro.sample(Sites.delta_lambda_l.format(l=l),
                                        dist.Gamma(shape_vec, torch.ones(self.k, device=self.device)).to_event(1))
-            tau_lambda_k_list = torch.cumprod(delta_lambda, dim=-1)
+            # tau_k = prod_{h<=k} delta_h, computed in log space: with large k the
+            # product under- or overflows in float32 and the gradients become NaN.
+            log_tau_lambda = torch.cumsum(torch.log(delta_lambda.clamp(min=1e-30)), dim=-1)
 
             # rho - local shrinkage
             rho_lambda = pyro.sample(Sites.rho_lambda_l.format(l=l),
                                      dist.Gamma(self._t(self.alpha_joint / 2), self._t(self.alpha_joint / 2)).expand([p_l, self.k]).to_event(2)).squeeze()
 
-            precision = rho_lambda * tau_lambda_k_list
-            precision = torch.clamp(precision, min=1e-10, max=1e10)
-            sigma_lambda_l = precision.pow_(-0.5)
+            # precision = rho * tau, clamped to [1e-10, 1e10]
+            log_precision = torch.log(rho_lambda.clamp(min=1e-30)) + log_tau_lambda
+            log_precision = torch.clamp(log_precision, min=-23.03, max=23.03)
+            sigma_lambda_l = torch.exp(-0.5 * log_precision)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                                    dist.Normal(torch.zeros(p_l, self.k, device=self.device), sigma_lambda_l).to_event(2))
             Lambda_l_list.append(Lambda_l)
@@ -341,7 +354,7 @@ class SupMultiviewShared(PyroModule):
             )
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), _Lambda_default)
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
-                                        torch.ones(p_l, self.k, device=self.device),
+                                        torch.full((p_l, self.k), self.init_scale_Lambda, device=self.device),
                                         constraint=dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -408,7 +421,7 @@ class SupMultiviewShared(PyroModule):
         )
         loc_Z = pyro.param(Params.loc_Z, _Z_default)
         scale_Z = pyro.param(Params.scale_Z,
-                             torch.ones(self.n, self.k, device=self.device),
+                             torch.full((self.n, self.k), self.init_scale_Z, device=self.device),
                              constraint=dist.constraints.positive)
 
         with pyro.plate("obs", self.n, subsample=batch_idx):
@@ -446,7 +459,7 @@ class SupMultiviewShared(PyroModule):
             )
             loc_Lambda_l = pyro.param(Params.loc_Lambda_l.format(l=l), _Lambda_default)
             scale_Lambda_l = pyro.param(Params.scale_Lambda_l.format(l=l),
-                                        torch.ones(p_l, self.k, device=self.device),
+                                        torch.full((p_l, self.k), self.init_scale_Lambda, device=self.device),
                                         constraint=dist.constraints.positive)
             Lambda_l = pyro.sample(Sites.Lambda_l.format(l=l),
                                    dist.Normal(loc_Lambda_l, scale_Lambda_l).to_event(2))
@@ -513,7 +526,7 @@ class SupMultiviewShared(PyroModule):
         )
         loc_Z = pyro.param(Params.loc_Z, _Z_default)
         scale_Z = pyro.param(Params.scale_Z,
-                             torch.ones(self.n, self.k, device=self.device),
+                             torch.full((self.n, self.k), self.init_scale_Z, device=self.device),
                              constraint=dist.constraints.positive)
 
         with pyro.plate("obs", self.n, subsample=batch_idx):

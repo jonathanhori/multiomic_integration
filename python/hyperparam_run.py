@@ -214,7 +214,7 @@ if __name__ == "__main__":
                         metric_out_path, 
                         metric_out_filename_base.format(n, p, snr_x, snr_y, sparsity, k_delta, rep)
                         )
-                    eval_metric_table = evaluate_fitted_model(rep_config,
+                    eval_metric_table, _, _, _ = evaluate_fitted_model(rep_config,
                                                             data_package,
                                                             train_handler,
                                                             test_handler,
@@ -222,7 +222,8 @@ if __name__ == "__main__":
                                                             local_train_state,
                                                             N_POSTERIOR_SAMPLES,
                                                             metric_out_filename
-                                                            ).\
+                                                            )
+                    eval_metric_table = eval_metric_table.\
                                         assign(
                                             initial_lr = train_config['initial_lr'],
                                             betas = str(train_config['betas']),

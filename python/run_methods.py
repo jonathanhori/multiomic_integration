@@ -33,6 +33,10 @@ model_config
     outcome_weight        multiplies the outcome log-likelihood (default 1). The views
                           contribute sum_l p_l terms per observation against the
                           outcome's one, so larger values give the outcome more pull on Z.
+    init_scale_Lambda     shared only: initial guide sd of the loadings (default 1)
+    init_scale_Z          shared only: initial guide sd of the training scores (default 1)
+    init_param            shared only: initial shape and rate of the MGP Gamma guides
+                          and initial guide sd of beta (default 1)
     k_l_list              viper only: view-specific factors to fit per view
     include_view_factors  viper only: whether to fit the view-specific factors
 
@@ -53,6 +57,9 @@ Optimiser (opt="scheduled", the default for viper) — Adam with a StepLR schedu
 Minibatching and length:
     minibatch_fraction    minibatch size as a fraction of the dataset (preferred), or
     minibatch_size        absolute minibatch size; halved until it fits the data
+    min_minibatch_size    optional floor on the minibatch size from minibatch_fraction
+                          (small fractions give tiny minibatches at small n, which can
+                          make AdagradRMSProp diverge); absent: no floor
     num_particles         Monte Carlo samples per ELBO estimate
     min_epochs            never stop before this many epochs
     max_epochs            always stop after this many epochs
@@ -69,6 +76,10 @@ Stopping rule (optional; omitted keys use ModelHandler.do_inference defaults):
     window                epochs per comparison window for elbo_snr (default 50)
     snr_threshold         elbo_snr threshold (default 0.1); larger stops earlier
     grad_norm_tol         grad_norm threshold (default 1e-3)
+                          "ma_patience": Tran, Nguyen & Dao (2021): stop when the mean
+                              loss over the last ma_window epochs has not set a new
+                              minimum for ma_patience epochs.
+    ma_window, ma_patience  ma_patience settings (defaults 50, 50)
 
 The same train_config keys apply to local inference (train_model_locally).
 """
@@ -356,7 +367,8 @@ def _build_model(model_type, model_config, device="cpu", Z_init=None, Lambda_l_i
     """Construct the factor model for model_type from model_config.
 
     model_config keys: k, dense_model (or "dense"), outcome_weight (optional),
-    and for "viper" also k_l_list and include_view_factors.
+    for "shared" optionally init_scale_Lambda / init_scale_Z / init_param, and for "viper"
+    also k_l_list and include_view_factors.
     """
     k = model_config["k"]
     dense = model_config.get("dense_model", model_config.get("dense"))
@@ -374,6 +386,9 @@ def _build_model(model_type, model_config, device="cpu", Z_init=None, Lambda_l_i
         return SupMultiviewShared(
             k, dense=dense, outcome_weight=outcome_weight, device=device,
             joint_scores_init=Z_init, joint_loadings_list_init=Lambda_l_init_list,
+            init_scale_Lambda=model_config.get("init_scale_Lambda", 1.0),
+            init_scale_Z=model_config.get("init_scale_Z", 1.0),
+            init_param=model_config.get("init_param", 1.0),
         )
     return SupMultiviewDecomp(
         k, model_config["k_l_list"],
@@ -418,9 +433,11 @@ def _build_handler(mode, factor_model, train_config, model_type, opt=None, devic
 
 def _minibatch_size(train_config, n):
     """Absolute minibatch size from minibatch_fraction (preferred) or
-    minibatch_size, halved until it fits in n observations."""
+    minibatch_size, halved until it fits in n observations; min_minibatch_size
+    (optional) floors the fraction-based size."""
     if "minibatch_fraction" in train_config:
-        mb = max(1, int(n * train_config["minibatch_fraction"]))
+        mb = max(1, int(n * train_config["minibatch_fraction"]),
+                 int(train_config.get("min_minibatch_size", 1)))
     else:
         mb = int(train_config["minibatch_size"])
     while mb > n:
@@ -431,7 +448,8 @@ def _minibatch_size(train_config, n):
 def _convergence_kwargs(train_config):
     """Stopping-rule settings present in train_config; anything missing falls
     back to the ModelHandler.do_inference defaults."""
-    keys = ("convergence_criterion", "window", "snr_threshold", "grad_norm_tol")
+    keys = ("convergence_criterion", "window", "snr_threshold", "grad_norm_tol",
+            "ma_window", "ma_patience")
     return {key: train_config[key] for key in keys if key in train_config}
 
 
