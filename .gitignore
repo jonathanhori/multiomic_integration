@@ -7,6 +7,7 @@
 *.xlsx
 sim/logs
 sim/results/*
+sim/archive
 **/__pycache__
 *_old*
 .DS_Store
@@ -15,3 +16,10 @@ sim/results/*
 *.txt
 data
 *.pth
+*.png
+*.html
+*.pt
+*.npz
+*.log
+*flow*
+flow*
