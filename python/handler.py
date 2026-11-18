@@ -11,6 +11,75 @@ from torch.utils.data import DataLoader
 
 from constants import Sites, Params
 
+
+class AveragedParamChange:
+    """Stopping statistic for the "avg_param_change" criterion.
+
+    Every epoch the current values of each parameter group (default: all shared
+    loadings loc_Lambda_l*, stacked, and loc_beta) are added to a running block
+    sum. Every `block` epochs the block mean is stored and the sum reset; only the
+    last 2 * window_blocks block means are kept. Once that many exist, for each
+    group
+        A = mean of the last window_blocks block means   (the last block * window_blocks epochs)
+        B = mean of the window_blocks block means before them
+        change = ||A - B||_F / ||A||_F
+    i.e. how far the parameters' time average moved between two consecutive,
+    disjoint windows. Averaging over every epoch cancels the optimiser's
+    epoch-to-epoch jitter, so the statistic measures drift. The rule is met when
+    every group's change is below tol (a float, or a dict group -> float).
+
+    Memory: one running sum plus 2 * window_blocks block means per group, i.e.
+    (2 * window_blocks + 1) float32 copies of the tracked parameters, on the CPU,
+    independent of the number of epochs (13 copies of Lambda and beta by default).
+    Statistics are checked only when a block completes (every `block` epochs).
+    """
+
+    def __init__(self, block=25, window_blocks=6, tol=0.05, groups=None):
+        from collections import deque
+        self.block, self.window_blocks = int(block), int(window_blocks)
+        self.groups = groups or {"Lambda": "loc_Lambda_l", "beta": "loc_beta"}
+        self.tol = tol if isinstance(tol, dict) else {g: float(tol) for g in self.groups}
+        self.sums, self.count = {}, 0
+        self.means = {g: deque(maxlen=2 * self.window_blocks) for g in self.groups}
+        self.history = []          # (epoch, {group: change}) at every completed block once full
+
+    def _values(self, store):
+        out = {}
+        for g, prefix in self.groups.items():
+            names = sorted(n for n in store.keys() if n == prefix or n.startswith(prefix))
+            out[g] = torch.cat([store[n].detach().reshape(-1).to("cpu", torch.float32) for n in names])
+        return out
+
+    def update(self, store, epoch):
+        """Add this epoch's values; returns True when the rule is met at this epoch."""
+        vals = self._values(store)
+        for g, v in vals.items():
+            if g in self.sums:
+                self.sums[g] += v
+            else:
+                self.sums[g] = v.clone()
+        self.count += 1
+        if self.count < self.block:
+            return False
+        for g in self.groups:
+            self.means[g].append(self.sums[g] / self.count)
+        self.sums, self.count = {}, 0
+        if len(self.means[next(iter(self.groups))]) < 2 * self.window_blocks:
+            return False
+        stats = {}
+        for g, q in self.means.items():
+            seq = list(q)
+            B = torch.stack(seq[:self.window_blocks]).mean(0)
+            A = torch.stack(seq[self.window_blocks:]).mean(0)
+            stats[g] = float(torch.linalg.norm(A - B) / torch.linalg.norm(A).clamp_min(1e-12))
+        self.history.append((epoch, stats))
+        return all(stats[g] < self.tol[g] for g in self.groups)
+
+    def nbytes(self):
+        """Bytes held by the tracker (block means plus running sums)."""
+        held = sum(t.numel() * t.element_size() for q in self.means.values() for t in q)
+        return held + sum(t.numel() * t.element_size() for t in self.sums.values())
+
 class ModelHandler:
     """Runs stochastic variational inference for one of the factor models and
     draws posterior samples from the fit.
@@ -124,6 +193,9 @@ class ModelHandler:
                     grad_norm_tol = 1e-3,
                     ma_window = 50,
                     ma_patience = 50,
+                    avg_block = 25,
+                    avg_window_blocks = 6,
+                    avg_tol = 0.05,
                     device = "cpu",
                     verbose = False,
                     optuna_trial = None,
@@ -159,6 +231,18 @@ class ModelHandler:
         window, snr_threshold, spike_tol : elbo_snr settings
         grad_norm_tol : grad_norm setting
         ma_window, ma_patience : ma_patience settings
+            "avg_param_change" — time-averaged parameter change (training only):
+                          every epoch the shared loadings (loc_Lambda_l*) and
+                          loc_beta are averaged into blocks of avg_block epochs;
+                          the mean over the last avg_window_blocks blocks is
+                          compared with the mean over the avg_window_blocks
+                          before, and training stops when the relative change
+                          ||A - B|| / ||A|| of both is below avg_tol. See
+                          AveragedParamChange. The tracker persists on the handler
+                          across do_inference calls (chunked training); its
+                          statistics are in self.avg_tracker.history.
+        avg_block, avg_window_blocks, avg_tol : avg_param_change settings
+            (defaults 25, 6, 0.05: two 150-epoch windows, 5%)
         verbose : print progress every 10 epochs and on termination
         optuna_trial, optuna_step_offset : report the per-datum loss to an Optuna
             trial each epoch so unpromising trials can be pruned
@@ -229,6 +313,12 @@ class ModelHandler:
             # ma_patience state: best moving-average loss so far and epochs since it
             _ma_best, _ma_count = math.inf, 0
             mean_grad_norm = math.inf
+            if convergence_criterion == "avg_param_change":
+                if self.mode != "train":
+                    raise ValueError("avg_param_change is for global training only")
+                if getattr(self, "avg_tracker", None) is None:
+                    self.avg_tracker = AveragedParamChange(avg_block, avg_window_blocks, avg_tol)
+            _avg_met = False
 
             for epoch in range(epochs):
                 epoch_loss = 0.
@@ -320,6 +410,9 @@ class ModelHandler:
                     if optuna_trial.should_prune():
                         raise _optuna.TrialPruned()
 
+                if convergence_criterion == "avg_param_change":
+                    _avg_met = self.avg_tracker.update(param_store_curr, self.model.total_epochs)
+
                 if convergence_criterion == "grad_norm" and batch_grad_norms:
                     mean_grad_norm = np.mean(batch_grad_norms)
 
@@ -361,9 +454,13 @@ class ModelHandler:
                             _ma_count += 1
                     loss_converged = _ma_count >= ma_patience
 
+                elif convergence_criterion == "avg_param_change":
+                    loss_converged = _avg_met
+
                 else:
                     raise ValueError(f"Unknown convergence_criterion: {convergence_criterion!r}. "
-                                     "Choose 'elbo_min', 'elbo_snr', 'grad_norm' or 'ma_patience'.")
+                                     "Choose 'elbo_min', 'elbo_snr', 'grad_norm', 'ma_patience' "
+                                     "or 'avg_param_change'.")
 
                 if verbose and epoch % 10 == 0:
                     print("--------------------")
