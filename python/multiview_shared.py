@@ -47,6 +47,7 @@ class SupMultiviewShared(PyroModule):
                  init_scale_Lambda=1.0,
                  init_scale_Z=1.0,
                  init_param=1.0,
+                 conjugate_shapes=True,
                  device="cpu"):
         super().__init__()
 
@@ -76,12 +77,14 @@ class SupMultiviewShared(PyroModule):
         self.a_weibull = a_weibull
         self.b_weibull = b_weibull
 
-        # Up-weighting factor for the outcome log-likelihood. The reconstruction
-        # likelihood contributes L * p_l terms per observation while the outcome
-        # contributes a single term, so the shared scores Z are estimated almost
-        # entirely from X. Setting outcome_weight ~ L * p_l rebalances the ELBO so
-        # the outcome informs Z comparably to the views. outcome_weight=1.0
-        # recovers the original (reconstruction-dominated) objective.
+        # Weight on the outcome log-likelihood (a tempered posterior that counts
+        # each y_i outcome_weight times). Keep the default 1.0, the correctly
+        # specified posterior. Weights above 1 lift a factor that sits just below
+        # the detection threshold sqrt(P/n), but they narrow the beta intervals
+        # by about sqrt(w) and let training scores absorb y, so test-time 95%
+        # coverage falls to about 0.74 at w ~ 2 and 0.5 at w ~ 5, with no reliable
+        # gain in CV MSE (docs/supervision_regimes.md, section 6). Do not scale
+        # it with L * p_l.
         self.outcome_weight = outcome_weight
 
         self.joint_scores_init = joint_scores_init
@@ -113,6 +116,26 @@ class SupMultiviewShared(PyroModule):
         # Initial shape and rate of the MGP Gamma guides (delta, rho) and initial
         # guide sd of beta. 0.1 was the value before 27 May 2026 (commit 49d239a).
         self.init_param = init_param
+        # MGP guide only. True (default since November 2026): the shapes of the five
+        # conjugate guide factors q(delta), q(rho), q(psi), q(sigma2_y), q(sigma2_beta)
+        # are set to their closed-form mean-field optima and never trained (they are
+        # kept in the param store but used detached, so they get no gradient); their
+        # rates start so that the expectations the other factors see equal those of
+        # the old start (E[delta] = E[rho] = 1, E[1/s] = a_prior / b_prior for the
+        # inverse-gamma variances) and are trained. Holding these shapes fixed leaves
+        # the ELBO's stationary points unchanged; SVI otherwise barely moves them, and
+        # q(delta) started at Gamma(1, 1) let the global precision tau collapse at large
+        # k. Derivation: docs/conjugate_guide_shapes.tex. False: the old start (Gamma
+        # guides at init_param, inverse-gamma guides at the prior, all trained).
+        self.conjugate_shapes = conjugate_shapes
+
+    def _conj_param(self, name_a, name_b, a_closed, b_closed, a_old, b_old):
+        """Shape and rate of a conjugate guide factor (see conjugate_shapes)."""
+        pos = dist.constraints.positive
+        if not self.conjugate_shapes:
+            return (pyro.param(name_a, a_old, constraint=pos), pyro.param(name_b, b_old, constraint=pos))
+        a = pyro.param(name_a, a_closed, constraint=pos).detach()
+        return a, pyro.param(name_b, b_closed, constraint=pos)
 
     def _t(self, x):
         """Scalar float → device-placed tensor (avoids CPU/MPS log_prob mismatch)."""
@@ -329,21 +352,23 @@ class SupMultiviewShared(PyroModule):
         ########################
         Lambda_l_list = []
         for l, p_l in enumerate(self.p_l_list):
-            a_delta_lambda_l = pyro.param(Params.a_delta_lambda_l.format(l=l),
-                                          torch.full((self.k,), self.init_param, device=self.device),
-                                          constraint=dist.constraints.positive)
-            b_delta_lambda_l = pyro.param(Params.b_delta_lambda_l.format(l=l),
-                                          torch.full((self.k,), self.init_param, device=self.device),
-                                          constraint=dist.constraints.positive)
+            # q(delta_h): closed-form shape a_prior_h + p_l (k - h + 1) / 2, rate = shape
+            a0 = torch.full((self.k,), self.a2_sigma_joint, device=self.device)
+            a0[0] = self.a1_sigma_joint
+            a_cf = a0 + p_l * (self.k - torch.arange(self.k, device=self.device, dtype=a0.dtype)) / 2
+            old = torch.full((self.k,), self.init_param, device=self.device)
+            a_delta_lambda_l, b_delta_lambda_l = self._conj_param(
+                Params.a_delta_lambda_l.format(l=l), Params.b_delta_lambda_l.format(l=l),
+                a_cf, a_cf.clone(), old, old.clone())
             pyro.sample(Sites.delta_lambda_l.format(l=l),
                         dist.Gamma(a_delta_lambda_l, b_delta_lambda_l).to_event(1))
 
-            a_rho_lambda_l = pyro.param(Params.a_rho_lambda_l.format(l=l),
-                                        torch.full((p_l, self.k), self.init_param, device=self.device),
-                                        constraint=dist.constraints.positive)
-            b_rho_lambda_l = pyro.param(Params.b_rho_lambda_l.format(l=l),
-                                        torch.full((p_l, self.k), self.init_param, device=self.device),
-                                        constraint=dist.constraints.positive)
+            # q(rho_jk): closed-form shape alpha / 2 + 1 / 2, rate = shape
+            a_cf = torch.full((p_l, self.k), self.alpha_joint / 2 + 0.5, device=self.device)
+            old = torch.full((p_l, self.k), self.init_param, device=self.device)
+            a_rho_lambda_l, b_rho_lambda_l = self._conj_param(
+                Params.a_rho_lambda_l.format(l=l), Params.b_rho_lambda_l.format(l=l),
+                a_cf, a_cf.clone(), old, old.clone())
             pyro.sample(Sites.rho_lambda_l.format(l=l),
                         dist.Gamma(a_rho_lambda_l, b_rho_lambda_l).to_event(2)).squeeze()
 
@@ -366,22 +391,23 @@ class SupMultiviewShared(PyroModule):
 
         # Idiosyncratic error variance
         for l, p_l in enumerate(self.p_l_list):
-            a_psi_l = pyro.param(Params.a_psi_l.format(l=l),
-                                 torch.full((p_l,), self.a_psi, device=self.device),
-                                 constraint=dist.constraints.positive)
-            b_psi_l = pyro.param(Params.b_psi_l.format(l=l),
-                                 torch.full((p_l,), self.b_psi, device=self.device),
-                                 constraint=dist.constraints.positive)
+            # q(psi_j): closed-form shape a_psi + n / 2; rate keeps E[1/psi] = a_psi / b_psi
+            a_cf = torch.full((p_l,), self.a_psi + self.n / 2, device=self.device)
+            a_psi_l, b_psi_l = self._conj_param(
+                Params.a_psi_l.format(l=l), Params.b_psi_l.format(l=l),
+                a_cf, a_cf * self.b_psi / self.a_psi,
+                torch.full((p_l,), self.a_psi, device=self.device), torch.full((p_l,), self.b_psi, device=self.device))
             pyro.sample(Sites.psi_l.format(l=l),
                         dist.InverseGamma(a_psi_l, b_psi_l).to_event(1))
 
         # Outcome model coefficients
-        a_sigma_beta = pyro.param(Params.a_sigma_beta,
-                                  torch.full((self.k,), self.a_sigma_beta, device=self.device),
-                                  constraint=dist.constraints.positive)
-        b_sigma_beta = pyro.param(Params.b_sigma_beta,
-                                  torch.full((self.k,), self.b_sigma_beta, device=self.device),
-                                  constraint=dist.constraints.positive)
+        # q(sigma2_beta_k): closed-form shape a_sigma_beta + 1 / 2; rate keeps E[1/sigma2_beta]
+        a_cf = torch.full((self.k,), self.a_sigma_beta + 0.5, device=self.device)
+        a_sigma_beta, b_sigma_beta = self._conj_param(
+            Params.a_sigma_beta, Params.b_sigma_beta,
+            a_cf, a_cf * self.b_sigma_beta / self.a_sigma_beta,
+            torch.full((self.k,), self.a_sigma_beta, device=self.device),
+            torch.full((self.k,), self.b_sigma_beta, device=self.device))
         pyro.sample(Sites.sigma2_beta,
                     dist.InverseGamma(a_sigma_beta, b_sigma_beta).to_event(1))
 
@@ -393,12 +419,12 @@ class SupMultiviewShared(PyroModule):
                     dist.Normal(loc_beta, scale_beta).to_event(1)).squeeze(0)
 
         if self.outcome == "gaussian":
-            a_sigma_y = pyro.param(Params.a_sigma_y,
-                                   torch.tensor(self.a_sigma_y, device=self.device),
-                                   constraint=dist.constraints.positive)
-            b_sigma_y = pyro.param(Params.b_sigma_y,
-                                   torch.tensor(self.b_sigma_y, device=self.device),
-                                   constraint=dist.constraints.positive)
+            # q(sigma2_y): closed-form shape a_sigma_y + w n / 2; rate keeps E[1/sigma2_y]
+            a_cf = torch.tensor(self.a_sigma_y + self.outcome_weight * self.n / 2, device=self.device)
+            a_sigma_y, b_sigma_y = self._conj_param(
+                Params.a_sigma_y, Params.b_sigma_y,
+                a_cf, a_cf * self.b_sigma_y / self.a_sigma_y,
+                torch.tensor(self.a_sigma_y, device=self.device), torch.tensor(self.b_sigma_y, device=self.device))
             pyro.sample(Sites.sigma2_y,
                         dist.InverseGamma(a_sigma_y, b_sigma_y)).squeeze(0)
         elif self.outcome == "censored":

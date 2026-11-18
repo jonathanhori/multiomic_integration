@@ -35,8 +35,12 @@ model_config
                           outcome's one, so larger values give the outcome more pull on Z.
     init_scale_Lambda     shared only: initial guide sd of the loadings (default 1)
     init_scale_Z          shared only: initial guide sd of the training scores (default 1)
-    init_param            shared only: initial shape and rate of the MGP Gamma guides
-                          and initial guide sd of beta (default 1)
+    init_param            shared only: initial guide sd of beta (default 1), and the
+                          initial shape and rate of the MGP Gamma guides when
+                          conjugate_shapes is False
+    conjugate_shapes      shared only (default True): MGP guide's conjugate factors use
+                          fixed closed-form shapes (SupMultiviewShared docstring,
+                          docs/conjugate_guide_shapes.tex); False gives the old start
     k_l_list              viper only: view-specific factors to fit per view
     include_view_factors  viper only: whether to fit the view-specific factors
 
@@ -48,6 +52,11 @@ with s_k a running average of squared gradients:
     eta                   overall step-size scale
     t                     weight of the newest squared gradient in s_k (0 < t <= 1)
     delta                 small exponent adjustment to the step-size decay (e.g. 1e-16)
+    warmup_epochs         global training only: eta rises linearly from 0 over this many
+                          epochs (each parameter counts its own steps). Default 5 for
+                          "shared" (November 2026: stops the first steps, which are
+                          eta * sign(g) for every parameter, from inflating weak columns;
+                          docs/mgp_shrinkage_collapse.md), 0 for the other models.
 
 Optimiser (opt="scheduled", the default for viper) — Adam with a StepLR schedule:
     initial_lr, betas     Adam learning rate and moment coefficients
@@ -80,6 +89,15 @@ Stopping rule (optional; omitted keys use ModelHandler.do_inference defaults):
                               loss over the last ma_window epochs has not set a new
                               minimum for ma_patience epochs.
     ma_window, ma_patience  ma_patience settings (defaults 50, 50)
+                          "avg_param_change": time-averaged change of the shared
+                              loadings and beta (global training only): every epoch
+                              is averaged into blocks of avg_block epochs; stop when
+                              the mean over the last avg_window_blocks blocks differs
+                              from the mean over the avg_window_blocks before by
+                              less than avg_tol (relative Frobenius norm) for both
+                              (handler.AveragedParamChange).
+    avg_block, avg_window_blocks, avg_tol  avg_param_change settings (defaults 25, 6,
+                              0.05: two disjoint 150-epoch windows, 5%)
 
 The same train_config keys apply to local inference (train_model_locally).
 """
@@ -93,6 +111,7 @@ import torch
 from torch.utils.data import TensorDataset
 import pyro
 from pyro.optim import AdagradRMSProp
+from pyro.optim.adagrad_rmsprop import AdagradRMSProp as _TorchAdagradRMSProp
 from pyro.infer import Trace_ELBO
 
 from constants import Sites
@@ -190,7 +209,7 @@ MODEL_TYPES = ("single_view", "shared", "viper")
 # original helpers set them.
 _MODEL_DEFAULTS = {
     "single_view": {"opt": "adagrad",   "orthogonal_projection": False},
-    "shared":      {"opt": "adagrad",   "orthogonal_projection": True},
+    "shared":      {"opt": "adagrad",   "orthogonal_projection": True, "warmup_epochs": 5},
     "viper":       {"opt": "scheduled", "orthogonal_projection": True},
 }
 
@@ -389,6 +408,7 @@ def _build_model(model_type, model_config, device="cpu", Z_init=None, Lambda_l_i
             init_scale_Lambda=model_config.get("init_scale_Lambda", 1.0),
             init_scale_Z=model_config.get("init_scale_Z", 1.0),
             init_param=model_config.get("init_param", 1.0),
+            conjugate_shapes=model_config.get("conjugate_shapes", True),
         )
     return SupMultiviewDecomp(
         k, model_config["k_l_list"],
@@ -398,7 +418,24 @@ def _build_model(model_type, model_config, device="cpu", Z_init=None, Lambda_l_i
     )
 
 
-def _build_handler(mode, factor_model, train_config, model_type, opt=None, device="cpu"):
+class _WarmupAdagradRMSProp(_TorchAdagradRMSProp):
+    """Pyro's AdagradRMSProp with eta scaled by min(1, step / warmup_steps)."""
+
+    def __init__(self, params, warmup_steps=0, **kw):
+        super().__init__(params, **kw)
+        self.warmup_steps, self.n_steps = warmup_steps, 0
+        self.base_eta = [g["eta"] for g in self.param_groups]
+
+    def step(self, closure=None):
+        self.n_steps += 1
+        f = min(1.0, self.n_steps / self.warmup_steps) if self.warmup_steps else 1.0
+        for g, b in zip(self.param_groups, self.base_eta):
+            g["eta"] = b * f
+        return super().step(closure)
+
+
+def _build_handler(mode, factor_model, train_config, model_type, opt=None, device="cpu",
+                   steps_per_epoch=None):
     """ModelHandler for global training (mode="train") or local inference
     (mode="predict").
 
@@ -411,11 +448,13 @@ def _build_handler(mode, factor_model, train_config, model_type, opt=None, devic
     loss = Trace_ELBO(num_particles=train_config["num_particles"])
 
     if opt == "adagrad":
-        optimizer = AdagradRMSProp({
-            "eta":   train_config["eta"],
-            "delta": train_config["delta"],
-            "t":     train_config["t"],
-        })
+        args = {"eta": train_config["eta"], "delta": train_config["delta"], "t": train_config["t"]}
+        warm = train_config.get("warmup_epochs", defaults.get("warmup_epochs", 0)) if mode == "train" else 0
+        if warm and steps_per_epoch:
+            optimizer = pyro.optim.PyroOptim(_WarmupAdagradRMSProp,
+                                             {**args, "warmup_steps": int(warm * steps_per_epoch)})
+        else:
+            optimizer = AdagradRMSProp(args)
         return ModelHandler(mode, factor_model, opt=optimizer, loss=loss, opt_scheduler=None,
                             orthogonal_projection=defaults["orthogonal_projection"],
                             device=device)
@@ -449,7 +488,7 @@ def _convergence_kwargs(train_config):
     """Stopping-rule settings present in train_config; anything missing falls
     back to the ModelHandler.do_inference defaults."""
     keys = ("convergence_criterion", "window", "snr_threshold", "grad_norm_tol",
-            "ma_window", "ma_patience")
+            "ma_window", "ma_patience", "avg_block", "avg_window_blocks", "avg_tol")
     return {key: train_config[key] for key in keys if key in train_config}
 
 
@@ -486,7 +525,9 @@ def train_model(model_config, train_config, train_subset, model_out_filename=Non
 
     t0 = time.time()
     factor_model = _build_model(model_type, model_config, device, Z_init, Lambda_l_init_list)
-    train_handler = _build_handler("train", factor_model, train_config, model_type, opt, device)
+    mb = _minibatch_size(train_config, len(train_subset))
+    train_handler = _build_handler("train", factor_model, train_config, model_type, opt, device,
+                                   steps_per_epoch=int(np.ceil(len(train_subset) / mb)))
 
     train_handler.do_inference(
         train_dataset=train_subset,
@@ -537,6 +578,10 @@ def train_model_locally(factor_model, train_config, data_subset, model_out_filen
     _check_model_type(model_type)
     test_handler = _build_handler("predict", factor_model, train_config, model_type, opt, device)
 
+    conv = _convergence_kwargs(train_config)
+    if conv.get("convergence_criterion") == "avg_param_change":
+        # tracks global parameters, which are fixed in local inference: use the default rule
+        conv = {"convergence_criterion": "ma_patience"}
     t0 = time.time()
     test_handler.do_inference(
         train_dataset=data_subset,
@@ -546,7 +591,7 @@ def train_model_locally(factor_model, train_config, data_subset, model_out_filen
         minibatch_size=_minibatch_size(train_config, len(data_subset)),
         variational_diff_func=np.mean,
         verbose=verbose,
-        **_convergence_kwargs(train_config),
+        **conv,
     )
     runtime = time.time() - t0
 
