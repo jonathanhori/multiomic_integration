@@ -75,6 +75,28 @@ class AveragedParamChange:
         self.history.append((epoch, stats))
         return all(stats[g] < self.tol[g] for g in self.groups)
 
+    def write_window_mean(self, store):
+        """Replace each tracked parameter in `store` by its mean over the last
+        window_blocks completed blocks (the window A of the last check; fewer blocks
+        if fewer have completed). Used for local inference, where the last iterate is
+        noisy because every step resamples the frozen global parameters. Values are
+        averaged on the constrained scale and written back through the param store,
+        which keeps each parameter's constraint. Returns the number of epochs averaged."""
+        q0 = self.means[next(iter(self.groups))]
+        w = min(self.window_blocks, len(q0))
+        if w == 0:
+            return 0
+        for g, prefix in self.groups.items():
+            A = torch.stack(list(self.means[g])[-w:]).mean(0)
+            names = sorted(n for n in store.keys() if n == prefix or n.startswith(prefix))
+            i = 0
+            for n in names:
+                cur = store[n]
+                k = cur.numel()
+                store[n] = A[i:i + k].reshape(cur.shape).to(cur.device, cur.dtype)
+                i += k
+        return w * self.block
+
     def nbytes(self):
         """Bytes held by the tracker (block means plus running sums)."""
         held = sum(t.numel() * t.element_size() for q in self.means.values() for t in q)
@@ -196,6 +218,8 @@ class ModelHandler:
                     avg_block = 25,
                     avg_window_blocks = 6,
                     avg_tol = 0.05,
+                    avg_groups = None,
+                    avg_return_window_mean = False,
                     device = "cpu",
                     verbose = False,
                     optuna_trial = None,
@@ -211,7 +235,7 @@ class ModelHandler:
         Parameters
         ----------
         train_dataset : TensorDataset(idx, X_1, ..., X_L, y); for a censored
-            outcome, TensorDataset(idx, X_1, ..., X_L, cens, y). In predict mode
+            outcome, TensorDataset(idx, X_1, ..., X_L, event, y). In predict mode
             y is never passed to the model.
         inference_type : "svi" or "svgd"
         min_epochs, epochs : minimum and maximum number of epochs
@@ -241,8 +265,17 @@ class ModelHandler:
                           AveragedParamChange. The tracker persists on the handler
                           across do_inference calls (chunked training); its
                           statistics are in self.avg_tracker.history.
-        avg_block, avg_window_blocks, avg_tol : avg_param_change settings
+        avg_block, avg_window_blocks, avg_tol : avg_param_change settings; avg_tol is a
+            float or a dict {"Lambda": tol, "beta": tol}
             (defaults 25, 6, 0.05: two 150-epoch windows, 5%)
+            In prediction mode (local inference) avg_param_change tracks the local
+            parameters instead: by default the test score means loc_Z_pred and sds
+            scale_Z_pred (groups "Z" and "Z_scale"), with a fresh tracker each call.
+        avg_groups : dict group -> parameter-name prefix tracked by avg_param_change
+            (None: the defaults above for the handler's mode)
+        avg_return_window_mean : avg_param_change only: when inference ends (rule met or
+            max epochs), replace the tracked parameters by their mean over the last
+            window (AveragedParamChange.write_window_mean) instead of the last iterate
         verbose : print progress every 10 epochs and on termination
         optuna_trial, optuna_step_offset : report the per-datum loss to an Optuna
             trial each epoch so unpromising trials can be pruned
@@ -314,10 +347,14 @@ class ModelHandler:
             _ma_best, _ma_count = math.inf, 0
             mean_grad_norm = math.inf
             if convergence_criterion == "avg_param_change":
-                if self.mode != "train":
-                    raise ValueError("avg_param_change is for global training only")
-                if getattr(self, "avg_tracker", None) is None:
-                    self.avg_tracker = AveragedParamChange(avg_block, avg_window_blocks, avg_tol)
+                if self.mode == "train":
+                    if getattr(self, "avg_tracker", None) is None:
+                        self.avg_tracker = AveragedParamChange(avg_block, avg_window_blocks, avg_tol,
+                                                               avg_groups)
+                else:
+                    self.avg_tracker = AveragedParamChange(
+                        avg_block, avg_window_blocks, avg_tol,
+                        avg_groups or {"Z": Params.loc_Z_pred, "Z_scale": Params.scale_Z_pred})
             _avg_met = False
 
             for epoch in range(epochs):
@@ -328,15 +365,15 @@ class ModelHandler:
                     batch_idx = batch.pop(0).to(self.device)
                     if self.model.model_type in ("MatrixDecomp", "SupMultiviewDecomp", "SupMultiviewShared"):
                         # Expected batch order: [idx, X_1, ..., X_L, y]
-                        # For censored outcome:  [idx, X_1, ..., X_L, cens, y]
+                        # For censored outcome:  [idx, X_1, ..., X_L, event, y]  (event: 1 observed, 0 censored)
                         y_batch = batch.pop(-1).squeeze().to(self.device)
-                        if getattr(self.model, 'outcome', 'gaussian') == "censored":
+                        if getattr(self.model, 'outcome', 'gaussian') in ("censored", "lognormal_aft"):
                             cens_batch = batch.pop(-1).squeeze().to(self.device)
                         batch = [t.to(self.device) for t in batch]
                         # In predict mode only X informs Z; y is not observed.
                         if self.mode == "predict":
                             loss = inference.step(batch, batch_idx)
-                        elif getattr(self.model, 'outcome', 'gaussian') == "censored":
+                        elif getattr(self.model, 'outcome', 'gaussian') in ("censored", "lognormal_aft"):
                             loss = inference.step(batch, batch_idx, y_batch, cens_batch)
                         else:
                             loss = inference.step(batch, batch_idx, y_batch)
@@ -411,7 +448,9 @@ class ModelHandler:
                         raise _optuna.TrialPruned()
 
                 if convergence_criterion == "avg_param_change":
-                    _avg_met = self.avg_tracker.update(param_store_curr, self.model.total_epochs)
+                    _avg_met = self.avg_tracker.update(
+                        param_store_curr,
+                        self.model.total_epochs if self.mode == "train" else self.model.local_epochs)
 
                 if convergence_criterion == "grad_norm" and batch_grad_norms:
                     mean_grad_norm = np.mean(batch_grad_norms)
@@ -570,6 +609,10 @@ class ModelHandler:
                             
                     break
                 params_epoch_last = params_epoch_curr
+
+            self.window_mean_epochs = 0
+            if convergence_criterion == "avg_param_change" and avg_return_window_mean:
+                self.window_mean_epochs = self.avg_tracker.write_window_mean(pyro.get_param_store())
         else:
             raise NotImplementedError    
         

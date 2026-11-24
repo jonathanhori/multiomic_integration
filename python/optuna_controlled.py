@@ -124,7 +124,17 @@ PARAM_SPACE_FULL = {
     "t":                  {"type": "float", "low": 0.01,  "high": 0.1,  "log": True},
     "minibatch_fraction": {"type": "float", "low": 0.03,  "high": 0.20, "log": True},
 }
-SPACES = {"original": PARAM_SPACE, "lv": PARAM_SPACE_LV, "full": PARAM_SPACE_FULL}
+# Arm-B study (16 November 2026; --space armb, with --full-length): the optimiser under
+# the new model defaults (fixed closed-form conjugate shapes, 5-epoch eta warm-up;
+# docs/conjugate_guide_shapes.tex), which may move the optimum, so the range is wider
+# than the full study's on every axis. Log scale; round values are chosen afterwards in
+# a finer grid around the optimum. TODO(user): ranges.
+PARAM_SPACE_ARMB = {
+    "eta":                {"type": "float", "low": 0.08,  "high": 0.50, "log": True},
+    "t":                  {"type": "float", "low": 0.005, "high": 0.2,  "log": True},
+    "minibatch_fraction": {"type": "float", "low": 0.03,  "high": 0.20, "log": True},
+}
+SPACES = {"original": PARAM_SPACE, "lv": PARAM_SPACE_LV, "full": PARAM_SPACE_FULL, "armb": PARAM_SPACE_ARMB}
 
 
 # The setting used so far (sim_run_shared_parallel.py): elbo_snr, window 50, threshold 5.

@@ -62,7 +62,7 @@ def guide_moments(store, L, dtype=torch.float64):
     """
     get = lambda name: store[name].detach().to(dtype).cpu()
     a_y, b_y = get(Params.a_sigma_y), get(Params.b_sigma_y)
-    return {
+    out = {
         "M": [get(Params.loc_Lambda_l.format(l=l)).squeeze() for l in range(L)],
         "S": [get(Params.scale_Lambda_l.format(l=l)).squeeze() ** 2 for l in range(L)],
         "a_psi": [get(Params.a_psi_l.format(l=l)) for l in range(L)],
@@ -74,6 +74,12 @@ def guide_moments(store, L, dtype=torch.float64):
         # E_q[sigma_y^2] exists only for a > 1
         "E_sigma2_y": b_y / (a_y - 1) if float(a_y) > 1 else torch.tensor(float("nan"), dtype=dtype),
     }
+    # Outcome intercept: only fits with a censored outcome have one (outcome="lognormal_aft":
+    # the predictive mean of the standardised log time is m_intercept + m_z' m_beta).
+    if Params.loc_intercept in store.keys():
+        out["m_intercept"] = get(Params.loc_intercept).reshape(())
+        out["s2_intercept"] = get(Params.scale_intercept).reshape(()) ** 2
+    return out
 
 
 def load_guide_moments(paramstore_path, L):
@@ -112,6 +118,9 @@ def closed_form_scores(moments, X_list, cov="diag"):
     yhat = m_z @ m_beta
     pred_var = (moments["E_sigma2_y"] + torch.trace(S_beta @ cov_z) + m_beta @ cov_z @ m_beta
                 + ((m_z ** 2) * moments["s2_beta"]).sum(1))
+    if "m_intercept" in moments:                       # censored outcomes (log-time scale)
+        yhat = yhat + moments["m_intercept"]
+        pred_var = pred_var + moments["s2_intercept"]
     coef = [(M_l * w_l[:, None]) @ (A_inv @ m_beta) for M_l, w_l in zip(M, w)]
     return {"m_z": m_z, "cov_z": cov_z, "A_bar": A_bar, "yhat": yhat,
             "pred_var": pred_var, "coef": coef}

@@ -33,8 +33,8 @@ model_config
     outcome_weight        multiplies the outcome log-likelihood (default 1). The views
                           contribute sum_l p_l terms per observation against the
                           outcome's one, so larger values give the outcome more pull on Z.
-    init_scale_Lambda     shared only: initial guide sd of the loadings (default 1)
-    init_scale_Z          shared only: initial guide sd of the training scores (default 1)
+    init_scale_Lambda     shared only: initial guide sd of the loadings (default 0.01)
+    init_scale_Z          shared only: initial guide sd of the training scores (default 0.1)
     init_param            shared only: initial guide sd of beta (default 1), and the
                           initial shape and rate of the MGP Gamma guides when
                           conjugate_shapes is False
@@ -46,6 +46,13 @@ model_config
 
 train_config
 ------------
+Missing keys are filled from the model's defaults (with_defaults). For "shared" the
+defaults are eta 0.3, t 0.005, delta 1e-16, minibatch_fraction 0.1, num_particles 1,
+convergence_criterion "avg_param_change" (avg_block 25, avg_window_blocks 6, avg_tol
+Lambda 0.05 / beta 0.07), min_epochs 0, max_epochs 1500, plus SVD initialisation and
+the guide start init_scale_Lambda 0.01 / init_scale_Z 0.1 (November 2026 tuning),
+and the local-inference settings below.
+
 Optimiser (opt="adagrad", the default for single_view and shared) — Pyro's
 AdagradRMSProp, whose step size at iteration k is eta * k^(-1/2 + delta) / (1 + sqrt(s_k)),
 with s_k a running average of squared gradients:
@@ -99,7 +106,30 @@ Stopping rule (optional; omitted keys use ModelHandler.do_inference defaults):
     avg_block, avg_window_blocks, avg_tol  avg_param_change settings (defaults 25, 6,
                               0.05: two disjoint 150-epoch windows, 5%)
 
-The same train_config keys apply to local inference (train_model_locally).
+The same train_config keys apply to local inference (train_model_locally), except
+that for "shared" with convergence_criterion "avg_param_change" local inference uses
+its own rule and start (November 2026, sim/results/integration_shared_controlled/
+grid_default/local_rule/init/; python/local_init_trace.py, local_init_compare.py):
+    local_init_sd         "train" (default): test score sds start at the per-factor
+                          average of the trained training-score sds (scale_Z), means at
+                          0; "prior": sds 1, means 0 (the guide's own start). From the
+                          prior start the sds need 300-850 epochs to converge.
+    local_warmup_epochs   eta rises linearly from 0 over this many local epochs
+                          (default 5). Without it the first update of each score is
+                          ~14x the nominal step and throws the training-sd start away.
+    local_avg_block, local_avg_window_blocks, local_avg_tol
+                          avg_param_change on the test score means and sds (both must
+                          change < tol); defaults 25, 6, 0.10 (two 150-epoch windows).
+    local_return_window_mean
+                          True (default): the test scores are the mean of the
+                          iterates over the last 150-epoch window, not the last iterate
+                          (every step resamples the frozen globals, so the last iterate
+                          is noisy).
+With these defaults local inference stopped at 300-350 epochs on 8 controlled datasets,
+with the score means within 1-7% and sds within 6-7% of the closed-form optimum (as
+close as 1000 epochs), at 0.17-0.67x the training time. Other model types, or a
+train_config with another convergence_criterion, keep the old behaviour (prior start,
+no warm-up, last iterate; avg_param_change maps to ma_patience).
 """
 import gc
 import os
@@ -114,7 +144,7 @@ from pyro.optim import AdagradRMSProp
 from pyro.optim.adagrad_rmsprop import AdagradRMSProp as _TorchAdagradRMSProp
 from pyro.infer import Trace_ELBO
 
-from constants import Sites
+from constants import Sites, Params
 from data_utils import (
     calc_all_structures_with_rescaling, eval_performance,
     extract_sim_decomp, normalize_tensor_by_col, zero_variance_col_filter,
@@ -209,9 +239,40 @@ MODEL_TYPES = ("single_view", "shared", "viper")
 # original helpers set them.
 _MODEL_DEFAULTS = {
     "single_view": {"opt": "adagrad",   "orthogonal_projection": False},
-    "shared":      {"opt": "adagrad",   "orthogonal_projection": True, "warmup_epochs": 5},
+    "shared":      {"opt": "adagrad",   "orthogonal_projection": True, "warmup_epochs": 5,
+                    "svd_init": True},
     "viper":       {"opt": "scheduled", "orthogonal_projection": True},
 }
+
+# Default train_config / model_config entries; keys the caller passes win.
+# "shared" (November 2026, sim/results/integration_shared_controlled/optuna/): optimiser
+# from the Optuna studies + round-number grid (armb_grid/), stopping rule from
+# avg_param_rule/ (every-epoch averaged loadings and beta, two disjoint 150-epoch
+# windows, Lambda < 5% and beta < 7%: within 0.005 CV MSE of 700 epochs on the
+# controlled tuning datasets at ~2/3 of the epochs). max_epochs is a safety cap; the rule
+# cannot fire before 2 x 150 = 300 epochs. Guide start: init_scale_Lambda 0.01,
+# init_scale_Z 0.1 (the arm-B guide used throughout that tuning).
+_TRAIN_DEFAULTS = {
+    "shared": {"eta": 0.3, "t": 0.005, "delta": 1e-16, "num_particles": 1,
+               "minibatch_fraction": 0.1, "min_epochs": 0, "max_epochs": 1500,
+               "convergence_criterion": "avg_param_change", "avg_block": 25,
+               "avg_window_blocks": 6, "avg_tol": {"Lambda": 0.05, "beta": 0.07},
+               # local inference (train_model_locally); see the module docstring
+               "local_init_sd": "train", "local_warmup_epochs": 5, "local_avg_block": 25,
+               "local_avg_window_blocks": 6, "local_avg_tol": 0.10,
+               "local_return_window_mean": True},
+}
+_MODEL_CONFIG_DEFAULTS = {
+    "shared": {"init_scale_Lambda": 0.01, "init_scale_Z": 0.1},
+}
+
+
+def with_defaults(model_type, train_config=None, model_config=None):
+    """train_config and model_config filled in with the model's defaults
+    (_TRAIN_DEFAULTS / _MODEL_CONFIG_DEFAULTS); entries the caller gives win."""
+    tc = {**_TRAIN_DEFAULTS.get(model_type, {}), **(train_config or {})}
+    mc = {**_MODEL_CONFIG_DEFAULTS.get(model_type, {}), **(model_config or {})}
+    return tc, mc
 
 
 def _check_model_type(model_type):
@@ -221,7 +282,7 @@ def _check_model_type(model_type):
 
 
 def process_data(sim_data, sim_data_test=None, training_split=False, training_size=0.8,
-                 seed=123, model_type="viper"):
+                 seed=123, model_type="viper", outcome="gaussian"):
     """Train/test split, drop zero-variance columns, and standardise each view
     and the outcome using training-set statistics.
 
@@ -245,16 +306,32 @@ def process_data(sim_data, sim_data_test=None, training_split=False, training_si
         Training fraction when training_split=True.
     seed : int
         Random seed for the split when training_split=True.
+    outcome : "gaussian" (default) or "lognormal_aft" (model_type "shared" only).
+        "lognormal_aft": y holds right-censored follow-up times (> 0) and the dicts also
+        carry "event" (1 = event observed, 0 = censored). The outcome becomes log y,
+        standardised with the training mean / sd of all log y (events and censored);
+        the subsets are TensorDataset(idx, X_1, ..., X_L, event, y) (the layout
+        handler.py reads for censored outcomes), and data_package also holds
+        "outcome", "train_event", "test_event", "y_mean" / "y_sd" (of log y).
 
     Returns
     -------
     train_subset, test_subset : TensorDataset(idx, X_1, ..., X_L, y)
+        (idx, X_1, ..., X_L, event, y) for outcome="lognormal_aft"
     data_package : dict used by evaluate_fitted_model
     """
     _check_model_type(model_type)
+    if outcome not in ("gaussian", "lognormal_aft"):
+        raise ValueError(f"outcome must be 'gaussian' or 'lognormal_aft', got {outcome!r}")
+    censored = outcome == "lognormal_aft"
+    if censored and model_type != "shared":
+        raise ValueError("outcome='lognormal_aft' is implemented for model_type='shared' only")
 
     X_l_list = sim_data["X_l"]
     y = sim_data["y"]
+    if censored:
+        y = torch.log(y.double()).to(sim_data["y"].dtype)   # log follow-up time
+        event = sim_data["event"].reshape(-1).float()
     k = int(sim_data["K"])
     L = len(X_l_list)
     n = X_l_list[0].shape[0]
@@ -267,6 +344,8 @@ def process_data(sim_data, sim_data_test=None, training_split=False, training_si
         test_X_l_list  = [X[test_idx]  for X in X_l_list]
         train_y = y[train_idx]
         test_y  = y[test_idx]
+        if censored:
+            train_event, test_event = event[train_idx], event[test_idx]
     else:
         assert sim_data_test is not None, \
             "sim_data_test is required when training_split=False (or set training_split=True)"
@@ -276,6 +355,9 @@ def process_data(sim_data, sim_data_test=None, training_split=False, training_si
         test_idx  = torch.arange(test_X_l_list[0].shape[0])
         train_X_l_list = X_l_list
         train_y = y
+        if censored:
+            test_y = torch.log(test_y.double()).to(sim_data_test["y"].dtype)
+            train_event, test_event = event, sim_data_test["event"].reshape(-1).float()
 
     # Clean: remove zero-variance columns and standardise, using training data
     X_l_list_column_filters = [zero_variance_col_filter(X) for X in train_X_l_list]
@@ -299,10 +381,19 @@ def process_data(sim_data, sim_data_test=None, training_split=False, training_si
     # MatrixDecomp expects a 1-D outcome; the multiview models take y as loaded.
     train_y_data = train_y_clean.squeeze() if model_type == "single_view" else train_y_clean
     test_y_data  = test_y_clean.squeeze()  if model_type == "single_view" else test_y_clean
-    train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]),
-                                 *train_X_l_list_clean, train_y_data)
-    test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
-                                 *test_X_l_list_clean, test_y_data)
+    if censored:
+        # (idx, X_1, ..., X_L, event, y): handler.py pops y, then event
+        train_y_data = train_y_data.reshape(-1)
+        test_y_data = test_y_data.reshape(-1)
+        train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]),
+                                     *train_X_l_list_clean, train_event, train_y_data)
+        test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
+                                     *test_X_l_list_clean, test_event, test_y_data)
+    else:
+        train_subset = TensorDataset(torch.arange(train_X_l_list_clean[0].shape[0]),
+                                     *train_X_l_list_clean, train_y_data)
+        test_subset  = TensorDataset(torch.arange(test_X_l_list_clean[0].shape[0]),
+                                     *test_X_l_list_clean, test_y_data)
 
     # Simulated structures, with score rows restricted to the training set.
     # Real data have no simulated truth (Z is None): leave these empty.
@@ -338,6 +429,9 @@ def process_data(sim_data, sim_data_test=None, training_split=False, training_si
     }
     if model_type == "viper":
         data_package["k_l_list"] = sim_data["K_l"].int().tolist()
+    if censored:
+        data_package.update(outcome=outcome, train_event=train_event, test_event=test_event,
+                            y_mean=y_mean, y_sd=y_std)
 
     return train_subset, test_subset, data_package
 
@@ -405,10 +499,11 @@ def _build_model(model_type, model_config, device="cpu", Z_init=None, Lambda_l_i
         return SupMultiviewShared(
             k, dense=dense, outcome_weight=outcome_weight, device=device,
             joint_scores_init=Z_init, joint_loadings_list_init=Lambda_l_init_list,
-            init_scale_Lambda=model_config.get("init_scale_Lambda", 1.0),
-            init_scale_Z=model_config.get("init_scale_Z", 1.0),
+            init_scale_Lambda=model_config.get("init_scale_Lambda", _MODEL_CONFIG_DEFAULTS["shared"]["init_scale_Lambda"]),
+            init_scale_Z=model_config.get("init_scale_Z", _MODEL_CONFIG_DEFAULTS["shared"]["init_scale_Z"]),
             init_param=model_config.get("init_param", 1.0),
             conjugate_shapes=model_config.get("conjugate_shapes", True),
+            outcome=model_config.get("outcome", "gaussian"),
         )
     return SupMultiviewDecomp(
         k, model_config["k_l_list"],
@@ -435,9 +530,10 @@ class _WarmupAdagradRMSProp(_TorchAdagradRMSProp):
 
 
 def _build_handler(mode, factor_model, train_config, model_type, opt=None, device="cpu",
-                   steps_per_epoch=None):
+                   steps_per_epoch=None, local_warmup_epochs=0):
     """ModelHandler for global training (mode="train") or local inference
-    (mode="predict").
+    (mode="predict"). local_warmup_epochs: step-size warm-up for local inference
+    (training uses warmup_epochs).
 
     opt : "adagrad" uses AdagradRMSProp (requires eta/delta/t in train_config);
         "scheduled" uses StepLR with Adam (requires initial_lr/betas/
@@ -449,7 +545,8 @@ def _build_handler(mode, factor_model, train_config, model_type, opt=None, devic
 
     if opt == "adagrad":
         args = {"eta": train_config["eta"], "delta": train_config["delta"], "t": train_config["t"]}
-        warm = train_config.get("warmup_epochs", defaults.get("warmup_epochs", 0)) if mode == "train" else 0
+        warm = (train_config.get("warmup_epochs", defaults.get("warmup_epochs", 0)) if mode == "train"
+                else local_warmup_epochs)
         if warm and steps_per_epoch:
             optimizer = pyro.optim.PyroOptim(_WarmupAdagradRMSProp,
                                              {**args, "warmup_steps": int(warm * steps_per_epoch)})
@@ -494,8 +591,12 @@ def _convergence_kwargs(train_config):
 
 def train_model(model_config, train_config, train_subset, model_out_filename=None,
                 model_type="viper", opt=None, verbose=False, write=True, device="cpu",
-                svd_init=False, optuna_trial=None, optuna_step_offset=0):
+                svd_init=None, optuna_trial=None, optuna_step_offset=0):
     """Train a model globally on the training set.
+
+    train_config / model_config entries that are missing are filled in from the
+    model's defaults (with_defaults); for "shared" an empty train_config gives the
+    tuned optimiser and the avg_param_change stopping rule.
 
     Parameters
     ----------
@@ -503,15 +604,19 @@ def train_model(model_config, train_config, train_subset, model_out_filename=Non
         Path stem for the saved state; nothing is written when None or write=False.
     opt : "adagrad", "scheduled" or None (the model's default: "scheduled"
         for viper, "adagrad" otherwise).
-    svd_init : bool
+    svd_init : bool or None
         If True, initialise the score and shared-loading locations from the
-        top-k SVD of the stacked training views before starting SVI.
+        top-k SVD of the stacked training views before starting SVI. None: the
+        model's default (True for "shared", False otherwise).
 
     Returns
     -------
     factor_model, train_handler, model_state_dict
     """
     _check_model_type(model_type)
+    train_config, model_config = with_defaults(model_type, train_config, model_config)
+    if svd_init is None:
+        svd_init = _MODEL_DEFAULTS[model_type].get("svd_init", False)
     k = model_config["k"]
 
     Z_init, Lambda_l_init_list = None, None
@@ -519,7 +624,9 @@ def train_model(model_config, train_config, train_subset, model_out_filename=Non
     if svd_init:
         svd_t0 = time.time()
         # train_subset is TensorDataset(idx, X_1, ..., X_L, y); views are [1:-1]
-        X_l_list = [t.to(device) for t in train_subset.tensors[1:-1]]
+        # views only: (idx, X_1..X_L, y), or (idx, X_1..X_L, event, y) for censored outcomes
+        last = -2 if model_config.get("outcome", "gaussian") in ("censored", "lognormal_aft") else -1
+        X_l_list = [t.to(device) for t in train_subset.tensors[1:last]]
         Z_init, Lambda_l_init_list = compute_svd_init(X_l_list, k)
         svd_time = time.time() - svd_t0
 
@@ -560,6 +667,26 @@ def train_model(model_config, train_config, train_subset, model_out_filename=Non
     return factor_model, train_handler, model_state_dict
 
 
+def _init_local_scores_shared(n_new, init_sd, device="cpu"):
+    """Start the test score guide of SupMultiviewShared: means 0 and, for
+    init_sd="train", sds equal to the per-factor average of the trained training-score
+    sds (the same for every new observation); "prior" gives sds 1 (the guide's own
+    start). Local parameters left over from an earlier call are removed first."""
+    import pyro.distributions as dist
+    store = pyro.get_param_store()
+    for name in (Params.loc_Z_pred, Params.scale_Z_pred):
+        if name in store:
+            del store[name]
+    sd = store[Params.scale_Z].detach().mean(0).to(device)
+    if init_sd == "prior":
+        sd = torch.ones_like(sd)
+    elif init_sd != "train":
+        raise ValueError(f"local_init_sd must be 'train' or 'prior', got {init_sd!r}")
+    k = sd.numel()
+    pyro.param(Params.loc_Z_pred, torch.zeros(n_new, k, device=device))
+    pyro.param(Params.scale_Z_pred, sd.expand(n_new, k).clone(), constraint=dist.constraints.positive)
+
+
 def train_model_locally(factor_model, train_config, data_subset, model_out_filename=None,
                         model_type="viper", opt=None, verbose=False, device="cpu"):
     """Local inference on new observations: infers their scores with the
@@ -576,19 +703,34 @@ def train_model_locally(factor_model, train_config, data_subset, model_out_filen
     factor_model, test_handler, model_state_dict
     """
     _check_model_type(model_type)
-    test_handler = _build_handler("predict", factor_model, train_config, model_type, opt, device)
+    train_config, _ = with_defaults(model_type, train_config)
+    mb = _minibatch_size(train_config, len(data_subset))
 
     conv = _convergence_kwargs(train_config)
-    if conv.get("convergence_criterion") == "avg_param_change":
+    local_rule = model_type == "shared" and conv.get("convergence_criterion") == "avg_param_change"
+    warm = 0
+    if local_rule:
+        # averaged change of the test score means and sds (see the module docstring)
+        conv = {"convergence_criterion": "avg_param_change",
+                "avg_block": train_config.get("local_avg_block", 25),
+                "avg_window_blocks": train_config.get("local_avg_window_blocks", 6),
+                "avg_tol": train_config.get("local_avg_tol", 0.10),
+                "avg_return_window_mean": train_config.get("local_return_window_mean", True)}
+        warm = train_config.get("local_warmup_epochs", 0)
+        _init_local_scores_shared(len(data_subset), train_config.get("local_init_sd", "prior"), device)
+    elif conv.get("convergence_criterion") == "avg_param_change":
         # tracks global parameters, which are fixed in local inference: use the default rule
         conv = {"convergence_criterion": "ma_patience"}
+    test_handler = _build_handler("predict", factor_model, train_config, model_type, opt, device,
+                                  steps_per_epoch=int(np.ceil(len(data_subset) / mb)),
+                                  local_warmup_epochs=warm)
     t0 = time.time()
     test_handler.do_inference(
         train_dataset=data_subset,
         min_epochs=train_config["min_epochs"],
         epochs=train_config["max_epochs"],
         minibatch_flag=True,
-        minibatch_size=_minibatch_size(train_config, len(data_subset)),
+        minibatch_size=mb,
         variational_diff_func=np.mean,
         verbose=verbose,
         **conv,

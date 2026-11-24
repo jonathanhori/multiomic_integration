@@ -76,8 +76,15 @@ class FlowModelHandler:
             epoch_loss = 0.0
             for batch in loader:
                 batch_idx = batch[0]
-                X_list = [batch[1]]
-                y_batch = batch[2].squeeze() if len(batch) > 2 else None
+                # Works for both single-view (batch = [idx, X, y]) and
+                # multiview (batch = [idx, X_1, ..., X_L, y]).
+                # For unsupervised single-view (batch = [idx, X]), y stays None.
+                if getattr(self.model, "supervised_model", True) and len(batch) >= 3:
+                    X_list = list(batch[1:-1])
+                    y_batch = batch[-1].squeeze()
+                else:
+                    X_list = list(batch[1:])
+                    y_batch = None
                 epoch_loss += svi.step(X_list, batch_idx, y_batch)
 
             self.model.loss_history.append(epoch_loss)
