@@ -1,0 +1,121 @@
+---
+title: "Current simulation results"
+jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+execute:
+  warning: false
+---
+
+This report contains **only current results**: produced with the current model
+code and comparable with one another. Past experiments whose results are out
+of date or not comparable are listed (without their results) in
+`sim/archive/README.md`. Metric definitions are in `docs/evaluation_metrics.md`;
+the design question behind the misaligned study is discussed in
+`docs/supervision_regimes.md`.
+
+**Which model.** All current simulation results are for the **shared-factor
+model** (`SupMultiviewShared`). The full model, VIPER (`SupMultiviewDecomp`, with
+view-specific factors), has no current results yet (section 3).
+
+**Methods.** Every section compares the same methods, as in the TCGA analysis:
+the shared model, MOFA + OLS, PCA + OLS (5 and 15 components), ridge and elastic
+net, plus oracles where the truth is known.
+
+## 1. Current studies
+
+| Study | Methods | Data | Status |
+|---|---|---|---|
+| Misaligned scenarios | shared model and MOFA (June 2026 runs); PCA + OLS, ridge, elastic net, oracles (October 2026) | `sim/data/multi_view_shared_misaligned`: 12 (n, p) cells × 4 scenarios × 10 replicates | current; covariance metric pending correction |
+| Single-condition pipeline runs | shared model; single-view model | one dataset each | current: `sim/python_integration.html`, `sim/python_factorization.html` |
+
+## 2. Misaligned scenarios
+
+**Design** (from the methods document). Five shared factors; the outcome
+depends only on some of them, which are given smaller loadings:
+
+| Scenario | Factor scales $(s_1,\dots,s_5)$ | Outcome factors |
+|---|---|---|
+| symmetric | (1, 1, 1, 1, 1) | all |
+| mild misalignment | (2, 2, 1, 1, 1) | 3, 4, 5 |
+| strong misalignment | (3, 2, 1, 0.5, 0.25) | 4, 5 |
+| anti-aligned | (3, 2, 1, 0.5, 0.25) | 5 only |
+
+The full analysis, with every metric for every (n, p) cell, is
+`sim/exploration/misaligned_diagnosis.qmd`. The headline tables follow; all are
+per (scenario, n, p) cell.
+
+```{python}
+import os
+import pandas as pd
+from IPython.display import Image, display
+
+SUMMARY = os.path.expanduser("~/multiomic_integration/sim/results/integration_shared_misaligned/summary")
+FIGS    = os.path.expanduser("~/multiomic_integration/sim/figures/misaligned")
+OUT     = os.path.expanduser("~/multiomic_integration/sim/results/summary")
+os.makedirs(OUT, exist_ok=True)
+
+def show(name):
+    path = os.path.join(SUMMARY, name)
+    if not os.path.exists(path):
+        print(f"{name} not found: render sim/exploration/misaligned_diagnosis.qmd first")
+        return None
+    t = pd.read_csv(path, index_col=[0, 1, 2])
+    t.to_csv(os.path.join(OUT, f"misaligned_{name}"))
+    return t
+```
+
+### Is the outcome factor detectable without supervision?
+
+Median strength of the weakest outcome-relevant factor relative to the detection
+threshold $\sqrt{P/n}$ (above 1: an unsupervised method can find it).
+
+```{python}
+path = os.path.join(SUMMARY, "detection_ratio_by_cell.csv")
+pd.read_csv(path, index_col=[0, 1]) if os.path.exists(path) else print("not found")
+```
+
+### Test outcome MSE
+
+```{python}
+show("outcome_mse_by_cell.csv")
+```
+
+```{python}
+if os.path.exists(os.path.join(FIGS, "outcome_mse_by_cell.png")):
+    display(Image(os.path.join(FIGS, "outcome_mse_by_cell.png")))
+```
+
+### Best method per cell
+
+Lowest mean test MSE among the fitted methods, and the shared model's rank (1 = best of 6).
+
+```{python}
+path = os.path.join(SUMMARY, "best_method_by_cell.csv")
+if os.path.exists(path):
+    best = pd.read_csv(path, index_col=[0, 1, 2])
+    best.to_csv(os.path.join(OUT, "misaligned_best_method_by_cell.csv"))
+    display(best.unstack("p"))
+```
+
+### Gap to the best achievable MSE
+
+```{python}
+show("gap_to_oracle_by_cell.csv")
+```
+
+## 3. Toward a systematic VIPER evaluation
+
+| Component | Status |
+|---|---|
+| Pipeline helpers for VIPER (`model_type="viper"`) | done, verified identical to the old helpers |
+| VIPER pipeline notebook | skeleton (`sim/python_viper.qmd`), settings not re-tuned |
+| Simulated data with view-specific factors | `sim/data_ortho` (aligned only); no misaligned or weak-signal version |
+| VIPER results with current code | none |
+| Comparators | shared model, MOFA, PCA + OLS, ridge, elastic net, oracles |
+
+Open decisions: re-tune VIPER's training settings; the simulation design
+(`docs/supervision_regimes.md`); the corrected covariance metric.
