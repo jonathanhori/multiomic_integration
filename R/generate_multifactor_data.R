@@ -36,7 +36,18 @@
 #       sim_data_singlefactor_n{n}_P{P}_c{c}_rep{rep}.rds
 #   Seeds: set.seed(20261122 + 100000 i_n + 10000 i_P + 100 i_c + rep).
 #
-# usage: Rscript R/generate_multifactor_data.R [--single] [--only n,P,c(,w)] [--reps r1,r2,...]
+# High-PVE + weak study (--highpve; November 2026): one predictive factor that is as
+#   large as the nuisance factors (nuisance column 1: dense loadings on ~75 % of the
+#   features, sd 1, PVE ~15 %) and one weak predictive factor (g = c sqrt(gamma), own
+#   support, rescaled to target), plus 3 nuisance factors with beta = 0 (K = 5). The
+#   weak factor carries a share omega_2 in {0.25, 0.5, 0.75} of the signal and the large
+#   one 1 - omega_2 (omega = omega_2, omega_nuis = (1 - omega_2, 0, 0, 0)); signal variance
+#   1, snr_y = 2. Same (n, P, c) cells as the other studies.
+#   Layout: sim/data/multi_view_shared_multifactor/high_pve/{train,test}/n{n}_P{P}_c{c}_w{omega_2}/
+#       sim_data_highpve_n{n}_P{P}_c{c}_w{omega_2}_rep{rep}.rds
+#   Seeds: set.seed(20261124 + 100000 i_n + 10000 i_P + 1000 i_w + 100 i_c + rep).
+#
+# usage: Rscript R/generate_multifactor_data.R [--single | --highpve] [--only n,P,c(,w)] [--reps r1,r2,...]
 
 root <- file.path(Sys.getenv("HOME"), "multiomic_integration")
 source(file.path(root, "R", "sim_methods.R"))
@@ -64,6 +75,9 @@ if (SINGLE) {
   OUT_ROOT <- file.path(root, "sim", "data", "multi_view_shared_multifactor", "single_factor")
   W_ARRAY <- 1                  # omega = 1: one relevant factor carries all the signal
 }
+HIGHPVE <- "--highpve" %in% commandArgs(trailingOnly = TRUE)
+stopifnot(!(SINGLE && HIGHPVE))
+if (HIGHPVE) OUT_ROOT <- file.path(root, "sim", "data", "multi_view_shared_multifactor", "high_pve")
 
 args <- commandArgs(trailingOnly = TRUE)
 only <- NULL
@@ -83,14 +97,17 @@ for (i_w in seq_along(W_ARRAY)) for (i_c in seq_along(C_ARRAY)) {
   for (d in dirs) dir.create(d, recursive = TRUE, showWarnings = FALSE)
   sg <- sqrt(P / n)
   for (rep in REPS) {
-    fname <- sprintf(if (SINGLE) "sim_data_singlefactor_%s_rep%d.rds" else "sim_data_twofactor_%s_rep%d.rds", cond, rep)
+    prefix <- if (SINGLE) "singlefactor" else if (HIGHPVE) "highpve" else "twofactor"
+    fname <- sprintf("sim_data_%s_%s_rep%d.rds", prefix, cond, rep)
     if (file.exists(file.path(dirs[2], fname))) next
     if (SINGLE) set.seed(20261122 + 100000 * i_n + 10000 * i_P + 100 * i_c + rep) else
+      if (HIGHPVE) set.seed(20261124 + 100000 * i_n + 10000 * i_P + 1000 * i_w + 100 * i_c + rep) else
       set.seed(20261118 + 100000 * i_n + 10000 * i_P + 1000 * i_w + 100 * i_c + rep)
     tr <- generate_factor_data_shared_multifactor(
       N = n, p_l_vec = diff(round(seq(0, P, length.out = L + 1))),
-      g_target = if (SINGLE) c * sg else c(G_STRONG * sg, c * sg),
-      omega = if (SINGLE) 1 else c(1 - w, w),
+      g_target = if (SINGLE || HIGHPVE) c * sg else c(G_STRONG * sg, c * sg),
+      omega = if (SINGLE) 1 else if (HIGHPVE) w else c(1 - w, w),
+      omega_nuis = if (HIGHPVE) c(1 - w, 0, 0, 0) else rep(0, 4),
       a = 0.5, K_nuis = 4, nuis_sd = 1, nuis_density = 0.75, snr_y = 2,
       rescale_to_target = RESCALE)
     te <- generate_factor_data_shared_multifactor_testing(TEST_N, tr)

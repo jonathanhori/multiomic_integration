@@ -1,0 +1,29 @@
+# Conda environment for the Hoffman2 Slurm cluster (Linux). The repository's
+# environment.yml is a macOS export (Apple-silicon builds) and does not install on Linux.
+# Same Python and package versions as environment.yml, plus scikit-survival (survival
+# study); torch is the CPU build. Notebook / plotting packages are left out.
+#
+# Create once, on Hoffman2, with the miniforge module loaded (see cluster/setup_hoffman2.sh):
+#   conda env create -f cluster/environment_hoffman2.yml
+# rpy2 is installed afterwards by setup_hoffman2.sh with the R module loaded, so it links
+# to that R.
+name: multiomic
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.5.1
+      - pyro-ppl==1.9.1
+      - zuko==1.6.0
+      - numpy==2.4.4
+      - pandas==2.3.3
+      - scipy==1.16.3
+      - scikit-learn==1.8.0
+      - scikit-survival==0.27.0
+      - joblib==1.5.2
+      - optuna==4.9.0
+      - tqdm==4.67.1
+      - pyreadr==0.5.3

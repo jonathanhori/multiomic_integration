@@ -2,7 +2,7 @@
 # One-time setup of this repository on the Hoffman2 Slurm cluster.
 #
 # Run from the repository root, inside an interactive session (not on the login node):
-#   srun --time=02:00:00 --cpus-per-task=2 --mem=8G --account=pi_<PI> --pty bash -l
+#   srun --time=02:00:00 --cpus-per-task=2 --mem=8G --account=pi_huazhou --pty bash -l
 #   cd $SCRATCH/multiomic_integration && bash cluster/setup_hoffman2.sh [--smoke]
 #
 # What it does (each step is skipped if already done):
