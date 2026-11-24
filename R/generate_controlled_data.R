@@ -5,7 +5,9 @@
 #
 # Grid (Phase 2):
 #   n in {100, 200, 500}, P in {600, 3000} with L = 3 views of p_l = P / 3,
-#   c in {0.3, 0.6, 1, 1.5, 2, 3, 10},  g_target = c * sqrt(gamma), gamma = P / n,
+#   c in {0.3, 0.6, 1, 1.5, 2, 3, 10},
+#   plus high-dimensional cells (November 2026): P = 10000 (views 3334 / 3333 / 3333),
+#   c in {0.3, 1, 3, 10} (C_ARRAY_HIGHDIM), all n,  g_target = c * sqrt(gamma), gamma = P / n,
 #   K_nuis = 4 (K = 5), a = 0.5, nuisance density 0.75, snr_y = 2, r_out = 0,
 #   rescale_to_target = FALSE (realised g_true varies around g_target).
 #   Each training replicate has N = n samples; its test set has TEST_N fresh samples
@@ -23,8 +25,9 @@
 source(file.path(Sys.getenv("HOME"), "multiomic_integration", "R", "sim_methods.R"))
 
 N_ARRAY <- c(100, 200, 500)
-P_ARRAY <- c(600, 3000)
+P_ARRAY <- c(600, 3000, 10000)   # appended values keep the earlier cells' seeds
 C_ARRAY <- c(0.3, 0.6, 1, 1.5, 2, 3, 10)
+C_ARRAY_HIGHDIM <- c(0.3, 1, 3, 10)   # c values generated for P > 3000
 REPS    <- 1:10          # TODO(user): number of replicates (spec: start with 10)
 TEST_N  <- 100           # TODO(user): test-set size (100 as in the misaligned study; the
                          # primary metric, exact risk, does not use the test set)
@@ -42,6 +45,7 @@ cond_name <- function(n, P, c) sprintf("n%d_P%d_c%s", n, P, format(c))
 for (i_n in seq_along(N_ARRAY)) for (i_P in seq_along(P_ARRAY)) for (i_c in seq_along(C_ARRAY)) {
   n <- N_ARRAY[i_n]; P <- P_ARRAY[i_P]; c <- C_ARRAY[i_c]
   if (!is.null(only) && !all(c(n, P, c) == only)) next
+  if (P > 3000 && !(c %in% C_ARRAY_HIGHDIM)) next
   cond <- cond_name(n, P, c)
   dirs <- file.path(OUT_ROOT, c("train", "test"), cond)
   for (d in dirs) dir.create(d, recursive = TRUE, showWarnings = FALSE)
@@ -50,7 +54,7 @@ for (i_n in seq_along(N_ARRAY)) for (i_P in seq_along(P_ARRAY)) for (i_c in seq_
     fname <- sprintf("sim_data_controlled_%s_rep%d.rds", cond, rep)
     if (file.exists(file.path(dirs[2], fname))) next
     set.seed(20261021 + 100000 * i_n + 10000 * i_P + 100 * i_c + rep)
-    tr <- generate_factor_data_shared_controlled(N = n, p_l_vec = rep(P / L, L), g_target = g_target,
+    tr <- generate_factor_data_shared_controlled(N = n, p_l_vec = diff(round(seq(0, P, length.out = L + 1))), g_target = g_target,
                                                  a = 0.5, K_nuis = 4, nuis_sd = 1, nuis_density = 0.75,
                                                  snr_y = 2, r_out = 0, rescale_to_target = FALSE)
     te <- generate_factor_data_shared_controlled_testing(TEST_N, tr)
