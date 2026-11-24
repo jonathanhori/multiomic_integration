@@ -1,0 +1,455 @@
+---
+title: "Correcting the early MGP collapse: step size, warm-up, delayed shrinkage, dense prior"
+subtitle: "Prediction over epochs and at the MA stop, implied number of factors, the MGP global precision and factor recovery, by K_max — TCGA, controlled and misaligned simulations"
+jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
+---
+
+**Why.** With the current optimiser (AdagradRMSProp, η = 0.22) the gradients
+of the loadings and of q(δ) are far larger than 1, so the optimiser's update
+η·g/(1 + √s) is a sign step: in the first epoch every loading and every δ
+parameter moves by about η whatever its gradient. Weak columns' loadings are
+inflated, the MGP global precision τ_k = δ_1⋯δ_k collapses over a long range of
+columns, and at large K_max noise columns stay in the model
+(`docs/mgp_shrinkage_collapse.md`).
+
+**What is compared** (`python/global_eta_study.py`). Five approaches; model,
+initialisation and data handling are otherwise unchanged, and the model code
+is not edited (the optimiser variants wrap the optimiser `run_methods` builds):
+
+| approach | what changes | targets |
+|---|---|---|
+| current | AdagradRMSProp, η = 0.22 for every parameter | — |
+| 0.3·η global | step 0.3·η for every global parameter (loadings, δ, ρ, noise variances, β, σ_y); η for the per-sample scores | the size of every global step, throughout training |
+| η warm-up (5 epochs) | η rises linearly from 0 to 0.22 over the first 5 epochs (per optimiser step, all parameters), then the current optimiser | the first-epoch sign steps only; full speed afterwards |
+| δ frozen 25 epochs | q(δ) held at its starting value (so E[τ_k] = 1) for the first 25 epochs while loadings and scores train; then trained as usual | lets the loadings settle before the shrinkage reacts to them ("delayed shrinkage") |
+| dense prior | `dense_model=True`: a per-view, per-column inverse-gamma loading variance, no cumulative product; current optimiser | removes the product that spreads one column's collapse to all later columns (no τ to plot) |
+ Each fit runs a fixed 1000
+epochs; every 25 epochs the closed-form test predictions, the τ profile and
+(simulations) the recovery of the true factors are recorded. The MA w25 p50
+stopping rule is located afterwards from the training loss and marked on the
+curves.
+
+| data | runs | K_max |
+|---|---|---|
+| TCGA COAD/READ, 5 CV folds (same folds and preprocessing as `tcga_coadread_cv.qmd`) | 5 folds | 20, 50, 100 |
+| controlled-strength simulation, n = 500, P = 3000, c = 1, true K = 5 | 2 replicates | 15, 50, 100 |
+| June misaligned simulation, n = 500, p = 1000 × 3, symmetric, true K = 5 | 2 replicates | 15, 50, 100 |
+
+Prediction metrics use the closed-form posterior predictive of the guide
+(`viper_predict.closed_form_scores`) on the standardised outcome, not the
+local-SVI scoring of the CV notebook, so their level differs slightly from
+`tcga_coadread_cv.qmd`; the comparison between optimisers is like for like.
+
+```{python}
+import os, glob, itertools
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sys
+sys.path.insert(1, os.path.expanduser("~/multiomic_integration/python"))
+from factor_interpretation import _rotate_loadings
+
+ROOT = os.path.expanduser("~/multiomic_integration")
+HERE = f"{ROOT}/analysis/tcga_coadread"
+DIRS = {"tcga": f"{HERE}/results/global_eta_study", "sim": f"{ROOT}/sim/results/global_eta_study"}
+FIG = f"{HERE}/figures/global_eta"
+os.makedirs(FIG, exist_ok=True)
+OPT_ALL = {"default": "current", "gslow0.3": "0.3·η global", "warm5": "η warm-up 5 ep.",
+           "dfreeze25": "δ frozen 25 ep.", "warm5_qprior": "warm-up + q(δ) at prior",
+           "warm5_qflat": "warm-up + q(δ) tight at 1", "dense": "dense prior (ref.)"}
+OCOL = {"default": "C3", "gslow0.3": "C0", "warm5": "C2", "dfreeze25": "C1", "warm5_qprior": "C5",
+        "warm5_qflat": "C6", "dense": "C7"}
+DATA = {"tcga": "TCGA", "ctrl": "controlled sim (K = 5)", "mis": "misaligned sim (K = 5)"}
+
+def read(kind):
+    fs = glob.glob(f"{DIRS['tcga']}/*_{kind}.csv") + glob.glob(f"{DIRS['sim']}/*_{kind}.csv")
+    return pd.concat([pd.read_csv(f) for f in fs], ignore_index=True)
+
+curve = read("curve")
+tau = read("tau")
+OPT = {o: l for o, l in OPT_ALL.items() if o in set(curve.opt)}
+done = curve.groupby(["data", "K_max", "opt"])["rep"].nunique().unstack("opt")
+print("fits per cell:"); display(done)
+
+def save(fig, name):
+    fig.savefig(f"{FIG}/{name}", dpi=150, bbox_inches="tight")
+```
+
+## 1. TCGA: prediction over epochs
+
+Pooled over the 5 held-out folds at each epoch: R² = 1 − ΣSSE/ΣSST of the
+standardised outcome, and the coverage of the 95% predictive intervals.
+Vertical ticks: each fold's MA stop.
+
+```{python}
+#| fig-height: 7
+pred = []
+for f in glob.glob(f"{DIRS['tcga']}/tcga_*_preds.npz"):
+    rep, k, opt = f.split("/")[-1].replace("_preds.npz", "").split("_", 1)[1].split("_", 2)
+    d = np.load(f)
+    for i, e in enumerate(d["epochs"]):
+        yhat, sd = d["pred"][i, :, 0], d["pred"][i, :, 1]
+        pred.append({"rep": int(rep[3:]), "K_max": int(k[1:]), "opt": opt, "epoch": int(e),
+                     "sse": ((yhat - d["y"]) ** 2).sum(), "sst": ((d["y"] - d["y"].mean()) ** 2).sum(),
+                     "covered": (np.abs(yhat - d["y"]) <= 1.96 * sd).sum(), "n": len(d["y"])})
+pred = pd.DataFrame(pred)
+pool = pred.groupby(["K_max", "opt", "epoch"]).agg(sse=("sse", "sum"), sst=("sst", "sum"),
+                                                     covered=("covered", "sum"), n=("n", "sum"), folds=("rep", "nunique"))
+pool["R2"] = 1 - pool.sse / pool.sst
+pool["coverage"] = pool.covered / pool.n
+pool = pool.reset_index()
+stops = curve.query("data == 'tcga'").groupby(["K_max", "opt", "rep"])["ma_stop"].first().reset_index()
+
+ks = sorted(pool.K_max.unique())
+fig, axs = plt.subplots(2, len(ks), figsize=(4.6 * len(ks), 7), sharey="row", squeeze=False)
+for j, k in enumerate(ks):
+    for opt in OPT:
+        g = pool.query("K_max == @k and opt == @opt and folds == 5")
+        if g.empty: continue
+        axs[0, j].plot(g.epoch, g.R2, color=OCOL[opt], label=OPT[opt])
+        axs[1, j].plot(g.epoch, g.coverage, color=OCOL[opt])
+        for s in stops.query("K_max == @k and opt == @opt").ma_stop.dropna():
+            axs[0, j].plot([s, s], [0.62, 0.65], color=OCOL[opt], lw=1.5)
+    axs[0, j].set(title=f"K_max = {k}", ylim=(0.2, 0.65)); axs[1, j].set(xlabel="epoch", ylim=(0.7, 1.0))
+    axs[1, j].axhline(0.95, color="k", lw=0.6)
+axs[0, 0].set_ylabel("pooled out-of-fold R²"); axs[1, 0].set_ylabel("95% coverage")
+axs[0, 0].legend(fontsize=8)
+plt.tight_layout(); save(fig, "tcga_r2_coverage_vs_epoch.png"); plt.show()
+
+# table: at the MA stop of each fold, at epoch 500 and 1000, and the best epoch
+def at_stop(g):
+    out = []
+    for r in g.itertuples():
+        s = stops.query("K_max == @r.K_max and opt == @r.opt and rep == @r.rep").ma_stop
+        out.append(r.epoch == (max(e for e in g.query("rep == @r.rep").epoch if e <= (s.iloc[0] if s.notna().all() else 1000))))
+    return np.array(out)
+rows = []
+for (k, opt), g in pred.groupby(["K_max", "opt"]):
+    if g.rep.nunique() < 5: continue
+    m = at_stop(g); s = g[m]
+    best = pool.query("K_max == @k and opt == @opt").sort_values("R2").iloc[-1]
+    e500 = pool.query("K_max == @k and opt == @opt and epoch == 500").iloc[0]
+    e1000 = pool.query("K_max == @k and opt == @opt and epoch == 1000").iloc[0]
+    cv = curve.query("data == 'tcga' and K_max == @k and opt == @opt")
+    cma = cv.merge(s[["rep", "epoch"]], on=["rep", "epoch"])
+    c1000 = cv[cv.epoch == 1000]
+    rows.append({"K_max": k, "approach": OPT[opt],
+                 "R² at MA stop": 1 - s.sse.sum() / s.sst.sum(), "coverage at MA stop": s.covered.sum() / s.n.sum(),
+                 "factors >1% at MA": cma["cols > 1%"].mean(), "factors >0.1% at MA": cma["cols > 0.1%"].mean(),
+                 "factors >1% at 1000": c1000["cols > 1%"].mean(), "factors >0.1% at 1000": c1000["cols > 0.1%"].mean(),
+                 "median MA stop": stops.query("K_max == @k and opt == @opt").ma_stop.median(),
+                 "R² at 500": e500.R2, "R² at 1000": e1000.R2, "coverage at 1000": e1000.coverage,
+                 "best R²": best.R2, "best epoch": int(best.epoch)})
+tcga_tab = pd.DataFrame(rows).round(3)
+tcga_tab.to_csv(f"{DIRS['tcga']}/summary_prediction.csv", index=False)
+display(tcga_tab)
+```
+
+## 2. Simulations: prediction and factor recovery over epochs
+
+Mean over the two replicates. Recovery: canonical correlations between the
+true score space (5 factors) and the fitted columns with the 5 largest PVE
+(mean over the 5 canonical correlations); columns kept: columns with more than
+0.1% PVE (true number 4-5, see the PVE cutoff discussion in
+`tcga_coadread_cv.qmd`).
+
+```{python}
+#| fig-height: 9
+sim = curve.query("data != 'tcga'")
+mets = [("test_mse_std", "test MSE (std. outcome)"), ("recovery (mean canon corr)", "recovery (mean canon. corr.)"),
+        ("cols > 0.1%", "columns > 0.1% PVE")]
+for data in ["ctrl", "mis"]:
+    ks = sorted(sim.query("data == @data").K_max.unique())
+    if not ks: continue
+    fig, axs = plt.subplots(len(mets), len(ks), figsize=(4.4 * len(ks), 2.6 * len(mets)), sharey="row", squeeze=False)
+    for j, k in enumerate(ks):
+        for opt in OPT:
+            g = sim.query("data == @data and K_max == @k and opt == @opt")
+            if g.empty: continue
+            m = g.groupby("epoch")[[c for c, _ in mets]].mean()
+            for i, (c, lab) in enumerate(mets):
+                axs[i, j].plot(m.index, m[c], color=OCOL[opt], label=OPT[opt] if i == 0 else None)
+                for s in g.groupby("rep").ma_stop.first().dropna():
+                    lo, hi = axs[i, j].get_ylim() if False else (None, None)
+                    axs[i, j].axvline(s, color=OCOL[opt], lw=0.6, ls=":")
+        axs[0, j].set_title(f"{DATA[data]}, K_max = {k}")
+        axs[-1, j].set_xlabel("epoch")
+    for i, (_, lab) in enumerate(mets):
+        axs[i, 0].set_ylabel(lab)
+    axs[0, 0].legend(fontsize=8)
+    plt.tight_layout(); save(fig, f"{data}_curves.png"); plt.show()
+
+rows = []
+for (data, k, opt), g in sim.groupby(["data", "K_max", "opt"]):
+    ma = []
+    for rep, h in g.groupby("rep"):
+        s = h.ma_stop.iloc[0]
+        e = h.epoch[h.epoch <= (s if pd.notna(s) else 1000)].max()
+        ma.append(h[h.epoch == e].iloc[0])
+    ma = pd.DataFrame(ma); last = g[g.epoch == 1000]
+    rows.append({"data": DATA[data], "K_max": k, "approach": OPT[opt], "median MA stop": g.groupby("rep").ma_stop.first().median(),
+                 "test MSE at MA": ma.test_mse_std.mean(), "test MSE at 1000": last.test_mse_std.mean(),
+                 "coverage at MA": ma.coverage_95.mean(),
+                 "factors >1% at MA": ma["cols > 1%"].mean(), "factors >1% at 1000": last["cols > 1%"].mean(),
+                 "recovery at MA": ma["recovery (mean canon corr)"].mean(),
+                 "recovery at 1000": last["recovery (mean canon corr)"].mean(),
+                 "cols > 0.1% at MA": ma["cols > 0.1%"].mean(), "cols > 0.1% at 1000": last["cols > 0.1%"].mean(),
+                 "coverage at 1000": last.coverage_95.mean()})
+sim_tab = pd.DataFrame(rows).round(3)
+sim_tab.to_csv(f"{DIRS['sim']}/summary.csv", index=False)
+display(sim_tab)
+```
+
+## 3. The MGP global precision τ_k
+
+E_q[log₁₀ τ_k] by column at the end of training (epoch 1000; view 0, the
+expression view on TCGA), one line per fold or replicate. Under the prior,
+τ_k increases with k.
+
+```{python}
+#| fig-height: 8
+last = tau.query("epoch == 1000 and view == 0")
+datas = [d for d in ["mis", "ctrl", "tcga"] if d in last.data.unique()]
+MGP = [o for o in OPT if o != "dense"]
+fig, axs = plt.subplots(len(datas), len(MGP), figsize=(5.2 * len(MGP), 3.2 * len(datas)), sharey=True, squeeze=False)
+KC = {15: "C0", 20: "C0", 50: "C2", 100: "C3"}
+for i, data in enumerate(datas):
+    for j, opt in enumerate(MGP):
+        ax = axs[i, j]
+        for (k, rep), g in last.query("data == @data and opt == @opt").groupby(["K_max", "rep"]):
+            ax.plot(g.column, g["E log10 tau"], color=KC[k], lw=1, alpha=0.8,
+                    label=f"K_max = {k}" if rep == g.rep.min() and rep in (0, 1) else None)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(title=f"{DATA[data]} — {OPT[opt]}", xlabel="column k" if i == len(datas) - 1 else "")
+        if j == 0: ax.set_ylabel(r"$E_q[\log_{10}\tau_k]$, epoch 1000")
+        ax.legend(fontsize=7)
+plt.tight_layout(); save(fig, "tau_profiles_epoch1000.png"); plt.show()
+
+# summary: lowest log10 tau, and how many columns have tau below tau_1
+s = last.groupby(["data", "K_max", "opt", "rep"]).apply(lambda g: pd.Series({
+    "min log10 tau": g["E log10 tau"].min(),
+    "columns with tau < tau_1": int((g["E log10 tau"] < g["E log10 tau"].iloc[0]).sum())}))
+display(s.groupby(["data", "K_max", "opt"]).mean().round(1).unstack("opt"))
+```
+
+How τ evolves early in training (the collapse happened in the first epoch):
+
+```{python}
+#| fig-height: 4
+fig, axs = plt.subplots(1, 3, figsize=(14, 3.6), sharey=True)
+for ax, data in zip(axs, ["mis", "ctrl", "tcga"]):
+    kk = 100
+    for opt in OPT:
+        g = tau.query("data == @data and K_max == @kk and opt == @opt and view == 0")
+        if g.empty: continue
+        m = g.groupby(["epoch", "column"])["E log10 tau"].mean().unstack("column")
+        cols = [c for c in (20, 50, 80) if c in m.columns]
+        for c, ls in zip(cols, ["-", "--", ":"]):
+            ax.plot(m.index, m[c], color=OCOL[opt], ls=ls, label=f"{OPT[opt]}, column {c}")
+    ax.set(title=f"{DATA[data]}, K_max = 100", xlabel="epoch", xscale="log")
+axs[0].set_ylabel(r"$E_q[\log_{10}\tau_k]$"); axs[0].legend(fontsize=6)
+plt.tight_layout(); save(fig, "tau_over_epochs_k100.png"); plt.show()
+```
+
+## 4. TCGA: factor stability across folds
+
+As in `tcga_coadread_cv.qmd`, section 5: each fit's loadings are varimax-rotated;
+for each active rotated factor (PVE > 1%) of one fold, the best |correlation|
+with any factor of another fold (common genes), averaged over all ordered pairs
+of folds. Shown at the MA stop's checkpoint and at epoch 1000.
+
+```{python}
+CV = f"{HERE}/results/cv"
+L = 2
+def genes(f):
+    return [open(f"{CV}/fold{f}/genes_view{l}.txt").read().split("\n") for l in range(L)]
+
+def load_fit(f, k, opt, when):
+    d = np.load(f"{DIRS['tcga']}/tcga_rep{f}_k{k}_{opt}_fits.npz")
+    if f"{when}_W" not in d: return None
+    W, Z = d[f"{when}_W"], d[f"{when}_Z"]
+    g = genes(f); p0 = len(g[0])
+    rot, R = _rotate_loadings([W[:p0], W[p0:]])
+    Zr = Z @ R
+    n, P = Zr.shape[0], W.shape[0]
+    energy = (Zr ** 2).sum(0) * sum((r ** 2).sum(0) for r in rot) / (n * P)
+    return {"loadings": rot, "genes": g, "active": np.where(energy > 0.01)[0]}
+
+def best_match(a, b):
+    va, vb = [], []
+    for l in range(L):
+        ib = {g: i for i, g in enumerate(b["genes"][l])}
+        pairs = [(i, ib[g]) for i, g in enumerate(a["genes"][l]) if g in ib]
+        ia_, ib_ = zip(*pairs)
+        va.append(a["loadings"][l][list(ia_)]); vb.append(b["loadings"][l][list(ib_)])
+    A, B = np.vstack(va), np.vstack(vb)
+    A = (A - A.mean(0)) / A.std(0); B = (B - B.mean(0)) / B.std(0)
+    return np.abs(A.T @ B) / A.shape[0]
+
+rows = []
+for k in sorted(curve.query("data == 'tcga'").K_max.unique()):
+    for opt in OPT:
+        for when in ["ma", "1000"]:
+            try:
+                fits = {f: load_fit(f, k, opt, when) for f in range(5)}
+            except FileNotFoundError:
+                continue
+            if any(v is None for v in fits.values()): continue
+            vals = [best_match(fits[a], fits[b])[j].max() for a in fits for b in fits if a != b for j in fits[a]["active"]]
+            rows.append({"K_max": k, "approach": OPT[opt], "when": "MA stop" if when == "ma" else "epoch 1000",
+                         "active factors (mean)": np.mean([len(v["active"]) for v in fits.values()]),
+                         "mean best |corr| across folds": np.mean(vals)})
+stab = pd.DataFrame(rows).round(3)
+stab.to_csv(f"{DIRS['tcga']}/summary_stability.csv", index=False)
+display(stab.pivot_table(index=["K_max", "when"], columns="approach",
+                         values=["mean best |corr| across folds", "active factors (mean)"]))
+```
+
+Reference: the same measure for MOFA and PCA (and the shared model with the
+current optimiser at the MA stop) from the CV pipeline's fits
+(`tcga_coadread_cv.qmd`, section 5; `results/cv/cv_factor_stability.csv`). The
+K of MOFA and PCA corresponds to K_max here.
+
+```{python}
+ref = pd.read_csv(f"{HERE}/results/cv/cv_factor_stability.csv")
+ref = ref.assign(approach=ref.method + " (CV pipeline)").rename(columns={"K": "K_max", "mean best |corr|": "mean best |corr| across folds"})
+ours = stab.query("(when == 'MA stop') or (approach == '0.3·η global' and when == 'epoch 1000')").assign(
+    approach=lambda d: d.approach + ", " + d.when)
+both = pd.concat([ref[["approach", "K_max", "mean best |corr| across folds", "active factors (mean)"]],
+                  ours[["approach", "K_max", "mean best |corr| across folds", "active factors (mean)"]]])
+fig, ax = plt.subplots(figsize=(7.5, 4.2))
+for a, g in both.groupby("approach", sort=False):
+    ref_line = "CV pipeline" in a
+    ax.plot(g.K_max, g["mean best |corr| across folds"], "s--" if ref_line else "o-", lw=1.2,
+            color="k" if a.startswith("MOFA") else "0.55" if a.startswith("PCA") else None, label=a)
+ax.set(xlabel="K_max", ylabel="mean best |corr| across folds", ylim=(0.4, 1.0))
+ax.legend(fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left")
+plt.tight_layout(); save(fig, "stability_vs_mofa_pca.png"); plt.show()
+display(both.pivot_table(index="approach", columns="K_max", values="mean best |corr| across folds").round(2))
+```
+
+## 5. Implied number of factors (PVE)
+
+Columns whose share of the training views' variance (PVE = ‖z_k‖²‖λ_k‖²/(nP),
+unrotated) exceeds 1% (solid) or 0.1% (dashed), at the MA stop's checkpoint
+and at epoch 1000, mean over folds / replicates, against K_max. The
+simulations have 5 true factors. A count that rises with K_max means the
+model is keeping noise columns; a flat count means K_max no longer matters.
+
+```{python}
+#| fig-height: 7
+rows = []
+for (data, k, opt, rep), g in curve.groupby(["data", "K_max", "opt", "rep"]):
+    s = g.ma_stop.iloc[0]
+    e = g.epoch[g.epoch <= (s if pd.notna(s) else 1000)].max()
+    for when, ep in [("MA stop", e), ("epoch 1000", 1000)]:
+        r = g[g.epoch == ep].iloc[0]
+        rows.append({"data": data, "K_max": k, "opt": opt, "rep": rep, "when": when,
+                     ">1%": r["cols > 1%"], ">0.1%": r["cols > 0.1%"]})
+nf = pd.DataFrame(rows).groupby(["data", "K_max", "opt", "when"])[[">1%", ">0.1%"]].mean().reset_index()
+fig, axs = plt.subplots(2, 3, figsize=(15, 7), squeeze=False)
+for j, data in enumerate(["tcga", "ctrl", "mis"]):
+    for i, when in enumerate(["MA stop", "epoch 1000"]):
+        ax = axs[i, j]
+        for opt in OPT:
+            g = nf.query("data == @data and opt == @opt and when == @when").sort_values("K_max")
+            ax.plot(g.K_max, g[">1%"], "o-", color=OCOL[opt], label=OPT[opt])
+            ax.plot(g.K_max, g[">0.1%"], "o--", color=OCOL[opt], alpha=0.5)
+        if data != "tcga": ax.axhline(5, color="k", lw=0.6)
+        ax.set(title=f"{DATA[data]} — {when}", xlabel="K_max" if i == 1 else "", ylabel="columns above PVE cutoff" if j == 0 else "")
+axs[0, 0].legend(fontsize=8)
+plt.tight_layout(); save(fig, "implied_factors_vs_kmax.png"); plt.show()
+display(nf.pivot_table(index=["data", "when", "K_max"], columns="opt", values=">1%").rename(columns=OPT).round(1))
+```
+
+## 6. Covariance reconstruction (simulations)
+
+Factor part of the implied covariance, Λ_l Σ_Z Λ_mᵀ, against the truth on the
+standardised scale, for every pair of views (`python/global_eta_cov.py`, using
+`data_utils.implied_cov_errors`). Relative error = mean squared entrywise error
+÷ mean squared entry of the true covariance (the error of an all-zero estimate);
+mean over view pairs and replicates. TCGA has no true covariance.
+
+```{python}
+cov = pd.read_csv(f"{DIRS['sim']}/cov_error.csv")
+ct = (cov.groupby(["data", "K_max", "opt", "when"]).cov_rel.mean().unstack("opt")
+      .rename(columns=OPT)[[v for v in OPT.values() if v in OPT.values()]])
+ct.index = ct.index.set_levels([[DATA.get(d, d) for d in ct.index.levels[0]]] + list(ct.index.levels[1:]))
+display((100 * ct).round(2).rename_axis(columns="relative covariance error (%)"))
+```
+
+## 7. Interpretation: do the fits recover the annotated factors?
+
+The 12 consensus factors CF1–CF12 annotated in `tcga_coadread_factors.qmd`
+were built from the CV pipeline's K = 20 fits (current optimiser, MA stop). Each
+study fit's varimax factors (> 1% PVE) are correlated with them over shared
+features (`global_eta_consensus_match.py`). A CF counts as recovered at
+|r| ≥ 0.8; an "unmatched" factor has no CF at |r| ≥ 0.5. Mean over folds.
+K_max = 20 with the current optimiser matches partly by construction.
+
+```{python}
+cm_ = pd.read_csv(f"{DIRS['tcga']}/consensus_match.csv")
+cm_["approach"] = cm_.approach.map(OPT)
+display(cm_.groupby(["K_max", "when", "approach"])[["active factors", "CFs recovered (|r| >= 0.8)", "unmatched factors (|r| < 0.5)"]]
+        .mean().unstack("approach").round(1))
+```
+
+## 8. Summary
+
+189 fits (7 approaches × the grid). Every fit completed; at TCGA K_max = 100,
+8 first attempts (δ frozen, dense) hit NaN in the noise-variance guide and
+were rerun with a new seed. The dense prior is shown for reference only (no
+K* selection or within-factor sparsity).
+
+**Warm-up + q(δ) started tight at 1, Gamma(50, 50), is the only approach that
+fixes every criterion at once.**
+
+| criterion | current | η warm-up | warm-up + q(δ) at prior | **warm-up + q(δ) tight at 1** |
+|---|---|---|---|---|
+| TCGA R² at MA stop, K_max 20 / 50 / 100 | 0.474 / 0.530 / 0.539 | 0.471 / 0.547 / 0.570 | 0.466 / 0.540 / 0.569 | 0.474 / 0.537 / **0.575** |
+| TCGA R² at epoch 1000 | 0.475 / 0.537 / 0.553 | 0.474 / 0.552 / 0.564 | 0.470 / 0.548 / 0.569 | 0.475 / 0.541 / 0.573 |
+| TCGA coverage at MA stop, K_max 100 | 0.947 | 0.957 | 0.972 | 0.947 |
+| controlled sim test MSE, epoch 1000, K_max 15 / 50 / 100 | 0.630 / 0.849 / 0.979 | 0.633 / 0.754 / 0.826 | 0.622 / 0.720 / 0.803 | **0.595 / 0.632 / 0.655** |
+| controlled sim recovery, epoch 1000 | 0.973 / 0.937 / 0.836 | 0.973 / 0.956 / 0.943 | 0.973 / 0.957 / 0.945 | **0.975 / 0.972 / 0.967** |
+| misaligned sim test MSE, epoch 1000, K_max 100 | 0.335 | 0.333 | 0.346 | 0.355 |
+| columns with τ_k < τ_1, K_max 100 (TCGA / ctrl / mis) | 98 / 99 / 99 | 99 / 99 / 99 | 86 / 75 / 86 | **0 / 0 / 0** |
+| TCGA columns > 0.1% PVE, K_max 100, epoch 1000 | 81 | 74 | 76 | **59** |
+| TCGA cross-fold match, epoch 1000, K_max 20 / 50 / 100 | 0.88 / 0.74 / 0.49 | 0.92 / 0.90 / 0.64 | 0.92 / 0.92 / 0.92 | **0.92 / 0.94 / 0.94** |
+| annotated CFs recovered, epoch 1000, K_max 20 / 50 / 100 | 9.8 / 1.6 / 1.0 | 10.0 / 6.2 / 1.0 | 9.6 / 8.2 / 6.2 | **11.4 / 8.8 / 7.2** |
+| median MA stop, TCGA K_max 100 | 325 | 188 | 201 | 395 |
+
+MOFA's cross-fold match on the same measure is 0.94 / 0.96 / 0.95, PCA's
+0.84 / 0.81 / 0.79: with the tight start the shared model matches MOFA.
+
+- **τ.** With the tight start, no column's E_q[log τ_k] falls below τ_1's, and the profiles rise with k, in every fit and all
+  three settings and at every K_max, as the prior intends; the collapse is gone,
+  not just smaller. Starting at the prior helps only partly (τ still falls over
+  75–86 of 100 columns).
+- **Factor selection.** The 1% PVE count is about 12 on TCGA, 5 (misaligned) and
+  4 (controlled; its fifth factor is weak) for every approach. The 0.1% count, the
+  one that grew with K_max, grows least with the tight start. Recovery in the
+  controlled simulation no longer depends on K_max (0.97 at 15, 50 and 100).
+- **Interpretation.** At K_max = 20 the tight start recovers 11.4 of the 12
+  annotated factors. At larger K_max it recovers the 7 strongest at |r| ≥ 0.85
+  (stroma/CMS4, MSI/CMS1, mucinous/CMS3, MAGE-A, batch/B cells, sex, plasma cells)
+  with about 1 unmatched factor, and fits fewer active factors (9.6 at K_max = 100):
+  the weakest annotated factors (WNT-high, squamous, smooth muscle, neutrophils,
+  small intestine) are shrunk away or merged rather than split into noise. The
+  current optimiser at K_max = 100 recovers 1 of 12 and adds 32 unmatched factors.
+- **Covariance reconstruction** (section 6) is the same for every approach
+  (relative error 1.6–1.7% controlled, 2.2–2.3% misaligned): it is driven by the
+  strong factors and does not separate the approaches.
+- **Costs.** (1) The tight guide moves slowly at first, so the MA rule stops
+  later (TCGA median 395 at K_max = 100; at K_max = 15–50 often 700–940, and in
+  a few fits not at all), i.e. more epochs per fit. (2) The misaligned simulation at
+  K_max = 100 has a slightly higher test MSE (0.355 vs 0.335 current), though
+  recovery is still 1.0.
+- δ frozen does not help (the collapse happens when q(δ) is released); 0.3·η alone
+  is stable but stops too early and converges slowly at small K_max.

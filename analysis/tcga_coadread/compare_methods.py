@@ -131,8 +131,11 @@ def ols_beta(Z_train, dp):
     return np.linalg.lstsq(np.asarray(Z_train), y, rcond=None)[0]
 
 
-def _score_shared(fm, test_subset, dp):
-    """Factor outputs and test predictions of the fit in the current param store."""
+def _score_shared(fm, test_subset, dp, local_config=None):
+    """Factor outputs and test predictions of the fit in the current param store.
+    local_config: train config of the local inference of the test scores; None means
+    LOCAL_TRAIN_CONFIG (the optimiser of shared_ma's training), {} the package defaults
+    (run_methods.with_defaults, the optimiser of the default fit)."""
     L = len(VIEWS)
     store = pyro.get_param_store()
     out = {
@@ -142,7 +145,8 @@ def _score_shared(fm, test_subset, dp):
         "beta": pyro.param(Params.loc_beta).detach().reshape(-1).clone(),
         "tau": [t.numpy() for t in expected_tau(store, L)],
     }
-    fm, teh, _ = train_model_locally(fm, LOCAL_TRAIN_CONFIG, test_subset, model_type="shared")
+    cfg = LOCAL_TRAIN_CONFIG if local_config is None else local_config
+    fm, teh, _ = train_model_locally(fm, cfg, test_subset, model_type="shared")
     post = teh.predict(dp["test_X_l_list_clean"], N_POSTERIOR_SAMPLES, [Sites.y_pred, Sites.Z_pred])
     s = summarise_post_samples(post[Sites.y_pred].squeeze().cpu())
     out["Z_test"] = post[Sites.Z_pred].mean(0).squeeze().cpu()

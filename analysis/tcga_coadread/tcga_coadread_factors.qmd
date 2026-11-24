@@ -1,0 +1,654 @@
+---
+title: "TCGA colorectal cancer: what the factors mean"
+subtitle: "Consensus factors of the shared model, annotated with gene sets and tumour characteristics"
+jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
+---
+
+## What this notebook does
+
+The shared model summarises each tumour's gene expression and promoter
+methylation with a small number of **factors**. A factor is a pattern of
+coordinated change: a group of genes that tend to go up together (and often
+another group that goes down at the same time) across tumours. The model gives
+
+- every **tumour a score** on each factor: how strongly that tumour shows the
+  pattern (positive, negative or near zero), and
+- every **gene a loading** on each factor: how much, and in which direction,
+  the gene moves with the pattern.
+
+A factor is only worth naming if it is (1) **reproducible**, (2) **recognisable
+biology** (or a recognisable artefact), and (3) **useful** for the question at
+hand, here tumour mutational burden (TMB). This notebook checks all three.
+It reads results written by `factor_annotation.py`; nothing is refitted here.
+
+**Which fits.** The factors here come from VIPER-Shared with the package defaults
+(November 2026; `run_methods.with_defaults("shared")`), fitted in the 5-fold
+cross-validation of `tcga_coadread_cv.qmd`. Section 6 asks the question a new
+analysis faces: a single fit, without cross-validation, reports some factors that
+do not reappear in fits to other samples. What are they, and do they matter?
+
+**In short.** Seventeen factors recur across the cross-validation fits (14 in all
+five). Twelve are the factors of the earlier model setting, renumbered: stromal
+content, the CMS1/MSI-versus-CMS2 axis, mucinous differentiation, cancer-testis
+antigens, a laboratory batch, sex, plasma cells, a WNT-high immune-cold state,
+smooth muscle, a squamous-like programme, neutrophilic inflammation and
+small-intestine-like differentiation. Five are new: developmental homeobox genes
+(CF7), drug and xenobiotic metabolism (CF12), a FOXQ1/PROM1-high aneuploid state
+(CF15), neuronal genes against NK/T cells (CF16) and TREM2⁺ macrophages (CF17).
+CF2 still carries most of the information about TMB, and CF7 adds a second,
+smaller signal within microsatellite-stable tumours. MOFA finds 15 of the 17; the
+drug-metabolism and TREM2⁺-macrophage factors are found only by the supervised
+model. A single fit finds the large factors reliably; most of the small ones it
+reports that do not reproduce have no clear biology and carry little of the
+prediction.
+
+## Setup
+
+```{python}
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from IPython.display import display, Markdown
+
+HERE = os.path.expanduser("~/multiomic_integration/analysis/tcga_coadread")
+RES = os.path.join(HERE, "results", "factors")
+FIGURES = os.path.join(HERE, "figures", "factors")
+os.makedirs(FIGURES, exist_ok=True)
+
+# consensus of the VIPER-Shared fits with the package defaults (factor_annotation.py
+# --method shared --tag _default); the earlier setting's files have no tag
+TAG = "_default"
+summ = pd.read_csv(os.path.join(RES, f"consensus_summary{TAG}.csv"))
+load = pd.read_csv(os.path.join(RES, f"consensus_loadings{TAG}.csv"), index_col=0)
+scores = pd.read_csv(os.path.join(RES, f"consensus_scores_oof{TAG}.csv"), index_col=0)
+ann = pd.read_csv(os.path.join(RES, "sample_annotation.csv"), index_col=0)
+assoc = pd.read_csv(os.path.join(RES, f"associations{TAG}.csv"))
+gsea = pd.read_csv(os.path.join(RES, f"gsea{TAG}.csv"))
+gsea["FDR"] = pd.to_numeric(gsea["FDR"], errors="coerce")
+d = ann.reindex(scores.index)
+
+def lcorr(a, b):
+    x, y = a.align(b, join="inner"); ok = x.notna() & y.notna()
+    return np.corrcoef(x[ok], y[ok])[0, 1]
+
+mofa_load = pd.read_csv(os.path.join(RES, "consensus_loadings_mofa.csv"), index_col=0)
+old_load = pd.read_csv(os.path.join(RES, "consensus_loadings.csv"), index_col=0)
+mofa_match = pd.DataFrame({m: [lcorr(load[f], mofa_load[m]) for f in load] for m in mofa_load}, index=load.columns)
+old_match = pd.DataFrame({m: [lcorr(load[f], old_load[m]) for f in load] for m in old_load}, index=load.columns)
+
+def save_fig(fig, name):
+    fig.savefig(os.path.join(FIGURES, name), dpi=150, bbox_inches="tight")
+```
+
+## 1. Which factors are reproducible?
+
+The model was fitted five times in the cross-validation, each time on a
+different 80% of the 530 tumours (`tcga_coadread_cv.qmd`; here the fits with
+at most 20 factors, whose factors are the most stable). A factor that appears
+in only one fit could be noise. So:
+
+1. In each fit, the factors were **rotated** to the simplest equivalent form
+   (varimax: each factor loads strongly on few genes), as a factor model's
+   factors are only defined up to such rotations.
+2. Factors from the five fits were **matched** by the similarity of their gene
+   loadings (correlation over the genes both fits used).
+3. A **consensus factor** is a pattern found in at least 4 of the 5 fits with
+   loading correlation of at least 0.8 between fits. Its loadings are the
+   average over the fits.
+4. Each tumour's **score** comes from the one fit that did *not* see that
+   tumour during training (its held-out fold), so the scores are not
+   flattered by overfitting.
+
+```{python}
+t = summ.copy()
+t["matching MOFA factor (|r|)"] = [f"{mofa_match.loc[f].abs().idxmax()} ({mofa_match.loc[f].abs().max():.2f})"
+                                    for f in t["factor"]]
+t["earlier setting's factor (|r|)"] = [f"{old_match.loc[f].abs().idxmax()} ({old_match.loc[f].abs().max():.2f})"
+                                        for f in t["factor"]]
+display(t.drop(columns="members").round(3))
+```
+
+- **Seventeen consensus factors**: fourteen are found in all five fits and three
+  (CF15–CF17) in four, and their loadings agree closely between fits (mean
+  correlation 0.84–0.995).
+- They are numbered by how much of the data they explain (**PVE**, the share of
+  the variation in all 3,000 features): CF1 explains about 7%, CF15–CF17 about 1%
+  each.
+- **beta** is the factor's weight in the model's TMB prediction, per standard
+  deviation of the factor (TMB standardised). CF2 (−0.52) carries most of it;
+  CF4 (−0.15), CF17 (+0.14), CF15 (−0.12), CF9 (−0.10) and CF7 (+0.10) carry
+  smaller weights.
+- **The earlier model setting** found twelve of these (|r| 0.94–0.99); CF7, CF12,
+  CF15, CF16 and CF17 are new.
+- **MOFA**, fitted to the same data with the same procedure, finds 15 of the 17
+  (loading correlations 0.93–1.00). It does not find CF12 (drug metabolism) or
+  CF17 (TREM2⁺ macrophages), the latter one of the outcome-weighted factors.
+
+## 2. How each factor is read
+
+Three independent lines of evidence:
+
+**(a) The genes with the largest loadings.** For expression, a positive loading
+means the gene is more highly expressed in tumours with a high score. For
+promoter methylation (the region just upstream of where transcription starts,
+TSS200), a positive loading means the promoter is *more methylated* in
+high-score tumours, which usually *silences* the gene.
+
+**(b) Gene-set enrichment (GSEA).** Instead of eyeballing a gene list, we ask
+whether the members of a known gene set (for example "genes of the interferon
+response") sit unusually high or low when all genes are ranked by their
+loading. The **NES** (normalised enrichment score) is positive if the set's
+genes go *up* with the factor and negative if they go *down*; the **FDR** is
+the false discovery rate after testing many sets (we use FDR < 0.05). For
+methylation, genes are ranked by *minus* their loading, so that a positive NES
+again means "the set is switched on" (its promoters lose methylation) in
+high-score tumours.
+
+Gene-set collections used (downloaded from MSigDB, release 2024.1, to
+`data/genesets/`):
+
+| Collection | What it contains |
+|---|---|
+| **Hallmark** (50 sets) | Curated, non-redundant summaries of well-defined processes (e.g. interferon-γ response, epithelial–mesenchymal transition, hypoxia) |
+| **Reactome**, **KEGG** | Pathway databases (signalling, metabolism, immune system) |
+| **C8 cell-type signatures** | Genes marking specific cell types in single-cell atlases (filtered to intestine, immune and stromal cell types) |
+| **CMS markers** | The 529 genes that define the four **consensus molecular subtypes** of colorectal cancer (CMScaller, Eide et al. 2017): CMS1 immune/MSI, CMS2 canonical (WNT/MYC), CMS3 metabolic/mucinous, CMS4 mesenchymal/stromal |
+
+**(c) Which tumours score high.** Out-of-fold scores were compared with tumour
+and patient characteristics: MSI score (MANTIS), TCGA molecular subtype, an
+approximate CMS call, aneuploidy, mutations in key driver genes (BRAF V600E,
+KRAS, APC, TP53, PIK3CA, POLE), hypoxia score, tumour side (right colon, left
+colon, rectum), stage, age, sex, and **tissue source site** (the hospital that
+provided the sample, a proxy for sample handling and laboratory batch). Effects
+are Spearman correlations for numbers and η² (the share of score variance
+explained by the groups) for categories; q-values are Benjamini–Hochberg
+adjusted over all tests.
+
+**Caveats.** The model only saw the 2,000 most variable expressed genes and
+1,000 most variable promoters, so enrichment is relative to these genes, which
+are rich in immune, stromal and tissue-identity genes. The CMS call here is an
+approximation (the class whose marker genes are highest on average), used only
+for annotation; it agrees with known biology (50 of 85 MSI-high tumours fall
+in CMS1). Associations are descriptive: they say which tumours show a pattern,
+not why.
+
+```{python}
+print("approximate CMS vs MSI status")
+display(pd.crosstab(d["CMS (approx.)"], d["MSI status"]))
+```
+
+## 3. Overview: which tumour characteristics go with which factor
+
+```{python}
+#| fig-height: 6
+vars_ = ["log(1+TMB)", "MSI_SCORE_MANTIS", "BRAF V600E", "KRAS mut", "TP53 mut", "APC mut",
+         "ANEUPLOIDY_SCORE", "CMS1 score", "CMS2 score", "CMS3 score", "CMS4 score",
+         "side", "stage", "hypoxia (Buffa)", "AGE", "SEX", "TISSUE_SOURCE_SITE"]
+eff = assoc.pivot(index="factor", columns="variable", values="effect")[vars_]
+q = assoc.pivot(index="factor", columns="variable", values="q (BH)")[vars_]
+eff = eff.loc[summ["factor"]]; q = q.loc[summ["factor"]]
+mag = eff.copy()
+mag[[c for c in vars_ if assoc.query("variable == @c")["type"].iloc[0] == "eta^2"]] **= 0.5   # eta -> comparable to |rho|
+fig, ax = plt.subplots(figsize=(11, 5.5))
+sns.heatmap(mag.abs(), cmap="Blues", vmin=0, vmax=1, ax=ax, cbar_kws={"label": "|rho| or eta"},
+            annot=np.where(q < 0.01, eff.round(2).astype(str), ""), fmt="", annot_kws={"fontsize": 7})
+ax.set(xlabel="", ylabel="", title="Factor scores vs tumour characteristics (numbers shown where q < 0.01; "
+       "rho for numeric, eta^2 for categories)")
+plt.xticks(rotation=40, ha="right"); plt.tight_layout()
+save_fig(fig, "factor_associations.png"); plt.show()
+```
+
+## 4. Factor by factor
+
+Each card lists the top genes (expression and promoter methylation) at both
+ends of the factor, the strongest gene sets, and the strongest tumour
+associations. A short reading follows each card.
+
+```{python}
+def short(s):
+    return (s.replace("HALLMARK_", "Hallmark: ").replace("REACTOME_", "Reactome: ")
+             .replace("KEGG_", "KEGG: ").replace("_", " ").lower())
+
+def card(f, n_genes=10, n_sets=4):
+    lines = []
+    for view, word in (("expression", "expression"), ("methylation", "promoter methylation")):
+        s = load[f][load.index.str.startswith(view + ":")].dropna().sort_values()
+        s.index = s.index.str.split(":").str[1]
+        lines.append(f"**{word}, up in high scorers:** {', '.join(s.index[::-1][:n_genes])}  ")
+        lines.append(f"**{word}, down in high scorers:** {', '.join(s.index[:n_genes])}  ")
+    g = gsea.query("factor == @f and FDR < 0.05")
+    for view in ("expression", "methylation"):
+        h = g[g["view"] == view]
+        up = h[h.NES > 0].sort_values("NES", ascending=False)["gene set"].head(n_sets).map(short).tolist()
+        dn = h[h.NES < 0].sort_values("NES")["gene set"].head(n_sets).map(short).tolist()
+        lines.append(f"**gene sets ({view}) — up:** {'; '.join(up) or '—'}; **down:** {'; '.join(dn) or '—'}  ")
+    a = assoc.query("factor == @f and `q (BH)` < 0.01").sort_values("p").head(6)
+    lines.append("**tumour associations (q < 0.01):** " + ("; ".join(
+        f"{r.variable} ({'rho' if r.type.startswith('Spear') else 'eta²'} {r.effect:.2f})"
+        for r in a.itertuples()) or "none"))
+    row = summ.set_index("factor").loc[f]
+    head = f"#### {f} — PVE {row['PVE (mean)']:.3f}, beta {row['beta (mean, per SD)']:.2f}, in {row['folds']}/5 fits"
+    display(Markdown(head + "\n\n" + "\n".join(lines)))
+```
+
+### CF1 — Fibroblast-rich stroma (CMS4-like)
+
+```{python}
+card("CF1")
+```
+
+High scorers have a lot of **cancer-associated fibroblasts** and the dense,
+scar-like connective tissue they build (collagens COL11A1, COL8A1, COL10A1;
+THBS2, SULF1; epithelial–mesenchymal-transition and elastic-fibre gene sets). Low
+scorers are dominated by tumour epithelium (LCN2, DUOX2, CCL20, NOS2;
+drug-metabolism enzymes). The score is almost the CMS4 marker score (rho 0.94).
+The largest source of variation in the data, and mostly **tissue composition**
+(tumour purity). No information about TMB (beta −0.03).
+
+### CF2 — CMS1/MSI versus CMS2 (the TMB factor)
+
+```{python}
+card("CF2")
+fig, axs = plt.subplots(1, 4, figsize=(13, 3.2), sharey=True)
+for ax, col in zip(axs, ["MSI status", "CMS (approx.)", "side", "BRAF V600E"]):
+    sns.boxplot(x=d[col].astype(str).replace("nan", np.nan), y=scores["CF2"], ax=ax, color="0.85", fliersize=2)
+    ax.set(xlabel=col, ylabel="CF2 score (out of fold)" if ax is axs[0] else "")
+plt.tight_layout(); save_fig(fig, "cf2_by_group.png"); plt.show()
+```
+
+The factor that matters most for the outcome (beta −0.52). Its **positive end**
+is the canonical CMS2 programme (LY6G6D and other CMS2 markers): left-sided,
+microsatellite-stable tumours. Its **negative end** is CMS1: interferon-γ response
+and myeloid (TREM2⁺ dendritic cell, macrophage) genes, and CMS1 markers (FOXD1,
+ZIC2/ZIC5, TRPV6). Low scorers are MSI-high, right-sided and BRAF V600E-mutant,
+the **serrated / CpG island methylator phenotype (CIMP)** pathway, in which
+promoter hypermethylation silences MLH1. The methylation side fits:
+CIMP-associated promoters (KLF7, DENND2C, BMPER, RECK, LOX) are more methylated in
+low scorers. Correlation with log(1 + TMB): −0.49.
+
+### CF3 — Mucinous / goblet-cell differentiation (CMS3)
+
+```{python}
+card("CF3")
+```
+
+**Goblet-cell** genes (ATOH1, FCGBP, SPINK4, REP15, B3GNT6), the CMS3 "metabolic"
+subtype (rho 0.88 with the CMS3 score), fewer TP53 mutations and less aneuploidy:
+the **mucinous** differentiation state. No relation to TMB.
+
+### CF4 — Laboratory batch, partly B-cell content
+
+```{python}
+card("CF4")
+fig, ax = plt.subplots(figsize=(8, 3.5))
+site = d["TISSUE_SOURCE_SITE"]
+keep = site.map(site.value_counts()) >= 15
+order = scores["CF4"][keep].groupby(site[keep]).mean().sort_values().index
+sns.boxplot(x=site[keep], y=scores["CF4"][keep], order=order, ax=ax, color="0.85", fliersize=2)
+ax.set(xlabel="", ylabel="CF4 score"); plt.xticks(rotation=35, ha="right"); plt.tight_layout()
+save_fig(fig, "cf4_by_site.png"); plt.show()
+```
+
+The strongest association is the **tissue source site** (η² 0.30), and the top
+positive genes are typical of technical variation (multi-copy families NPIPB13,
+TBC1D3G, NBPF6; TSIX). The negative end carries a **B-cell / lymphoid** signal
+(CD22, TIGIT; B-cell and lymphoid gene sets), which is why the factor also
+correlates with MSI score (−0.39) and TMB (−0.27). Treat it as **mainly
+technical**. It has the second-largest outcome weight (−0.15), so part of the
+prediction rests on a batch-confounded factor (as in the earlier setting, where
+it was CF5).
+
+### CF5 — Cancer-testis antigens
+
+```{python}
+card("CF5")
+```
+
+The **MAGE-A family and CSAG genes** (MAGEA3, MAGEA6, MAGEA2, MAGEA12, CSAG1/3,
+MAGEB2): cancer-testis antigens, silent outside the testis and switched on in some
+tumours when X-chromosome DNA loses methylation; immunotherapy targets. No
+clinical variable associates with it. Not informative for TMB.
+
+### CF6 — Patient sex
+
+```{python}
+card("CF6")
+```
+
+XIST and TSIX against Y-chromosome genes (DDX3Y, KDM5D, RPS4Y1, UTY); sex explains
+92% of the score's variance. A positive control.
+
+### CF7 — Developmental homeobox genes (new)
+
+```{python}
+card("CF7")
+```
+
+Low scorers express **developmental transcription factors** normally silent in
+the adult colon: homeobox and forebrain/neural-crest genes (EN2, OTX1, EMX1, PAX9,
+FEZF1, DMRTA2); high scorers express KRAB zinc-finger genes (ZNF43, ZNF880), GLDC,
+BNIP3 and CARD11. Ectopic expression of such genes is a known feature of
+CIMP-high, often right-sided tumours. The factor is younger-age-linked (rho −0.20)
+and associates with TMB *within* microsatellite-stable tumours (section 5). MOFA
+finds it too (|r| 0.96); the earlier setting merged it into others. Plausible
+biology, less well characterised than CF1–CF3.
+
+### CF8 — Plasma cells versus remodelling stroma
+
+```{python}
+card("CF8")
+```
+
+**Plasma cells and B cells** (IRF4, CD79A, TNFRSF17/BCMA, FCRL5, LAX1; B-cell gene
+sets, with immune-gene promoters losing methylation) against bone- and
+wound-remodelling stroma (SPP1, IBSP, MMP8). Microenvironment composition; no TMB
+information.
+
+### CF9 — WNT-high, immune-cold
+
+```{python}
+card("CF9")
+```
+
+Classic **WNT target genes** (NOTUM, APCDD1, NKD1), CMS2 (rho 0.52); low scorers
+show interferon-γ response and CXCL9⁺ macrophages: the WNT-driven
+"immune-desert" state. Weak outcome weight (−0.10), little TMB association.
+
+### CF10 — Smooth muscle (bowel wall in the sample)
+
+```{python}
+card("CF10")
+```
+
+**Smooth-muscle genes** (DES, SYNM, MYH11, CASQ2, CHRM2) against cancer-associated
+fibroblast genes (COL11A1, LRRC15): how much normal bowel wall was cut with the
+tumour. A sampling effect.
+
+### CF11 — Squamous-like / keratinisation programme
+
+```{python}
+card("CF11")
+```
+
+**Keratins and squamous genes** (KRT6A/B/C, KRT16, KRT17, SPRR1B, GJB4/5, KLK10),
+CMS1-leaning (rho 0.46 with the CMS1 score). Described in aggressive, less
+differentiated tumours. Plausible biology; no TMB information.
+
+### CF12 — Drug and xenobiotic metabolism (new; not found by MOFA)
+
+```{python}
+card("CF12")
+```
+
+High scorers express **phase II conjugation and drug-metabolism enzymes**
+(NAT2, SULT1B1; drug-metabolism, retinol-metabolism and phase II gene sets) and
+IL33; they lean CMS3 (rho 0.31) and are less aneuploid. Low scorers express
+TMPRSS6, AMN, MGAT3. A differentiated, metabolically active epithelial state. MOFA
+does not find it (best |r| 0.25), so it is shaped by the outcome or too weak for
+the unsupervised model; it is the least stable consensus factor across folds
+(0.87). No TMB information (rho −0.02).
+
+### CF13 — Neutrophilic inflammation
+
+```{python}
+card("CF13")
+```
+
+**Acute-inflammation genes**: IL8/CXCL8, CXCL5, IL1B, IL24, CXCR1, MMP3, MMP10;
+neutrophil and monocyte gene sets. Associated with hypoxia, CMS1 and tissue source
+site (η² 0.13), so partly handling (e.g. ischaemia time). No TMB information.
+
+### CF14 — Small-intestine-like (enterocyte) differentiation
+
+```{python}
+card("CF14")
+```
+
+**Small-intestinal absorptive-cell** genes (MUC17, MTTP, TM4SF4, TM4SF20, SLC7A9,
+DPP4) and lower SATB2-AS1, a marker of colonic identity: a known, rare
+differentiation state. No TMB information.
+
+### CF15 — FOXQ1/PROM1-high, aneuploid (new)
+
+```{python}
+card("CF15")
+```
+
+High scorers express FOXQ1, PROM1 (CD133), TESC, AZGP1 and TMPRSS3, and have
+lower EGF and HAVCR1; they are more aneuploid (rho 0.19) and somewhat
+KRAS/POLE-associated. PROM1 and FOXQ1 mark stem-like, invasive colorectal cancer
+cells. Found in 4 of 5 fits and by MOFA (|r| 0.96). Outcome weight −0.12, but
+little direct association with TMB (rho −0.09). The gene-set evidence is thin, so
+the reading rests on the genes.
+
+### CF16 — Neuronal genes versus NK/T cells (new)
+
+```{python}
+card("CF16")
+```
+
+High scorers express **neuronal and synaptic genes** (GRIP1, PCLO, ITGA8; neuronal
+system and synaptic-transmission gene sets) and are more aneuploid; low scorers
+have NK- and effector T-cell genes and CXCL11, TNFSF9, CFD. Less hypoxic
+(rho −0.28). Found in 4 of 5 fits and by MOFA (|r| 0.98); the least clear of the
+new factors.
+
+### CF17 — TREM2⁺ macrophages (new; not found by MOFA)
+
+```{python}
+card("CF17")
+```
+
+**TREM2⁺ lipid-associated macrophages**: TREM2, APOC1, HK3, MS4A4A, VSIG4, MSR1,
+FCGR1A/3A, LILRB4; myeloid gene sets. High scorers are CMS1-like, more hypoxic and
+have higher MSI scores (rho 0.20): the macrophage-rich microenvironment of
+hypermutated tumours. Outcome weight +0.14, the largest after CF2 and CF4, but
+modest direct correlation with TMB (0.13; 0.07 after MSI): it helps the prediction
+alongside CF2 rather than on its own. MOFA does not find it as a separate factor
+(best |r| 0.28).
+
+## 5. Which factors tell us about TMB?
+
+Out-of-fold scores against log(1 + TMB): over all tumours, within
+microsatellite-stable (MSS) tumours only, and as a partial correlation that
+removes what the MSI score already explains (rank-based). MSI is used here
+only after the fact, as in the other notebooks.
+
+```{python}
+from scipy.stats import spearmanr
+rows = []
+y = d["log(1+TMB)"]
+for f in summ["factor"]:
+    x = scores[f]
+    ok = x.notna() & y.notna()
+    mss = ok & (d["MSI status"] == "MSS")
+    ok2 = ok & d["MSI_SCORE_MANTIS"].notna()
+    rx, ry, rm = x[ok2].rank(), y[ok2].rank(), d.loc[ok2, "MSI_SCORE_MANTIS"].rank()
+    res = lambda v: v - np.polyval(np.polyfit(rm, v, 1), rm)
+    rows.append({"factor": f, "beta (per SD)": summ.set_index("factor").loc[f, "beta (mean, per SD)"],
+                 "rho, all": spearmanr(x[ok], y[ok])[0], "rho, MSS only": spearmanr(x[mss], y[mss])[0],
+                 "partial rho given MSI": np.corrcoef(res(rx), res(ry))[0, 1]})
+tmb = pd.DataFrame(rows).set_index("factor").round(2)
+tmb.to_csv(os.path.join(RES, "tmb_relevance.csv"))
+display(tmb)
+
+fig, ax = plt.subplots(figsize=(5.5, 4))
+for lab, col in (("MSS", "C0"), ("MSI-H", "C3")):
+    m = d["MSI status"] == lab
+    ax.scatter(scores.loc[m, "CF2"], y[m], s=8, alpha=0.6, color=col, label=lab)
+ax.set(xlabel="CF2 score (out of fold)", ylabel="log(1 + TMB)", title="CF2 and TMB")
+ax.legend(); plt.tight_layout(); save_fig(fig, "cf2_vs_tmb.png"); plt.show()
+```
+
+- **CF2 is the TMB factor.** It correlates −0.49 with log(1 + TMB) overall,
+  −0.31 within MSS tumours, and −0.44 after removing the MSI score, so it carries
+  information beyond the MSI score: the MANTIS score is an imperfect measure of
+  mismatch-repair deficiency, and CF2 also tracks the CIMP / BRAF-serrated biology
+  that varies within MSS tumours.
+- **CF7 (developmental homeobox genes) is a second, independent signal.** Its
+  correlation with TMB is −0.19 overall but −0.30 within MSS tumours and −0.20
+  after removing MSI, as large within MSS as CF2's.
+- **CF4** (batch / B-cell) has a weaker association that mostly disappears once
+  MSI is removed (partial −0.16).
+- **All other factors** have |rho| ≤ 0.13 with TMB, including CF17 (TREM2⁺
+  macrophages) and CF15, which carry outcome weight in the model but act jointly
+  with CF2 rather than on their own.
+
+## 6. A single fit: the factors that do not reproduce
+
+A new analysis fits the model once. `tcga_coadread.qmd` (section 6b) takes the
+fit with $K_{\max}$ = 50 on its 80/20 split and checks each of its 24 factors
+(PVE ≥ 0.5%) against the cross-validation fits of the other folds: 16 reappear in
+at least 3 of 4 and 8 do not. Every factor explaining at least 1.5% of the data
+reappears; the 8 that do not are all smaller. Here they are annotated the same way
+as the consensus factors (`single_fit_vs_consensus.py --stage annotate`: scores of
+all 530 samples, training and test, from that fit).
+
+```{python}
+SF = os.path.join(HERE, "results", "single_fit", "seed42")
+trust = pd.read_csv(os.path.join(SF, "factors_k50.csv")).set_index("factor")
+sload = pd.read_csv(os.path.join(SF, "loadings_k50.csv"), index_col=0)
+sassoc = pd.read_csv(os.path.join(RES, "associations_single42_k50.csv"))
+sgsea = pd.read_csv(os.path.join(RES, "gsea_single42_k50.csv")); sgsea["FDR"] = pd.to_numeric(sgsea["FDR"], errors="coerce")
+pred = pd.read_csv(os.path.join(SF, "prediction_k50.csv")).set_index("predictor")
+cov = pd.read_csv(os.path.join(SF, "cov_k50.csv")).set_index("set")
+nonrep = trust.index[~trust.reproducible]
+tab = trust.loc[nonrep, ["PVE", "beta per SD", "folds 0-3 found", "closest consensus factor", "|r| with it"]].copy()
+tab["test MSE if dropped (all: %.3f)" % pred.loc["all columns", "test MSE"]] = [pred.loc[f"drop {f}", "test MSE"] for f in nonrep]
+display(tab.style.format({"PVE": "{:.3f}", "beta per SD": "{:+.3f}", "|r| with it": "{:.2f}",
+                          tab.columns[-1]: "{:.3f}"}))
+
+def scard(f, n_genes=8, n_sets=3):
+    lines = []
+    for view, word in (("expression", "expression"), ("methylation", "promoter methylation")):
+        s_ = sload[f][sload.index.str.startswith(view + ":")].dropna().sort_values()
+        s_.index = s_.index.str.split(":").str[1]
+        lines.append(f"**{word}, up / down:** {', '.join(s_.index[::-1][:n_genes])} / {', '.join(s_.index[:n_genes])}  ")
+    g = sgsea.query("factor == @f and FDR < 0.05").sort_values("FDR")
+    lines.append("**gene sets (FDR < 0.05):** " + ("; ".join(f"{short(r_['gene set'])} ({r_['view'][:4]}, NES {r_['NES']:+.1f})"
+                                                            for _, r_ in g.head(n_sets).iterrows()) or "none") + "  ")
+    a = sassoc.query("factor == @f and `q (BH)` < 0.01").sort_values("p").head(4)
+    lines.append("**tumour associations (q < 0.01):** " + ("; ".join(
+        f"{r_.variable} ({'rho' if r_.type.startswith('Spear') else 'eta²'} {r_.effect:.2f})" for r_ in a.itertuples()) or "none"))
+    t_ = trust.loc[f]
+    display(Markdown(f"#### {f} — PVE {t_.PVE:.3f}, beta {t_['beta per SD']:+.2f}, in {t_['folds 0-3 found']}/4 other fits; "
+                     f"closest consensus factor {t_['closest consensus factor']} (|r| {t_['|r| with it']:.2f})\n\n" + "\n".join(lines)))
+
+for f in nonrep:
+    scard(f)
+```
+
+**What they are.** They fall into three groups:
+
+- **Real programmes that a 50-factor fit does not keep as a separate factor in
+  every sample.** F8 is the drug/xenobiotic-metabolism factor (consensus CF12,
+  |r| 0.92) and F11 the FOXQ1/PROM1-high aneuploid factor (consensus CF15,
+  |r| 0.82). Both are consensus factors of the 20-factor fits; at 50 factors other
+  folds split or merge them differently. They are reproducible biology, just not a
+  reproducible *column*.
+- **A batch-linked factor.** F10 is tied to tissue source site (η² 0.33) with
+  myeloid/neutrophil genes, close to the batch factor CF4 (|r| 0.73).
+- **Weak factors without clear biology.** F16 (a remnant of the cancer-testis
+  genes), F17 (neuroendocrine-like genes), F18 (low collagen / extracellular
+  matrix), F22 (HOXB genes, KRAS-mutant tumours) and F23 have few or no clinical
+  associations and no consistent gene sets. These are the fit-specific factors a
+  single analysis should not interpret.
+
+**Should they be reproduced?** Only F8 and F11 describe something that holds up,
+and the consensus already contains them; the batch factor is a known artefact; the
+other five would be over-interpretation.
+
+**Do they matter?**
+
+```{python}
+show = ["all columns", "drop the non-reproducible factors", "reproducible factors only",
+        "drop columns with PVE < 0.5%"]
+imp = pd.DataFrame({"test MSE (prediction)": pred.loc[show, "test MSE"],
+                    "test covariance error": cov.loc[show, "test rel. error"]})
+display(imp.style.format("{:.3f}"))
+```
+
+- **For prediction**, little: dropping all 8 raises the test MSE from 0.70 to 0.75,
+  mostly through F11 (to 0.73 on its own) and F18. Most of the prediction beyond the
+  reproducible factors comes from the 26 columns below 0.5% of the data, which are
+  not interpretable factors at all: dropping them costs 0.12.
+- **For reconstructing the data's covariance** (out of sample, against the test
+  samples' covariance; `tcga_coadread.qmd`), somewhat more: the error rises from
+  0.571 to 0.589 without them, against a sampling floor of about 0.50, while the
+  small columns barely matter (0.577 without them).
+
+**So, for a new analysis:** one fit is enough, used two ways. Keep every column for
+prediction and for the covariance (dropping anything costs accuracy). Interpret
+only factors that explain at least about 1.5% of the data, which all reproduce
+here; treat smaller factors as tentative unless they match known biology, as F8
+and F11 do. Refitting with other random seeds does not help sort them: the same
+data gives the same factors (`tcga_coadread.qmd`, section 6b).
+
+## 7. Summary
+
+
+```{python}
+lab = {
+ "CF1":  ("Fibroblast-rich stroma (CMS4-like)", "composition / tumour biology", "high"),
+ "CF2":  ("CMS1/MSI/CIMP vs CMS2", "tumour biology", "high"),
+ "CF3":  ("Mucinous / goblet differentiation (CMS3)", "tumour biology", "high"),
+ "CF4":  ("Tissue-source-site batch, B cells", "technical (mixed)", "medium"),
+ "CF5":  ("Cancer-testis antigens (MAGE-A)", "tumour biology", "high (gene-level)"),
+ "CF6":  ("Patient sex", "demographic", "high"),
+ "CF7":  ("Developmental homeobox genes", "tumour biology", "medium"),
+ "CF8":  ("Plasma cells vs remodelling stroma", "composition", "high"),
+ "CF9":  ("WNT-high, immune-cold", "tumour biology", "medium"),
+ "CF10": ("Smooth muscle (bowel wall sampled)", "sampling", "high"),
+ "CF11": ("Squamous-like / keratinisation", "tumour biology", "medium"),
+ "CF12": ("Drug / xenobiotic metabolism", "tumour biology", "medium"),
+ "CF13": ("Neutrophilic inflammation", "composition / handling", "medium"),
+ "CF14": ("Small-intestine-like differentiation", "tumour biology", "medium"),
+ "CF15": ("FOXQ1/PROM1-high, aneuploid", "tumour biology", "low"),
+ "CF16": ("Neuronal genes vs NK/T cells", "unclear", "low"),
+ "CF17": ("TREM2+ macrophages", "composition", "medium"),
+}
+s = pd.DataFrame(lab, index=["reading", "kind", "confidence"]).T
+s = s.join(summ.set_index("factor")[["PVE (mean)", "beta (mean, per SD)"]]).join(tmb[["rho, all", "partial rho given MSI"]])
+s.to_csv(os.path.join(RES, "factor_labels.csv"))
+display(s.round(3))
+```
+
+**Do the factors make sense?** Yes. The seventeen reproducible factors map onto
+recognisable sources of variation in colorectal tumours: the consensus molecular
+subtypes (CF1–CF3, CF9), cells of the tumour microenvironment (CF1, CF8, CF13,
+CF17), differentiation states (CF3, CF11, CF12, CF14), developmental and
+stem-like programmes (CF7, CF15), cancer-testis antigens (CF5), and three
+non-tumour sources any analysis of these samples should recognise: sex (CF6),
+how much bowel wall was sampled (CF10) and a laboratory batch (CF4). CF16 is the
+least clear.
+
+**Are they useful?** For describing the tumours, yes: they recover the
+established subtype structure without being told about it. For TMB, CF2 (the
+MSI/CIMP axis) carries most of the information; CF7 adds a signal within
+microsatellite-stable tumours; CF17 (TREM2⁺ macrophages) and CF15 carry outcome
+weight jointly with CF2; and part of the prediction rests on the batch-confounded
+CF4, which should be kept in mind when the model is applied to data from other
+sites.
+
+**One fit or many?** A single fit recovers these factors as well as any one
+cross-validation fit does, and the factors it reports that do not reproduce are
+small (< 1.5% of the data), mostly without clear biology, and carry little of the
+prediction (section 6). Interpreting a single fit's factors above about 1.5% of
+the data, and treating the smaller ones as tentative, is enough here.
+
+**Limitations.** Annotation is limited to the 3,000 most variable features seen
+by the model. The consensus uses the 20-factor fits; a 50- or 100-factor fit
+predicts better and its larger factors are equally stable
+(`tcga_coadread_cv.qmd`, section 5), but it splits some small programmes
+differently from fold to fold. The consensus rule (≥ 4 of 5 fits) also misses one
+outcome-relevant factor that appears clearly in 3 of the 5 20-factor fits and
+weakly in a fourth (`single_fit_vs_consensus.py`). Associations are descriptive.

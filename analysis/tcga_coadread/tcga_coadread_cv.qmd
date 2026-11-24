@@ -1,0 +1,375 @@
+---
+title: "TCGA colorectal cancer: cross-validated comparison and number of factors"
+subtitle: "Tumour mutational burden from expression and methylation — 5-fold CV, K_max sweep"
+jupyter: python3
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
+---
+
+**Purpose.** `tcga_coadread.qmd` walks through one 80/20 split. This notebook
+estimates how well each method predicts log(1 + TMB) with 5-fold
+cross-validation, and how the shared model's results change with the maximum
+number of factors $K_{\max}$.
+
+**Design** (`cv_k_sweep.py`):
+
+- **Folds.** The 530 aligned samples are shuffled (seed 42) and cut into 5
+  folds of 106. Because the loader uses the same shuffle for its 80/20 split,
+  fold 4's test set is exactly the test set of `tcga_coadread.qmd`. Each sample is a test sample exactly once. Folds are not
+  stratified by MSI status: MSI is not assumed to be available.
+- **No test information in preprocessing.** Within each fold, the most variable
+  genes (2000 expression, 1000 TSS200 methylation), the imputation means and the
+  standardisation are computed from the training samples only.
+- **Methods**, all on the same folds and inputs:
+
+  | Method | Description |
+  |---|---|
+  | `shared` | VIPER-Shared with the package defaults (`run_methods.with_defaults("shared")`, November 2026): MGP prior, $K_{\max}$ ∈ {20, 50, 100}, outcome weight 1, AdagradRMSProp η 0.3 / t 0.005, minibatch fraction 0.1, SVD start, stopped by the averaged-parameter rule (loadings < 5%, β < 7% between consecutive 150-epoch windows); test scores by local inference at the package defaults (start at the training score sds, 5-epoch warm-up, stop when the test score means and sds change < 10%, 150-epoch window average) |
+  | `shared_ma` | the earlier VIPER-Shared setting (η 0.22, t 0.02, minibatch 0.08, MA w25 p50 stop), kept for comparison |
+  | `mofa` | MOFA2 ($K$ ∈ {20, 50, 100}) + OLS of TMB on its factors |
+  | `pca_ols` | PCA of the stacked views ($K$ ∈ {20, 50, 100}) + OLS |
+  | `ridge`, `elastic_net` | penalised regression on all genes, penalties by inner 5-fold CV |
+  | `mean` | the training mean |
+
+- **$K_{\max}$ is a sensitivity analysis**, not a tuning parameter chosen on the
+  test folds: the question is how the results depend on it.
+- **Metrics.** Pooled out-of-fold metrics over all 530 samples (each sample
+  predicted by the model that did not see it), and per-fold paired differences
+  between methods. Outcome on the log(1 + TMB) scale.
+- **Post hoc only.** MSI status is used after the fact to break down errors,
+  and an MSI-only predictor is shown as a reference, not as a competing method.
+
+```{python}
+import os
+import sys
+import glob
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+
+sys.path.insert(1, os.path.expanduser("~/multiomic_integration/python"))
+from factor_interpretation import _rotate_loadings
+
+HERE     = os.path.expanduser("~/multiomic_integration/analysis/tcga_coadread")
+CV       = os.path.join(HERE, "results", "cv")
+FIGURES  = os.path.join(HERE, "figures", "cv")
+CLINICAL = os.path.expanduser("~/multiomic_integration/data/tcga/coadread_tcga_pan_can_atlas_2018")
+os.makedirs(FIGURES, exist_ok=True)
+N_FOLDS, K_GRID, L = 5, [20, 50, 100], 2
+LABEL = {"shared": "shared model", "shared_ma": "shared model (earlier setting)", "mofa": "MOFA", "pca_ols": "PCA + OLS",
+         "ridge": "ridge", "elastic_net": "elastic net", "mean": "mean"}
+
+def save_fig(fig, name):
+    fig.savefig(os.path.join(FIGURES, name), dpi=150, bbox_inches="tight")
+
+def save_table(df, name, index=True):
+    df.to_csv(os.path.join(CV, name), index=index)
+    return df
+
+rows = pd.concat([pd.read_csv(f) for f in glob.glob(os.path.join(CV, "rows", "*.csv"))], ignore_index=True)
+preds = pd.concat([pd.read_csv(f) for f in glob.glob(os.path.join(CV, "preds", "*.csv"))], ignore_index=True)
+rows["k"] = rows["k"].fillna(0).astype(int)
+preds["k"] = preds["k"].fillna(0).astype(int)
+failed = rows[rows["failed"].notna()] if "failed" in rows else rows.iloc[:0]
+rows = rows.drop(index=failed.index)
+print(f"{len(rows)} fits, {len(failed)} failed")
+display(failed)
+```
+
+## 1. Pooled out-of-fold performance
+
+$R^2 = 1 - \text{SSE}/\text{SST}$ over all 530 out-of-fold predictions; coverage
+and width of the 95% intervals (shared model: posterior predictive; MOFA: OLS
+prediction interval). Methods without $K$ are shown with $K$ = –.
+
+```{python}
+def pooled(g):
+    r = g["y_pred"] - g["y_true"]
+    out = {"n": len(g), "R2": 1 - (r ** 2).sum() / ((g["y_true"] - g["y_true"].mean()) ** 2).sum(),
+           "MSE": (r ** 2).mean()}
+    if g["lwr"].notna().all():
+        out["coverage_95"] = ((g["y_true"] >= g["lwr"]) & (g["y_true"] <= g["upr"])).mean()
+        out["width_95"] = (g["upr"] - g["lwr"]).mean()
+    return pd.Series(out)
+
+pool = pd.DataFrame({key: pooled(g) for key, g in preds.groupby(["method", "k"])}).T
+pool.index.names = ["method", "k"]
+fold_r2 = rows.groupby(["method", "k"])["r2"].agg(["mean", "sem"]).rename(columns=lambda c: f"fold R² {c}")
+extra = rows.groupby(["method", "k"])[["test_rse", "active_factors", "epochs", "runtime"]].mean()
+summary = pool.join(fold_r2).join(extra)
+summary = summary.rename(index=LABEL, level=0).rename(index={0: "–"}, level=1)
+display(save_table(summary.round(3), "cv_summary.csv"))
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 4))
+for m, mk in [("shared", "o"), ("shared_ma", "o"), ("mofa", "s"), ("pca_ols", "^")]:
+    g = rows[rows["method"] == m].groupby("k")["r2"].agg(["mean", "sem"])
+    ax.errorbar(g.index, g["mean"], yerr=g["sem"], marker=mk, capsize=3, label=LABEL[m])
+for m, ls in [("ridge", "--"), ("elastic_net", ":")]:
+    ax.axhline(rows.query("method == @m")["r2"].mean(), color="grey", ls=ls, label=LABEL[m])
+ax.set(xlabel="K (shared model: $K_{max}$)", ylabel="Test R² (fold mean ± SE)", xticks=K_GRID,
+       title="Cross-validated R² vs. number of factors")
+ax.legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "cv_r2_vs_k.png")
+plt.show()
+```
+
+## 2. Paired comparisons
+
+Every method is fitted on the same folds, so differences are compared fold by
+fold. Positive values: the shared model is better (higher R²). With 5 folds the
+standard error of the mean difference is rough; a difference whose sign is the
+same on all 5 folds is the clearer signal.
+
+```{python}
+wide = rows.assign(key=lambda d: d["method"] + np.where(d["k"] > 0, " K=" + d["k"].astype(str), ""))
+wide = wide.pivot(index="fold", columns="key", values="r2")
+pairs = []
+for k in K_GRID:
+    base = wide[f"shared K={k}"]
+    for other in [f"shared_ma K={k}", f"mofa K={k}", f"pca_ols K={k}", "ridge", "elastic_net"]:
+        d = base - wide[other]
+        pairs.append({"shared model": f"K_max={k}", "vs": other, "mean diff": d.mean(), "SE": d.sem(),
+                      "folds shared better": int((d > 0).sum())})
+for a, b in [(50, 20), (100, 50)]:
+    d = wide[f"shared K={a}"] - wide[f"shared K={b}"]
+    pairs.append({"shared model": f"K_max={a}", "vs": f"shared K={b}", "mean diff": d.mean(),
+                  "SE": d.sem(), "folds shared better": int((d > 0).sum())})
+display(save_table(pd.DataFrame(pairs).round(3), "cv_paired_differences.csv", index=False))
+```
+
+## 3. Training length
+
+The shared model stops when its loadings and outcome coefficients have stopped
+drifting: the averages of Λ and β over two consecutive 150-epoch windows differ by
+less than 5% and 7% (`handler.AveragedParamChange`). Every fit was also scored every
+25 epochs in closed form (`viper_predict.closed_form_scores`, `checkpoint_recorder`,
+which leaves training unchanged); the curves show test MSE and 95% coverage over
+training, with the stop marked. The test fold was not used to choose the stop.
+
+```{python}
+ckp = []
+for f in range(N_FOLDS):
+    for k in K_GRID:
+        path = os.path.join(CV, f"fold{f}", f"k{k}", "shared_default_checkpoints.csv")
+        if os.path.exists(path):
+            ckp.append(pd.read_csv(path).assign(fold=f, k=k))
+ckp = pd.concat(ckp, ignore_index=True)
+fig, axes = plt.subplots(2, len(K_GRID), figsize=(15, 6.5), sharex="col")
+for j, k in enumerate(K_GRID):
+    for f, g in ckp[ckp.k == k].groupby("fold"):
+        g = g.sort_values("epoch")
+        axes[0, j].plot(g.epoch, g.test_mse_std, lw=0.9, label=f"fold {f}")
+        axes[0, j].plot(g.epoch.iloc[-1], g.test_mse_std.iloc[-1], "o", color="#c0392b", mec="k", ms=5)
+        axes[1, j].plot(g.epoch, g.cov95, lw=0.9)
+        axes[1, j].plot(g.epoch.iloc[-1], g.cov95.iloc[-1], "o", color="#c0392b", mec="k", ms=5)
+    axes[1, j].axhline(0.95, color="k", ls=":", lw=0.8)
+    axes[0, j].set(title=f"$K_{{max}}$ = {k}"); axes[1, j].set(xlabel="Epoch")
+axes[0, 0].set_ylabel("Test MSE (standardised outcome)"); axes[1, 0].set_ylabel("95% coverage (closed form)")
+axes[0, -1].legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "cv_stopping_curves.png")
+plt.show()
+display(rows.query("method == 'shared'").pivot(index="fold", columns="k", values="epochs").astype(int)
+        .rename(columns=lambda k: f"K_max = {k}"))
+```
+
+## 4. How many factors does the model use?
+
+For each shared-model fit, factors ranked by the share of the training data's
+variance they explain (PVE). Where the ranked PVE falls off shows how many
+factors are in use, and whether the MGP prior switches columns off as
+$K_{\max}$ grows.
+
+```{python}
+def npz(f, k, method="shared"):
+    return np.load(os.path.join(CV, f"fold{f}", f"k{k}", f"{method}_factors.npz"))
+
+def ranked_pve(f):
+    W, Z = np.vstack([f[f"loadings_view{l}"] for l in range(L)]), f["Z_train"]
+    return np.sort((Z ** 2).sum(0) * (W ** 2).sum(0) / (Z.shape[0] * W.shape[0]))[::-1]
+
+colors = dict(zip(K_GRID, plt.cm.viridis(np.linspace(0.1, 0.85, len(K_GRID)))))
+fig, ax = plt.subplots(figsize=(7.5, 4.2))
+sel = []
+for k in K_GRID:
+    for f in range(N_FOLDS):
+        try:
+            v = ranked_pve(npz(f, k))
+        except FileNotFoundError:
+            continue
+        ax.plot(np.arange(1, k + 1), v, color=colors[k], lw=1.2, alpha=0.8,
+                label=f"$K_{{max}}$ = {k}" if f == 0 else None)
+        c = np.cumsum(v) / v.sum()
+        sel.append({"K_max": k, "fold": f, "PVE (all factors)": v.sum(), "factors > 1%": int((v > 0.01).sum()),
+                    "factors > 0.1%": int((v > 0.001).sum()),
+                    "factors for 90% of explained": int(np.searchsorted(c, 0.9) + 1)})
+for thr in (0.01, 0.001):
+    ax.axhline(thr, color="k", lw=0.6, alpha=0.4)
+ax.set(yscale="log", ylim=(1e-5, 0.2), xlabel="Factor rank (by PVE)", ylabel="PVE of the training data",
+       title="Shared model: ranked factor PVE (each line one fold)")
+ax.legend(fontsize=8)
+plt.tight_layout()
+save_fig(fig, "cv_ranked_pve.png")
+plt.show()
+display(save_table(pd.DataFrame(sel).groupby("K_max").mean().drop(columns="fold").round(3), "cv_factor_use.csv"))
+```
+
+## 5. Factor stability across folds
+
+Any two folds' training sets share 75% of their samples. For each active factor
+(PVE > 1%) of one fold's fit, the best absolute correlation of its rotated
+loadings with any factor of another fold's fit, on the genes both folds
+selected; averaged over all ordered pairs of folds. The factor carrying most of
+the outcome R² is reported separately.
+
+```{python}
+def load_rot(method, f, k):
+    d = npz(f, k, method)
+    rot, R = _rotate_loadings([d[f"loadings_view{l}"] for l in range(L)])
+    Z = d["Z_train"] @ R
+    beta = R.T @ d["beta"]
+    genes = [open(os.path.join(CV, f"fold{f}", f"genes_view{l}.txt")).read().split("\n") for l in range(L)]
+    n, P_ = Z.shape[0], sum(len(g) for g in genes)
+    energy = np.sum(Z ** 2, 0) * sum(np.sum(Lv ** 2, 0) for Lv in rot)
+    return {"loadings": rot, "genes": genes, "active": np.where(energy / (n * P_) > 0.01)[0],
+            "top": int(np.argmax(beta ** 2 * np.sum(Z ** 2, 0)))}
+
+def best_match(a, b):
+    va, vb = [], []
+    for l in range(L):
+        common = sorted(set(a["genes"][l]) & set(b["genes"][l]))
+        ia = {g: i for i, g in enumerate(a["genes"][l])}; ib = {g: i for i, g in enumerate(b["genes"][l])}
+        va.append(a["loadings"][l][[ia[g] for g in common]]); vb.append(b["loadings"][l][[ib[g] for g in common]])
+    A, B = np.vstack(va), np.vstack(vb)
+    A = (A - A.mean(0)) / A.std(0); B = (B - B.mean(0)) / B.std(0)
+    return np.abs(A.T @ B) / A.shape[0]
+
+stab = []
+for method in ["shared", "mofa", "pca_ols"]:
+    for k in K_GRID:
+        try:
+            fits = {f: load_rot(method, f, k) for f in range(N_FOLDS)}
+        except FileNotFoundError:
+            continue
+        for fa in fits:
+            for fb in fits:
+                if fa == fb:
+                    continue
+                C = best_match(fits[fa], fits[fb])
+                for j in fits[fa]["active"]:
+                    stab.append({"method": LABEL[method], "K": k, "best |corr|": C[j].max(),
+                                 "top outcome factor": j == fits[fa]["top"]})
+stab = pd.DataFrame(stab)
+display(save_table(stab.groupby(["method", "K"]).apply(lambda g: pd.Series({
+    "active factors (mean)": len(g) / (N_FOLDS * (N_FOLDS - 1)),
+    "mean best |corr|": g["best |corr|"].mean(),
+    "top outcome factor": g.loc[g["top outcome factor"], "best |corr|"].mean()})).round(3), "cv_factor_stability.csv"))
+```
+
+## 6. Post hoc: errors by MSI status, and an MSI-only reference
+
+MSI status is not a model input. Here the pooled out-of-fold predictions are
+broken down by MANTIS MSI status (MSI-H: score > 0.4, as in
+`tmb_transforms.py`), and an **MSI-only reference** — OLS of log(1 + TMB) on
+the MANTIS score, fitted on each fold's training samples — shows how much of
+the predictable variation MSI status alone carries. It is a reference point,
+not a competing method: the analysis assumes MSI is not available.
+
+```{python}
+clin = pd.read_csv(os.path.join(CLINICAL, "data_clinical_sample.txt"), sep="\t", skiprows=4).set_index("SAMPLE_ID")
+msi = clin["MSI_SCORE_MANTIS"]
+p = preds.join(msi, on="sample_id")
+p["MSI"] = np.where(p["MSI_SCORE_MANTIS"] > 0.4, "MSI-H", np.where(p["MSI_SCORE_MANTIS"].notna(), "MSS", None))
+
+ref = []
+for f in range(N_FOLDS):
+    tr = open(os.path.join(CV, f"fold{f}", "train_samples.txt")).read().split("\n")
+    te = open(os.path.join(CV, f"fold{f}", "test_samples.txt")).read().split("\n")
+    y = np.log1p(clin["TMB_NONSYNONYMOUS"])
+    ok_tr = [s for s in tr if pd.notna(msi[s])]
+    X = np.c_[np.ones(len(ok_tr)), msi[ok_tr]]
+    b = np.linalg.lstsq(X, y[ok_tr].values, rcond=None)[0]
+    fill = msi[ok_tr].mean()                         # missing MSI score: training mean
+    xm = msi[te].fillna(fill).values
+    ref.append(pd.DataFrame({"fold": f, "method": "msi_only (reference)", "k": 0, "sample_id": te,
+                             "y_true": y[te].values, "y_pred": b[0] + b[1] * xm}))
+ref = pd.concat(ref).join(msi, on="sample_id")
+ref["MSI"] = np.where(ref["MSI_SCORE_MANTIS"] > 0.4, "MSI-H", np.where(ref["MSI_SCORE_MANTIS"].notna(), "MSS", None))
+both = pd.concat([p, ref], ignore_index=True)
+
+def r2(g):
+    r = g["y_pred"] - g["y_true"]
+    return 1 - (r ** 2).sum() / ((g["y_true"] - g["y_true"].mean()) ** 2).sum()
+
+show = both[(both["method"].isin(["ridge", "elastic_net", "msi_only (reference)"])) |
+            ((both["method"].isin(["shared", "mofa", "pca_ols"])) & (both["k"] == 50))]
+tab = pd.DataFrame({
+    "all": show.groupby(["method", "k"]).apply(r2),
+    "within MSS": show[show["MSI"] == "MSS"].groupby(["method", "k"]).apply(r2),
+    "within MSI-H": show[show["MSI"] == "MSI-H"].groupby(["method", "k"]).apply(r2),
+    "mean residual, MSI-H": show[show["MSI"] == "MSI-H"].groupby(["method", "k"]).apply(
+        lambda g: (g["y_pred"] - g["y_true"]).mean()),
+})
+print("Pooled out-of-fold R² (K = 50 for the factor methods); MSI-H n =",
+      int((p.query("method == 'ridge'")["MSI"] == "MSI-H").sum()))
+display(save_table(tab.round(3), "cv_r2_by_msi.csv"))
+```
+
+## 7. Summary
+
+All numbers are pooled out-of-fold over the 530 samples unless stated;
+"k/5 folds" counts the folds on which the first method has the higher R². "Shared
+model" is VIPER-Shared with the package defaults; the earlier setting is kept for
+comparison.
+
+**Prediction.** With $K_{\max} = 100$ the shared model reaches R² 0.56, close to
+ridge (0.58; paired difference −0.008 ± 0.021, shared better on 2/5 folds) and
+PCA + OLS with 100 components (0.58; −0.016 ± 0.009, 1/5), and above elastic net
+(0.54; +0.028, 4/5) and MOFA (0.51; +0.054 ± 0.009, 5/5). It matches the earlier
+setting at every $K_{\max}$ (differences ≤ 0.01). Its 95% intervals cover
+94–94.3% of samples, slightly below nominal, and narrow as $K_{\max}$ grows (mean
+width 2.89 → 2.47).
+
+**$K_{\max}$ matters for prediction.** R² 0.49, 0.54 and 0.56 at $K_{\max}$ = 20, 50
+and 100 (+0.05 and +0.03, better on 4/5 folds both times). PCA + OLS shows the same
+trend; MOFA does not gain past K = 50 because it prunes to about 12 factors at every
+K. The gain beyond ~12 factors comes from many weak directions, which is also where
+ridge gets its advantage.
+
+**The MGP prior does not select the number of factors.** About 12 factors explain
+more than 1% of the data at every $K_{\max}$, but every column stays above 0.1% at
+$K_{\max}$ = 20 and 50 (63 of 100 at $K_{\max}$ = 100), and the number of factors for
+90% of the explained variance grows with $K_{\max}$ (14, 27, 42). The prior shrinks
+columns but does not remove them (docs/mgp_shrinkage_collapse.md).
+
+**Training length.** The averaged-parameter rule stops at 875–1025 epochs
+($K_{\max}$ = 20), 1075–1225 (50) and 1200–1375 (100). Test MSE in closed form is
+flat to within about ±0.01 by epoch 300–600, and coverage has settled by about
+epoch 600; the stop is set by the loadings condition, which keeps the factors
+settled, not by the outcome.
+
+**Factor stability across folds no longer drops with $K_{\max}$.** The shared
+model's active factors (PVE > 1% after rotation) reappear in other folds with mean
+best loading correlation 0.935, 0.943 and 0.934 at $K_{\max}$ = 20, 50 and 100, and
+0.985 for the main TMB factor, level with MOFA (0.94–0.96) and above PCA (0.79–0.84).
+Under the earlier setting this fell to 0.74 and 0.68 at $K_{\max}$ = 50 and 100, so
+the larger $K_{\max}$ that predicts better no longer costs interpretability.
+Whether a single fit is enough to interpret the factors (without CV) is examined in
+`tcga_coadread.qmd` and `tcga_coadread_factors.qmd`.
+
+**MSI, post hoc.** The MSI-only reference reaches R² 0.47 from the MANTIS score
+alone; the molecular methods add 0.06–0.11 on top. Most of every method's R² comes
+from separating MSI-H from MSS tumours: within MSS tumours R² is only 0.12–0.22
+(shared model 0.13, ridge 0.22), and within MSI-H 0.33–0.46 (shared model 0.41). All
+methods underpredict TMB in MSI-H tumours (mean residual −0.21 to −0.36; shared model
+−0.27).

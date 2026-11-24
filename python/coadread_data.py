@@ -2,19 +2,23 @@
 Data loading and preprocessing for the TCGA COAD/READ PanCan Atlas 2018 dataset.
 
 Three views available:
-  - Gene expression (RNA-seq V2 RSEM, log2(x+1) normalised)
-  - TSS200 methylation (HM27/HM450 probes within 200 bp of TSS, beta values)
-  - Gene-body methylation (HM27/HM450 Body probes, beta values)
+  - Gene expression (RNA-seq V2 RSEM). The cBioPortal file holds batch-normalised
+    RSEM values on the raw scale (median ~220, max ~9e5, ~1.6% slightly negative
+    from the batch correction); the loader returns log2(max(x, 0) + 1).
+  - TSS200 methylation (HM27/HM450 probes within 200 bp of TSS)
+  - Gene-body methylation (HM27/HM450 Body probes)
 
-Each methylation view is aggregated to gene level by averaging beta values across
-probes that map unambiguously to one gene in the selected region.
+Methylation beta values (all in (0.0015, 0.9963) in this file) are converted per
+probe to M-values, M = log2(beta / (1 - beta)), and then averaged over the probes
+that map unambiguously to one gene in the selected region. Set log2_expr=False /
+meth_m_values=False for the raw scales (the behaviour before November 2026).
 
 Gene overlaps (approximate, single-gene probes only):
   RNA ∩ TSS200 : ~3 143 genes
   RNA ∩ Body   : ~3 032 genes
   All three    : ~670 genes   (use restrict_to_common_genes=True)
 
-Samples are aligned to the 589-sample intersection of RNA, methylation, and
+Samples are aligned to the 530-sample intersection of RNA, methylation, and
 clinical data that have complete TMB values.
 """
 from __future__ import annotations
@@ -53,11 +57,13 @@ def _load_rna(
     path: Path,
     samples: List[str],
     impute_missing: bool = True,
+    log2_transform: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Load RNA-seq RSEM matrix, restrict to requested samples.
     Returns (samples × genes DataFrame, gene_names list).
-    Values are log2(RSEM+1) as provided by cBioPortal PanCan Atlas.
+    The file holds batch-normalised RSEM on the raw scale (not logged); with
+    log2_transform the values are log2(max(x, 0) + 1).
 
     Parameters
     ----------
@@ -72,6 +78,8 @@ def _load_rna(
     # Transpose: rows = samples, cols = genes
     rna = raw[raw.columns.intersection(samples)].T
     rna = rna.reindex(samples).dropna(how="all")
+    if log2_transform:
+        rna = np.log2(rna.clip(lower=0) + 1)
     if impute_missing:
         rna = rna.fillna(rna.mean(axis=0))
     gene_names = rna.columns.tolist()
@@ -83,6 +91,7 @@ def _aggregate_methylation(
     region: str,
     samples: List[str],
     impute_missing: bool = True,
+    m_values: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Load HM450 methylation data and aggregate to gene level for one region.
@@ -92,7 +101,10 @@ def _aggregate_methylation(
       - have DESCRIPTION containing `region` (e.g. 'TSS200' or 'Body')
       - have non-missing NAME
 
-    are included. Beta values are averaged across probes per (gene, sample).
+    are included. With m_values, each probe's beta is converted to an M-value,
+log2(beta / (1 - beta)) (beta clipped to [1e-4, 1 - 1e-4], which never binds in
+this file), before averaging across probes per (gene, sample); otherwise beta
+values are averaged.
 
     Returns (samples × genes DataFrame, gene_names list).
 
@@ -114,6 +126,9 @@ def _aggregate_methylation(
     # Sample columns only
     sample_cols = [c for c in raw.columns if c in set(samples)]
     data = raw[["NAME"] + sample_cols].copy()
+    if m_values:
+        b = data[sample_cols].clip(1e-4, 1 - 1e-4)
+        data[sample_cols] = np.log2(b / (1 - b))
 
     # Average beta values per gene across probes
     agg = data.groupby("NAME")[sample_cols].mean()  # genes × samples
@@ -151,7 +166,11 @@ def load_coadread(
     log1p_tmb: bool = True,
     train_frac: float = 0.8,
     random_seed: int = 42,
-    preprocess_on_train_only: bool = False,
+    preprocess_on_train_only: bool = True,
+    log2_expr: bool = True,
+    meth_m_values: bool = True,
+    n_folds: Optional[int] = None,
+    fold: int = 0,
 ) -> Dict:
     """
     Load and align TCGA COAD/READ gene expression, TSS200 methylation, and
@@ -170,18 +189,28 @@ def load_coadread(
                                 Default False — each view uses its own maximal
                                 gene set (RNA∩TSS200 ~3 143; RNA∩Body ~3 032).
     impute_missing : if True (default), fill NaN values in each view with
-                     column means computed over all aligned samples.
+                     column means (training samples only, unless
+                     preprocess_on_train_only=False).
                      Set to False to leave NaNs in place, e.g. when you want
                      to apply a different imputation strategy downstream.
     log1p_tmb : apply log1p transform to TMB_NONSYNONYMOUS (recommended;
                 TMB is right-skewed)
     train_frac : fraction of samples used for training
     random_seed : random seed for train/test split
-    preprocess_on_train_only : if True, choose the most variable genes and
-                     compute the imputation means from the training samples
+    log2_expr : log2(max(x, 0) + 1) the RSEM expression values (default True; the
+                file is not logged).
+    meth_m_values : convert methylation beta values to M-values per probe before
+                averaging to gene level (default True).
+    preprocess_on_train_only : if True (default), choose the most variable genes
+                     and compute the imputation means from the training samples
                      only, so test samples do not influence preprocessing.
-                     Default False reproduces the original behaviour (both
-                     computed over all aligned samples).
+                     False computes both over all aligned samples (the original
+                     behaviour; it lets test samples influence gene selection,
+                     so do not use it for evaluation).
+    n_folds, fold : if n_folds is set, k-fold cross-validation instead of a
+                    train_frac split: samples are shuffled with random_seed,
+                    cut into n_folds near-equal folds (np.array_split), and fold
+                    `fold` (0-based) is the test set. train_frac is ignored.
 
     Returns
     -------
@@ -230,9 +259,12 @@ def load_coadread(
     # ------------------------------------------------------------------
     # With preprocess_on_train_only, imputation waits until the split is known.
     impute_now = impute_missing and not preprocess_on_train_only
-    rna_df, rna_genes = _load_rna(rna_path, common_samples, impute_missing=impute_now)
-    tss200_df, tss200_genes = _aggregate_methylation(meth_path, "TSS200", common_samples, impute_missing=impute_now)
-    body_df, body_genes = _aggregate_methylation(meth_path, "Body", common_samples, impute_missing=impute_now)
+    rna_df, rna_genes = _load_rna(rna_path, common_samples, impute_missing=impute_now,
+                                  log2_transform=log2_expr)
+    tss200_df, tss200_genes = _aggregate_methylation(meth_path, "TSS200", common_samples,
+                                                     impute_missing=impute_now, m_values=meth_m_values)
+    body_df, body_genes = _aggregate_methylation(meth_path, "Body", common_samples,
+                                                 impute_missing=impute_now, m_values=meth_m_values)
 
     # ------------------------------------------------------------------
     # 4. Optionally restrict to three-way gene intersection
@@ -272,9 +304,15 @@ def load_coadread(
     rng = np.random.default_rng(random_seed)
     n = len(common_samples)
     idx = rng.permutation(n)
-    n_train = int(np.floor(train_frac * n))
-    train_idx = np.sort(idx[:n_train])
-    test_idx  = np.sort(idx[n_train:])
+    if n_folds is not None:
+        if not 0 <= fold < n_folds:
+            raise ValueError(f"fold must be in 0..{n_folds - 1}")
+        test_idx  = np.sort(np.array_split(idx, n_folds)[fold])
+        train_idx = np.setdiff1d(np.arange(n), test_idx)
+    else:
+        n_train = int(np.floor(train_frac * n))
+        train_idx = np.sort(idx[:n_train])
+        test_idx  = np.sort(idx[n_train:])
 
     # ------------------------------------------------------------------
     # 6. Imputation and variance filtering (per view independently)
