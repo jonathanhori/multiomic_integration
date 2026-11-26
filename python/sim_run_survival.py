@@ -243,7 +243,7 @@ def one(cond, rep):
     t0 = time.time()
     cox = sm.cox_fit(Z, t_tr, e_tr)
     surv = np.vstack([f(times) for f in cox.predict_survival_function(Zt)]) if len(times) >= 2 else None
-    add("mofa_cox", risk=cox.predict(Zt), surv=surv, runtime=time.time() - t0)
+    add("mofa_cox", risk=cox.predict(Zt), surv=surv, runtime=float(d["runtime"]) + time.time() - t0)   # MOFA fit + Cox
 
     # Elastic-net Cox on the stacked views
     t0 = time.time()
