@@ -2,7 +2,9 @@
 Controlled-strength simulation study, single- and two-factor (November 2026), for the
 Hoffman2 cluster (cluster/submit_controlled_study.sh) or locally.
 
-Two arms, scored by one pipeline:
+Arms, scored by one pipeline (the cluster array runs two_factor, single_factor and
+high_pve; arm single was dropped from it on 2026-11-26 and is run only for the
+no-regression check):
   single  the existing single-factor controlled datasets
           (sim/data/multi_view_shared_controlled/k.5, generate_controlled_data.R):
           n {100, 200, 500} x P {600, 3000} x c {0.3, 0.6, 1, 1.5, 2, 3, 10}, reps 1-10,
@@ -57,6 +59,10 @@ Per dataset:
   8. outcome UQ (viper_default closed form, MOFA OLS interval) and implied-covariance
      error for the factor methods.
 
+Runtime: every row's runtime is the time to get that method's predictions from the
+training data. For the four VIPER rows that is the training fit (fit_time) plus the
+method's own step (local inference [local_time], MC draws, OLS); MOFA's includes its fit.
+
 Output under sim/results/controlled_study/<arm>/: scores/<cond>.csv (one file per cell,
 so array tasks never share a file; resumable by rep), models/, mofa/, local_traj/,
 factors/<cond>_rep<r>.{csv,npz} (arms single_factor and high_pve).
@@ -97,12 +103,19 @@ FACTOR_DIAG = {"single_factor": True, "high_pve": True}
 N_PERM, N_SUB = 0, 0
 
 
+def single_tasks():
+    """Arm single (the unscaled single-factor data): not in the cluster array (decided
+    2026-11-26; arm single_factor covers the same cells with strength on target). Kept
+    for the no-regression check against grid_default: --arm single --cells all [--reps 1]
+    then --compare."""
+    return ([("single", (n, P, c, None), REPS_MAIN) for n, P, c in SINGLE_MAIN]
+            + [("single", (n, P, c, None), REPS_HIGHDIM) for n, P, c in SINGLE_HIGHDIM])
+
+
 def tasks():
     """(arm, cell, reps) for every array task, in task-id order (new arms are appended,
     so the ids of the earlier tasks do not change)."""
-    t = [("single", (n, P, c, None), REPS_MAIN) for n, P, c in SINGLE_MAIN]
-    t += [("single", (n, P, c, None), REPS_HIGHDIM) for n, P, c in SINGLE_HIGHDIM]
-    t += [("two_factor", cell, REPS_MAIN) for cell in TWO_FACTOR_CELLS]
+    t = [("two_factor", cell, REPS_MAIN) for cell in TWO_FACTOR_CELLS]
     t += [("single_factor", (n, P, c, None), REPS_MAIN) for n, P, c in SINGLE_MAIN + SINGLE_HIGHDIM]
     t += [("high_pve", cell, REPS_MAIN) for cell in TWO_FACTOR_CELLS]
     return t
@@ -322,8 +335,13 @@ def one(arm, n, P, c, w, rep):
                      kappa2_rel_mean=float(k2[m][rel].mean()))
         if m == "viper_default":
             r.update(extra_viper); r.update(u_v); r["runtime"] = fit_time
-        elif m == "viper_local":
-            r["cov_frob"] = extra_viper["cov_frob"]
+        elif m in ("viper_local", "viper_default_mc", "viper_scores_ols"):
+            # same VIPER fit: runtime = fit + this method's own step (local inference,
+            # MC draws, OLS), so it compares with MOFA's runtime, which includes its fit
+            r["stop_epoch"] = extra_viper["stop_epoch"]; r["fit_time"] = fit_time
+            r["runtime"] = fit_time + float(r.get("runtime") or 0.0)
+            if m == "viper_local":
+                r["cov_frob"] = extra_viper["cov_frob"]
         elif m == "mofa":
             r.update(u_m); r["cov_frob"] = cov["mofa"]; r["runtime"] = float(d["runtime"])
         elif m in cov:
@@ -397,7 +415,7 @@ def main():
         run_task(arm, cell, a.reps or reps); return
     if a.cells != "all" or a.arm is None:
         ap.error("give --task-id N, or --arm and --cells all")
-    sel = sorted([t for t in tl if t[0] == a.arm], key=lambda t: -t[1][0] * t[1][1])   # largest first
+    sel = sorted([t for t in tl + single_tasks() if t[0] == a.arm], key=lambda t: -t[1][0] * t[1][1])   # largest first
     from joblib import Parallel, delayed
     Parallel(n_jobs=a.workers, backend="loky")(delayed(run_task)(arm, cell, a.reps or reps)
                                                for arm, cell, reps in sel)

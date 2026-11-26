@@ -32,6 +32,9 @@ Metrics:
   other      calib_slope (regression of true log T on the prediction), cov95 / width95 of
              log T (methods with a predictive sd), kappa2 per relevant factor (factor
              methods), VIPER stop epoch / fit time / local epochs and time, runtimes
+  runtime    time to get the method's predictions from the training data: for every
+             VIPER row the training fit (fit_time) plus, for viper_lognormal_local, local
+             inference (local_time); MOFA rows include the MOFA fit
 
 Output: sim/results/survival_study/scores/<cond>.csv (one file per condition; resumable
 by rep), models/, mofa/.
@@ -187,8 +190,9 @@ def one(cond, rep):
     mu = mom["m_intercept"] + m_loc @ mb
     var = mom["E_sigma2_y"] + mom["s2_intercept"] + (s_loc ** 2 * (mb ** 2 + s2b)).sum(1) + (m_loc ** 2 * s2b).sum(1)
     add("viper_lognormal_local", m_raw=ym + ysd * mu.numpy(), s_raw=ysd * var.sqrt().numpy(),
-        runtime=float(st["inference_time"]), load_s=mom["M"],
-        extra={"local_epochs": model.local_epochs, "local_time": float(st["inference_time"])})
+        runtime=fit_time + float(st["inference_time"]), load_s=mom["M"],      # fit + local inference
+        extra={"stop_epoch": stop, "fit_time": fit_time,
+               "local_epochs": model.local_epochs, "local_time": float(st["inference_time"])})
     pyro.clear_param_store()
 
     # Gaussian VIPER on log y: censoring ignored, and events only
@@ -199,13 +203,14 @@ def one(cond, rep):
         d_te = {"X_l": te["X_l"], "y": log_te.to(te["y"].dtype), "K": te["K"], "Z": None}
         sub_g, _, dp_g = process_data(d_tr, d_te, model_type="shared")
         stem_g = os.path.join(OUT, "models", f"{label}_{cond}_rep{rep}")
-        _, ft = fit_viper(sub_g, {}, rep, stem_g)
+        model_g, ft = fit_viper(sub_g, {}, rep, stem_g)
         mom_g = load_guide_moments(stem_g + "_paramstore.pth", L)
         cf_g = closed_form_scores(mom_g, [x.double() for x in dp_g["test_X_l_list_clean"]])
         ymg, ysg = float(log_tr[kt].mean()), float(log_tr[kt].std())
         bg, cg = rm.to_raw_scale(cf_g["coef"], dp_g, ymg, ysg)
         add(label, m_raw=ymg + ysg * cf_g["yhat"].numpy(), s_raw=ysg * cf_g["pred_var"].sqrt().numpy(),
-            coef=(bg, cg), runtime=ft, load_s=None)
+            coef=(bg, cg), runtime=ft, load_s=None,
+            extra={"stop_epoch": model_g.total_epochs, "fit_time": ft})
         pyro.clear_param_store()
 
     # PCA scores + log-normal AFT / Cox

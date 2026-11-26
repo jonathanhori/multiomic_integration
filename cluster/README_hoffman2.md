@@ -6,7 +6,7 @@ older `*.sh` scripts in this folder are Grid Engine and are not used.
 
 | File | What it is |
 |---|---|
-| `submit_controlled_study.slurm` | controlled study: single-factor rerun, two-factor study, rescaled single-factor grid, high-PVE + weak study (432 tasks) |
+| `submit_controlled_study.slurm` | controlled study: two-factor study, single-factor grid (strength on target), high-PVE + weak study (378 tasks) |
 | `submit_survival.slurm` | survival study, log-normal AFT (336 tasks) |
 | `hoffman2_env.sh` | job environment (modules, conda environment); the one place to edit versions |
 | `environment_hoffman2.yml` | conda environment for Linux (the repository's `environment.yml` is a macOS export) |
