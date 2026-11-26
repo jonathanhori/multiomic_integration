@@ -1,9 +1,12 @@
 #!/bin/bash
 # One-time setup of this repository on the Hoffman2 Slurm cluster.
 #
-# Run from the repository root, inside an interactive session (not on the login node):
-#   srun --time=02:00:00 --cpus-per-task=2 --mem=8G --account=pi_huazhou --pty bash -l
-#   cd $SCRATCH/multiomic_integration && bash cluster/setup_hoffman2.sh [--smoke]
+# Run from the repository root as a batch job (not on the login node). The first run
+# compiles MOFA2's R dependencies from source, which takes hours on 2 CPUs:
+#   cd $SCRATCH/multiomic_integration
+#   sbatch --job-name=setup_smoke --account=pi_huazhou --time=08:00:00 --cpus-per-task=8 \
+#     --mem=16G --output=cluster/logs/setup_smoke.%j.out --wrap "bash cluster/setup_hoffman2.sh --smoke"
+# Each step keeps what it finished, so after a time-out simply submit it again.
 #
 # What it does (each step is skipped if already done):
 #   1. ~/multiomic_integration -> this directory (symlink). The code and the R scripts
@@ -11,10 +14,13 @@
 #      $SCRATCH (or your group's project directory) keeps the data and results out of the
 #      small $HOME quota.
 #   2. cluster/logs/ for the job logs (Slurm does not create directories).
-#   3. the conda environment from cluster/environment_hoffman2.yml, then rpy2 linked to
-#      the R module.
-#   4. MOFA2 (Bioconductor) in your R library, and its Python backend (basilisk builds it
-#      on first use: done here once, so the array tasks do not all build it at once).
+#   3. the conda environment from cluster/environment_hoffman2.yml, in $SCRATCH/software
+#      (cluster/hoffman2_env.sh), then rpy2 linked to the R module. An environment left
+#      half-built (time-out, partial purge) is detected by an import check and repaired.
+#   4. MOFA2 (Bioconductor) in the R library $SCRATCH/software/R, and its Python backend
+#      (basilisk builds it on first use: done here once, so the array tasks do not all
+#      build it at once).
+# Rerun it after a pause of two weeks or more: $SCRATCH deletes files older than 14 days.
 #   5. import checks; with --smoke, one full replicate of each study (~10-20 min).
 # Edit cluster/hoffman2_env.sh first if the module versions differ (module spider
 # miniforge; h2 modules R).
@@ -38,24 +44,42 @@ fi
 # 2. log directory
 mkdir -p cluster/logs
 
-# 3. conda environment
-eval "$(grep -E '^(MINIFORGE_MODULE|R_MODULE|CONDA_ENV)=' cluster/hoffman2_env.sh)"   # the three settings
+# 3. conda environment, in $SCRATCH (cluster/hoffman2_env.sh says why)
+eval "$(grep -E '^(MINIFORGE_MODULE|R_MODULE|ENV_ROOT|CONDA_ENV)=|^export (CONDA_PKGS_DIRS|PIP_CACHE_DIR|BASILISK_EXTERNAL_DIR)=' cluster/hoffman2_env.sh)"
+mkdir -p "$ENV_ROOT" "$CONDA_PKGS_DIRS" "$PIP_CACHE_DIR" "$BASILISK_EXTERNAL_DIR"
 module purge
 module load "$MINIFORGE_MODULE"
-if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
+ENV_CHECK="import torch, pyro, zuko, numpy, pandas, scipy, sklearn, sksurv, joblib, optuna, tqdm, pyreadr"
+if [ ! -d "$CONDA_ENV/conda-meta" ]; then
+  # not there, or a creation that stopped before conda finished (e.g. after a purge or a time-out)
   echo "== creating conda environment $CONDA_ENV"
-  conda env create -f cluster/environment_hoffman2.yml
+  conda env create --yes -p "$CONDA_ENV" -f cluster/environment_hoffman2.yml
+elif ! "$CONDA_ENV/bin/python" -c "$ENV_CHECK" 2>/dev/null; then
+  # conda finished but the pip packages are missing or incomplete (time-out in pip, partial purge)
+  echo "== repairing conda environment $CONDA_ENV (some packages missing)"
+  conda env update -p "$CONDA_ENV" -f cluster/environment_hoffman2.yml
 fi
+"$CONDA_ENV/bin/python" -c "$ENV_CHECK" || { echo "ERROR: environment $CONDA_ENV is incomplete" >&2; exit 1; }
 source cluster/hoffman2_env.sh
 python -c "import rpy2" 2>/dev/null || { echo "== installing rpy2 against $(R --version | head -1)"; pip install rpy2==3.6.4; }
 
-# 4. MOFA2 and its Python backend
-Rscript -e '
-lib <- Sys.getenv("R_LIBS_USER"); dir.create(lib, recursive = TRUE, showWarnings = FALSE); .libPaths(c(lib, .libPaths()))
+# 4. MOFA2 and its Python backend. R builds every package from source (no Hoffman2 R
+# module has the Bioconductor stack), so compile in parallel on the job's CPUs; an
+# interrupted install leaves 00LOCK-<pkg> folders that block reinstalling, so clear them.
+NCPU="${SLURM_CPUS_PER_TASK:-2}"
+export MAKEFLAGS="-j$NCPU"
+mkdir -p "$R_LIBS_USER"
+for lock in "$R_LIBS_USER"/00LOCK-*; do [ -d "$lock" ] && { echo "== removing stale R lock $lock"; rm -rf "$lock"; }; done
+NCPU="$NCPU" Rscript -e '
+lib <- Sys.getenv("R_LIBS_USER"); .libPaths(c(lib, .libPaths())); options(Ncpus = as.integer(Sys.getenv("NCPU")))
 if (!requireNamespace("MOFA2", quietly = TRUE)) {
   if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org", lib = lib)
   BiocManager::install("MOFA2", ask = FALSE, update = FALSE, lib = lib)
 }
+# R/mofa_run.R attaches tidyverse; the R module has only part of it (ggplot2, dplyr, ...)
+if (!requireNamespace("tidyverse", quietly = TRUE))
+  install.packages("tidyverse", repos = "https://cloud.r-project.org", lib = lib)
+for (p in c("MOFA2", "tidyverse")) if (!requireNamespace(p, quietly = TRUE)) stop("R package ", p, " failed to install")
 cat("MOFA2", as.character(packageVersion("MOFA2")), "\n")'
 echo "== building MOFA's Python backend with a tiny fit (first run only takes a few minutes)"
 python - <<'EOF'

@@ -21,6 +21,13 @@ older `*.sh` scripts in this folder are Grid Engine and are not used.
   time, not results.
 - The code and R scripts find the repository at `~/multiomic_integration`; the setup
   script links that path to the copy in `$SCRATCH`.
+- The software is in `$SCRATCH/software` as well: the conda environment, the R library
+  (MOFA2), MOFA's Python backend and the download caches (`cluster/hoffman2_env.sh`).
+  On 2026-11-24 `$HOME` was too slow to install into (a 3 h setup job timed out in pip),
+  and it has only ~15 GB free. After a pause of two weeks or more, rerun
+  `cluster/setup_hoffman2.sh`: it rebuilds whatever the purge removed.
+- Log in at **`hoffman2.oarc.ucla.edu`** for Slurm; `hoffman2.idre.ucla.edu` can land on
+  the legacy Grid Engine login nodes, which have no `sbatch` / `squeue`.
 
 ## Steps
 
@@ -28,15 +35,22 @@ older `*.sh` scripts in this folder are Grid Engine and are not used.
 the jobs use first (the `cluster/` files and the runners); then, on Hoffman2:
 
 ```bash
-cd $SCRATCH && git clone git@github.com:jonathanhori/multiomic_integration.git
+cd $SCRATCH && git clone https://github.com/jonathanhori/multiomic_integration.git
 ```
 
-(cloning over SSH needs a GitHub SSH key on Hoffman2; otherwise use the https URL). The
-single-factor data are not in git; copy them from the Mac (replace `<user>`; `echo
-$SCRATCH` on Hoffman2 shows the path, `/u/scratch/<first letter>/<user>`):
+(the repository is public, so HTTPS needs no login; the SSH address needs a GitHub SSH
+key on Hoffman2). The
+single-factor data are not in git; copy them from the Mac (`$SCRATCH` is
+`/u/scratch/j/jonhori`):
 
 ```bash
-rsync -av ~/multiomic_integration/sim/data/multi_view_shared_controlled/ <user>@hoffman2.idre.ucla.edu:/u/scratch/<u>/<user>/multiomic_integration/sim/data/multi_view_shared_controlled/
+ssh jonhori@hoffman2.idre.ucla.edu 'mkdir -p /u/scratch/j/jonhori/multiomic_integration/sim/data'
+```
+
+(`sim/data/` is not in git, and rsync creates only the last directory of the target.)
+
+```bash
+rsync -av ~/multiomic_integration/sim/data/multi_view_shared_controlled/ jonhori@hoffman2.idre.ucla.edu:/u/scratch/j/jonhori/multiomic_integration/sim/data/multi_view_shared_controlled/
 ```
 
 Later code changes: commit and push on the Mac, `git pull` on Hoffman2.
@@ -77,8 +91,8 @@ replicates are skipped.
 are optional):
 
 ```bash
-rsync -av <user>@hoffman2.idre.ucla.edu:/u/scratch/<u>/<user>/multiomic_integration/sim/results/controlled_study/ ~/multiomic_integration/sim/results/controlled_study/ --exclude models/ --exclude mofa/
-rsync -av <user>@hoffman2.idre.ucla.edu:/u/scratch/<u>/<user>/multiomic_integration/sim/results/survival_study/ ~/multiomic_integration/sim/results/survival_study/ --exclude models/ --exclude mofa/
+rsync -av jonhori@hoffman2.idre.ucla.edu:/u/scratch/j/jonhori/multiomic_integration/sim/results/controlled_study/ ~/multiomic_integration/sim/results/controlled_study/ --exclude models/ --exclude mofa/
+rsync -av jonhori@hoffman2.idre.ucla.edu:/u/scratch/j/jonhori/multiomic_integration/sim/results/survival_study/ ~/multiomic_integration/sim/results/survival_study/ --exclude models/ --exclude mofa/
 ```
 
 Then, on the Mac, `python python/sim_run_controlled_study.py --compare` checks the
